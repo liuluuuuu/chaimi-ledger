@@ -1,6 +1,31 @@
 /* ===== 设置层 ===== */
+/* 应用级区块（AI 配置/备份与日志）仅 NAS 管理员可见可写（MULTIUSER-PLAN §3.3；
+   服务端 _admin_or_403 同口径双保险）；微信机器人 A 通道按账本收口，全员可见；
+   本地开发（无网关身份）视为管理员 */
+const stIsAdmin = () => !ME.uid || !!ME.isadmin;
+function stAdminVis(){
+  const admin = stIsAdmin();
+  ["ai","backup"].forEach(s=>{
+    const tab = document.querySelector(`#stTabs button[data-s="${s}"]`);
+    const sec = document.querySelector(`.st-sec[data-s="${s}"]`);
+    if(tab) tab.style.display = admin ? "" : "none";
+    if(sec) sec.style.display = admin ? "" : "none";
+  });
+  // 机器人：区块全员可见；模式/白名单是应用级配置，非管理员只读（服务端同口径 admin 门）
+  $("#bot_mode_box").style.display = admin ? "" : "none";
+  $("#bot_save").style.display = admin ? "" : "none";
+  $("#bot_mode_ro").style.display = admin ? "none" : "";
+  $("#bot_users_row").style.display = admin ? "" : "none";
+  if(!admin){
+    const on = document.querySelector("#stTabs button.on");
+    if(on && on.style.display === "none") stTab("book");
+  }
+}
 function stLoad(){
-  loadCfg();loadLedgers();loadCatMgr();stAccs();stAttrs();loadBks();loadBkCfg();loadBotCfg();
+  stAdminVis();
+  loadLedgers();loadCatMgr();stAccs();stAttrs();
+  loadBotCfg();   // 机器人区块全员可见；账本下拉/成员表服务端按身份收口
+  if(stIsAdmin()) { loadCfg();loadBks();loadBkCfg(); }   // /api/backups 等已 admin 门，非管理员不拉
 }
 function stTab(name){
   document.querySelectorAll("#stTabs button").forEach(b=>b.classList.toggle("on", b.dataset.s===name));
@@ -12,7 +37,7 @@ document.querySelectorAll("#stTabs button").forEach(b=>b.onclick=()=>stTab(b.dat
 const LLM_PRESETS=[
   {id:"bailian",name:"阿里云百炼（Qwen，文本+视觉）",base_url:"https://dashscope.aliyuncs.com/compatible-mode/v1",model:"qwen-plus",vl_model:"qwen3-vl-plus"},
   {id:"zhipu",name:"智谱 AI（GLM，文本+视觉）",base_url:"https://open.bigmodel.cn/api/paas/v4",model:"glm-4-air",vl_model:"glm-4v-flash"},
-  {id:"deepseek",name:"DeepSeek（暂无视觉模型，图片记账不可用）",base_url:"https://api.deepseek.com/v1",model:"deepseek-chat",vl_model:""},
+  {id:"deepseek",name:"DeepSeek（文本+视觉）",base_url:"https://api.deepseek.com/v1",model:"deepseek-chat",vl_model:"deepseek-flash"},
   {id:"ollama",name:"本地 Ollama（需先 ollama pull 模型；Key 随便填）",base_url:"http://localhost:11434/v1",model:"qwen2.5:3b",vl_model:"qwen2.5vl:3b"},
   {id:"lmstudio",name:"本地 LM Studio（需在软件里开启本地服务器）",base_url:"http://localhost:1234/v1",model:"qwen2.5-3b-instruct",vl_model:"qwen2.5-vl-3b-instruct"},
 ];
@@ -67,17 +92,65 @@ async function llmModelsOpen(){
 function llmModelsClose(){ $("#llmModelsMask").style.display="none"; }
 
 const LEDGER_CURS = [["CNY","人民币 ¥"],["USD","美元 $"],["EUR","欧元 €"],["JPY","日元 ¥"],["HKD","港币 HK$"],["GBP","英镑 £"]];
+const lgMine = l => l.mine !== false;   // mine=false=别人共享来的（undefined=系统上下文/旧接口，视为自己）
 async function loadLedgers(){
   const ls = await getLedgers();
-  // 币种列：常用六种；库里存了列表外的币种时原样追加为可选项（防老数据显示空白）
+  // 共享按钮固定最右列（删除列在其左，单账本时删除列为空、共享仍贴右缘）；
+  // 币种：owner 可改下拉，共享来的账本只读文本；删除/共享管理均 owner-only（服务端同口径）
   document.querySelector("#ledgerTable tbody").innerHTML=ls.map(l=>
-    `<tr><td>${l.icon?esc(l.icon)+" ":""}${esc(l.name)}</td><td>
-       <select class="lg-cur" onchange="setLedgerCur(${l.id}, this)">
-         ${LEDGER_CURS.map(([v,t])=>`<option value="${v}" ${l.currency===v?"selected":""}>${t}</option>`).join("")}
-         ${LEDGER_CURS.some(([v])=>v===l.currency)?"":`<option selected>${esc(l.currency)}</option>`}
-       </select></td>
-     <td class="lg-del">${ls.length>1?`<button class="btn danger" onclick="delLedger(${l.id})">删除</button>`:""}</td></tr>`).join("");
+    `<tr><td>${l.icon?esc(l.icon)+" ":""}${esc(l.name)}</td><td>${
+        lgMine(l)
+        ? `<select class="lg-cur" onchange="setLedgerCur(${l.id}, this)">
+             ${LEDGER_CURS.map(([v,t])=>`<option value="${v}" ${l.currency===v?"selected":""}>${t}</option>`).join("")}
+             ${LEDGER_CURS.some(([v])=>v===l.currency)?"":`<option selected>${esc(l.currency)}</option>`}
+           </select>`
+        : `<span class="sub">${esc(l.currency||"CNY")}</span>`
+      }</td>
+     <td class="lg-del">${ls.length>1 && lgMine(l) ? `<button class="btn danger" onclick="delLedger(${l.id})">删除</button>` : ""}</td>
+     <td style="text-align:right">${lgMine(l)
+        ? `<button class="btn btn-ghost" style="padding:4px 10px;font-size:12px" onclick="shareOpen(${l.id},'${qEsc(l.name)}')">共享</button>`
+        : `<span class="sub">共享给我</span>`}</td></tr>`).join("");
   $("#lg_cur").innerHTML=LEDGER_CURS.map(([v,t])=>`<option value="${v}">${t}</option>`).join("");   // 新建行币种下拉（幂等填充）
+}
+
+/* ===== 账本共享（多用户）===== */
+let _shareLid = 0;
+async function shareOpen(id, name){
+  _shareLid = id;
+  $("#shareTitle").textContent = `共享「${name}」`;
+  $("#shareMask").style.display = "flex";
+  await shareRefresh();
+}
+function shareClose(){ $("#shareMask").style.display = "none"; }
+async function shareRefresh(){
+  try{
+    const [ms, us] = await Promise.all([
+      api(`/api/ledgers/${_shareLid}/members`),
+      api("/api/users")
+    ]);
+    const ids = new Set(ms.map(m=>+m.uid));
+    document.querySelector("#shareTable tbody").innerHTML = ms.map(m=>
+      `<tr><td>${esc(m.username || ("uid " + m.uid))}</td>
+       <td style="text-align:right"><button class="btn danger" style="padding:2px 10px;font-size:12px" onclick="shareDel(${m.uid})">移除</button></td></tr>`).join("")
+      || '<tr><td colspan="2" class="sub">尚未共享给任何人</td></tr>';
+    const cand = us.filter(u=>!ids.has(+u.uid) && +u.uid !== +ME.uid);
+    $("#shareUserSel").innerHTML = cand.length
+      ? cand.map(u=>`<option value="${u.uid}">${esc(u.username || ("uid "+u.uid))}${u.isadmin ? "（管理员）" : ""}</option>`).join("")
+      : `<option value="">（没有其他用户——让对方先打开一次柴米记账）</option>`;
+  }catch(e){ msg(e.message, false); }
+}
+async function shareAdd(){
+  const v = +$("#shareUserSel").value || 0;
+  if(!v) return msg("请选择要共享的用户", false);
+  try{ await apiSend(`/api/ledgers/${_shareLid}/members`,"PUT",{uid:v}); }
+  catch(e){ return msg(e.message, false); }
+  msg("已共享 ✅ 对方刷新应用即可看到"); shareRefresh();
+}
+async function shareDel(uid){
+  if(!await uiConfirm("移除后对方将看不到这本账（已记的流水保留）？", "移除")) return;
+  try{ await api(`/api/ledgers/${_shareLid}/members?uid=${uid}`,{method:"DELETE"}); }
+  catch(e){ return msg(e.message, false); }
+  shareRefresh();
 }
 
 async function setLedgerCur(id, sel){
@@ -105,8 +178,8 @@ async function delLedger(id){
 }
 
 const CAT_GROUP_CN = {expense:"支出", income:"收入", transfer:"退款和不计收支"};
-let catEdit = false;
-function toggleCatEdit(){ catEdit = !catEdit; loadCatMgr(); }
+const catEdit = mkEditToggle("catEditBtn", () => loadCatMgr());
+function toggleCatEdit(){ catEdit.toggle(); }   // app.html onclick 入口
 async function loadCatMgr(){
   const [cats, maps] = await Promise.all([
     api(`/api/categories?ledger=${lid()}`),
@@ -115,8 +188,6 @@ async function loadCatMgr(){
   categories = cats;   // 全局分类表同步（记一笔下拉/编辑弹窗同源）
   const byCat = {};
   for(const m of maps) (byCat[m.category_id] = byCat[m.category_id] || []).push(m);
-  const btn = $("#catEditBtn");
-  if(btn) btn.textContent = catEdit ? "完成" : "编辑";
   $("#catMgr").innerHTML = ["expense","income","transfer"].map(g=>{
     const tops = cats.filter(c=>!c.parent_id && c.type===g);
     if(!tops.length) return "";
@@ -124,13 +195,13 @@ async function loadCatMgr(){
         <button class="btn btn-ghost" style="padding:2px 10px;font-size:11px;margin-left:6px" onclick="catMgrNew('${g}')">＋新建分类</button></div>`
       + tops.map(c=>{
         const chips = (byCat[c.id]||[]).map(m=>
-          `<span class="mchip" title="账单来源名">${esc(m.source)}${catEdit?`<b onclick="event.stopPropagation();catMgrAliasDel(${m.id})">×</b>`:""}</span>`).join("");
+          `<span class="mchip" title="账单来源名">${esc(m.source)}${catEdit.on?`<b onclick="event.stopPropagation();catMgrAliasDel(${m.id})">×</b>`:""}</span>`).join("");
         return `<div class="cm-cat">
-          <div class="cm-cname${catEdit?" edit":""}"${catEdit?` onclick="catMgrRename(${c.id})" title="点此改名"`:""}>${esc(c.name)}</div>
+          <div class="cm-cname${catEdit.on?" edit":""}"${catEdit.on?` onclick="catMgrRename(${c.id})" title="点此改名"`:""}>${esc(c.name)}</div>
           <div class="cm-chips">${chips}
-            ${catEdit?`<button class="btn btn-ghost" style="padding:2px 8px;font-size:11px" onclick="catMgrAliasAdd(${c.id})">＋来源</button>`:""}
+            ${catEdit.on?`<button class="btn btn-ghost" style="padding:2px 8px;font-size:11px" onclick="catMgrAliasAdd(${c.id})">＋来源</button>`:""}
           </div>
-          ${catEdit?`<button class="btn danger" style="padding:2px 10px;font-size:11px;flex:0 0 auto" onclick="catMgrDel(${c.id},'${qEsc(c.name)}')">删除</button>`:""}
+          ${catEdit.on?`<button class="btn danger" style="padding:2px 10px;font-size:11px;flex:0 0 auto" onclick="catMgrDel(${c.id},'${qEsc(c.name)}')">删除</button>`:""}
         </div>`;
       }).join("") + `</div>`;
   }).join("") || '<div class="sub">暂无分类</div>';
@@ -205,6 +276,8 @@ function mkEditToggle(btnId, rerender){
 }
 const accEdit = mkEditToggle("accEditBtn", () => stAccs());
 let accRows = [];   // stAccs 最近一次拉取的账户行（delAcc 弹确认框取名字/笔数用）
+let bdgDirty = false;   // 预算输入框被用户改过（input 置位）：他端改预算/切账本回填时不覆盖正在编辑的草稿
+$("#bdg_amt").oninput = () => { bdgDirty = true; };
 async function stAccs(){
   const r = accScopeInfo();
   const as = await api(`/api/accounts?ledger=${lid()}` + (r.from ? `&from=${r.from}&to=${r.to}` : ""));
@@ -214,27 +287,28 @@ async function stAccs(){
     `<tr><td>${esc(a.name)}</td><td class="num c-exp">${curSym()}${fmt(a.spend || 0)}</td>
      ${accEdit.on ? `<td style="text-align:right"><button class="btn danger" onclick="delAcc(${a.id})">删</button></td>` : ""}</tr>`).join("") ||
     '<tr><td colspan="3" class="sub">暂无账户</td></tr>';
-  $("#accTotal").textContent = `${r.label}消费合计 ${curSym()}${fmt(as.reduce((s, a) => s + (a.spend || 0), 0))}`;
+  const spendSum = as.reduce((s, a) => s + (a.spend || 0), 0);
+  $("#accTotal").textContent = `${r.label}消费合计 ${curSym()}${fmt(spendSum)}`;
   // 避免与账户维度的 spend 合计因口径差异对不上；「全部」范围无该字段时回落账户合计
   const cur = await curLedger();
-  if(cur && cur.budget && $("#bdg_amt").value === "") $("#bdg_amt").value = (cur.budget / 100).toFixed(2);
-  const spend = as[0] && as[0].net_expense !== undefined ? as[0].net_expense
-    : as.reduce((s, a) => s + (a.spend || 0), 0);
-  if(cur && cur.budget && r.months){
+  const hasBudget = !!(cur && cur.budget);
+  if(cur && !bdgDirty) $("#bdg_amt").value = cur.budget ? (cur.budget / 100).toFixed(2) : "";   // 未编辑时跟随最新预算（含他端改动与清零），编辑中不覆盖
+  const spend = as[0] && as[0].net_expense !== undefined ? as[0].net_expense : spendSum;
+  if(hasBudget && r.months){
     const budget = cur.budget * r.months;
     const pct = Math.round(spend / budget * 100);
     const bLabel = r.months > 1 ? `预算(月预算×${r.months})` : "预算";   // 年范围折算值,标明口径防误读为未生效
     $("#bdg_stat").innerHTML = `${r.label}已消费 <b style="color:${pct > 100 ? "var(--expense)" : "var(--fg)"}">${curSym()}${fmt(spend)}</b> / ${bLabel} ${curSym()}${fmt(budget)}（${pct}%${pct > 100 ? " 超支" : ""}）`;
   }else{
-    $("#bdg_stat").innerHTML = `${r.label}消费合计 <b>${curSym()}${fmt(spend)}</b>${cur && cur.budget ? "（「全部」范围不按预算折算）" : ""}`;
+    $("#bdg_stat").innerHTML = `${r.label}消费合计 <b>${curSym()}${fmt(spend)}</b>${hasBudget ? "（「全部」范围不按预算折算）" : ""}`;
   }
 }
 async function saveBudget(){
-  const cur = await curLedger();
-  if(!cur) return;
-  await apiSend(`/api/ledgers/${lid()}`, "PUT", {name: cur.name, icon: cur.icon || "", currency: cur.currency || "CNY",
-    budget: Math.round(parseFloat($("#bdg_amt").value || "0") * 100)});
+  // 预算是账本级共享设置：独立端点，共享成员也可改（名称/币种仍 owner-only）
+  await apiSend(`/api/ledgers/${lid()}/budget`, "PUT",
+    {budget: Math.round(parseFloat($("#bdg_amt").value || "0") * 100)});
   await getLedgers(true);   // 强刷缓存：不刷则 stAccs 仍读到旧预算,统计行不更新
+  bdgDirty = false;   // 已保存成最新值：回到跟随模式（他端后续改动/切账本可回填）
   msg("预算已保存 ✅"); stAccs();
 }
 const userEdit = mkEditToggle("userEditBtn", () => stAttrs());
@@ -368,52 +442,33 @@ async function restore(f){
 }
 
 let _ilinkTimer = null, _qrTimer = null;
-let _botTokenPlain = "";   // 生成/重置后的明文（GET /api/config 只回掩码，刷新页面后回占位符）
-function botMcpCfgText(){
-  return "前提: 模式选「网关」并保存——TCP 18710 自动监听（MCP 走此 HTTP 口，无需手动启动服务）\n" +
-         "CHAIMI_BOT_URL=http://127.0.0.1:18710\n" +
-         "CHAIMI_BOT_TOKEN=" + (_botTokenPlain || "<点「生成 / 重置」后自动填入>") + "\n" +
-         "command: python3 /var/apps/chaimi-ledger/target/src/chaimi_mcp.py\n" +
-         "超时: 工具调用设 120 秒（LLM 解析 2~10s，查账/月报可 20s+）\n" +
-         "工具: ledger_message(text) / ledger_receipt(path_url) / ledger_status()";
-}
 const ILINK_STATE_CN = {off:"未启动", pending_scan:"等待扫码", scaned:"已扫码待确认",
   logged_in:"已连接 ✓", expired:"凭证过期", error:"连接异常"};
 
 async function loadBotCfg(){
   const c = await getCfg();
   const b = c.bot || {};
-  $("#bot_mode").value = ["off","gateway","direct"].includes(b.mode) ? b.mode : "off";
+  $("#bot_mode").value = ["off","direct"].includes(b.mode) ? b.mode : "off";
+  $("#bot_mode_ro").textContent = b.mode === "direct"
+    ? "模式：微信扫码（管理员已开启）" : "模式：未开启（需管理员开启微信扫码）";
   $("#bot_users").value = (b.allowed_users || []).join(", ");
-  // 网关白名单独立于微信白名单;空/缺省自动回填 gateway(MCP 固定传此标识)
-  $("#bot_gw_users").value = (b.gateway_users || []).length ? b.gateway_users.join(", ") : "gateway";
-  $("#bot_token").value = b.api_token || "";
-  $("#bot_token").placeholder = b.api_token ? "已设置（点生成/重置可更换）" : "未生成";
-  // MCP 挂载四要素;OpenClaw 与 chaimi 同机,URL 固定回环直连口;Token 行在生成/重置后自动填入明文
-  $("#bot_mcp_cfg").textContent = botMcpCfgText();
   botGwVis();
   await botLedgers();
   await botMembers();
 }
 function botGwVis(){
-  const m = $("#bot_mode").value;
-  $("#bot_gw").style.display = m === "gateway" ? "" : "none";
-  $("#bot_dir").style.display = m === "direct" ? "" : "none";
+  $("#bot_dir").style.display = $("#bot_mode").value === "direct" ? "" : "none";
 }
 async function saveBotCfg(){
   const users = $("#bot_users").value.split(/[,，\n]/).map(x=>x.trim()).filter(Boolean);
-  const gwUsers = $("#bot_gw_users").value.split(/[,，\n]/).map(x=>x.trim()).filter(Boolean);
   const m = $("#bot_mode").value;
-  await apiSend("/api/config","PUT",{bot:{mode:m, allowed_users:users, gateway_users: gwUsers.length ? gwUsers : ["gateway"]}});
+  await apiSend("/api/config","PUT",{bot:{mode:m, allowed_users:users}});
   _cfgCache = null;
-  // A/B 互斥由服务端 _bot_apply 落实:切 gateway/off 停直连轮询,切 direct/off 网关接口 403
-  msg(m === "gateway" ? "已切网关模式 ✅ 直连已关闭，仅放行网关调用"
-    : m === "direct" ? "已切直连模式 ✅ 网关接口已关闭，轮询将启动"
-    : "机器人已关闭 ✅ 直连与网关均停止");
+  msg(m === "direct" ? "已开启微信扫码 ✅ 轮询将启动" : "机器人已关闭 ✅");
   loadBotCfg();
 }
 async function botLedgers(){
-  const ls = await getLedgers();
+  const ls = await api("/api/ledgers?all=1");   // admin=全库账本；普通用户=自己拥有+共享来的（服务端同口径过滤）
   const cur = $("#bot_lg_sel").value;
   $("#bot_lg_sel").innerHTML = ledgerOptions(ls, cur ? +cur : 0);
   if(cur) $("#bot_lg_sel").value = cur;
@@ -449,7 +504,7 @@ async function botMembers(){
 }
 async function botBind(ledger, label){
   const lg = ledger || parseInt($("#bot_lg_sel").value) || 1;
-  const lb = (label !== undefined && label !== null && label !== false) ? label : $("#bot_user_sel").value;
+  const lb = label != null && label !== false ? label : $("#bot_user_sel").value;
   try{
     await apiSend("/api/bot/ilink/qrcode","POST",{ledger:lg, label:lb});
     msg(`二维码已生成（${_lgName(lg)}${lb?" · "+lb:""}），请用微信扫码`);
@@ -507,28 +562,6 @@ async function botUnbind(aid){
   await apiSend("/api/bot/ilink/unbind","POST",{account_id:aid});
   _cfgCache = null;   // 解绑改写 chaimi.conf(ilink 凭证)：配置缓存随之失效
   msg("已解绑"); await botMembers();
-}
-function copyText(t){   // execCommand 兜底通吃 http/https,免去 clipboard API 双路径
-  const ta = Object.assign(document.createElement("textarea"), {value:t});
-  ta.style.cssText = "position:fixed;opacity:0";
-  document.body.appendChild(ta); ta.select();
-  const ok = document.execCommand("copy");
-  ta.remove();
-  return ok;
-}
-function copyMcpCfg(){
-  const ok = copyText($("#bot_mcp_cfg").textContent);
-  msg(ok ? "MCP 配置已复制 ✅" : "复制失败，请手动选择文本", ok);
-}
-async function genBotToken(){
-  if($("#bot_token").value && !await uiConfirm("重置后旧 Token 立即失效，网关侧需同步更换。确定重置？","重置"))return;
-  const r = await api("/api/bot/token",{method:"POST"});
-  _cfgCache = null;   // token 已落 chaimi.conf：缓存不失效则重进设置页回显旧的「未生成」
-  $("#bot_token").value = r.token;
-  _botTokenPlain = r.token;   // MCP 配置行同步填入明文，「复制」即得完整可用配置
-  $("#bot_mcp_cfg").textContent = botMcpCfgText();
-  const ok = copyText(r.token);
-  msg(ok ? "已生成并复制 ✅（仅此一次完整显示）" : "已生成，请立即复制（仅此一次完整显示）", ok);
 }
 async function botTest(){
   const t = $("#bot_test_in").value.trim();

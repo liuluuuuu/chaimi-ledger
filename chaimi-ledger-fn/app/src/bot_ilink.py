@@ -582,7 +582,7 @@ def ilink_entries(cfg: dict) -> list:
     """bot.ilink 凭证列表归一化:旧版单 dict 自动包列表;无 token 的条目滤掉。"""
     raw = (cfg.get("bot") or {}).get("ilink")
     if isinstance(raw, dict):
-        return [dict(raw, ledger=raw.get("ledger") or (cfg.get("bot") or {}).get("default_ledger") or 1)]
+        return [dict(raw, ledger=raw.get("ledger") or 1)]
     out = []
     for e in raw or []:
         if isinstance(e, dict) and e.get("token"):

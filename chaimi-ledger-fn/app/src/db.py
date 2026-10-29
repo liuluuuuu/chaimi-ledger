@@ -102,6 +102,22 @@ CREATE INDEX IF NOT EXISTS idx_tx_date   ON transactions(ledger_id, date);
 CREATE INDEX IF NOT EXISTS idx_tx_order  ON transactions(ledger_id, order_no);
 CREATE INDEX IF NOT EXISTS idx_tx_batch  ON transactions(batch_id);
 CREATE INDEX IF NOT EXISTS idx_tx_refund ON transactions(refund_for);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY, value TEXT);
+
+-- 多用户（MULTIUSER-PLAN）：账本归属 + 共享名单 + 打开过应用的飞牛用户档案。
+-- uid = 网关注入的 X-Trim-Userid（fnOS 用户 uid，唯一键；username 可改名仅显示）。
+CREATE TABLE IF NOT EXISTS ledger_members (
+  ledger_id INTEGER NOT NULL, uid INTEGER NOT NULL,
+  added_at TEXT DEFAULT (datetime('now')),
+  PRIMARY KEY (ledger_id, uid));
+CREATE TABLE IF NOT EXISTS known_users (
+  uid INTEGER PRIMARY KEY,
+  username TEXT NOT NULL DEFAULT '',
+  isadmin INTEGER DEFAULT 0,
+  first_seen TEXT DEFAULT (datetime('now')),
+  last_seen TEXT DEFAULT (datetime('now')));
 """
 
 # 支出一级（15 分类体系：转账红包/投资理财迁 transfer，微信交易不留；
@@ -110,10 +126,12 @@ CREATE INDEX IF NOT EXISTS idx_tx_refund ON transactions(refund_for);
 # 2026-09 取消二级分类，并把「加油充电」从爱车养车拆为独立一级——实测加油/充电
 # 是高频独立支出（湖北石油/中石化电子钱包等），与停车保养分开统计更清晰）
 # 2026-09 取消二级分类后改为纯列表（原为 分类→子分类 字典，子类恒空）
+# 2026-10 补「住房物业」——房贷/房租/物业费原挤在充值缴费，房贷是多数家庭
+# 最大单笔固定支出，与水电燃气分开统计更清晰（老库由 init_db 一次性迁移补种）
 EXPENSE_CATEGORIES = [
     "餐饮美食", "日用百货", "数码电器", "服饰装扮",
     "美容美发", "文化休闲", "医疗健康", "教育培训",
-    "爱车养车", "加油充电", "交通出行", "充值缴费",
+    "爱车养车", "加油充电", "交通出行", "充值缴费", "住房物业",
     "母婴亲子", "亲友代付", "人情往来", "红包礼金", "其他",
 ]
 
@@ -149,6 +167,8 @@ DEFAULT_MAPPINGS = [
     ("expense", "汽车用品", "爱车养车"), ("expense", "爱车养车", "爱车养车"),
     ("expense", "交通出行", "交通出行"),
     ("expense", "充值缴费", "充值缴费"),
+    # 支付账单原生有「住房物业」分类（房贷/房租走这里），同名直连
+    ("expense", "住房物业", "住房物业"),
     ("expense", "母婴用品", "母婴亲子"), ("expense", "母婴亲子", "母婴亲子"),
     ("expense", "亲友代付", "亲友代付"), ("expense", "亲属卡交易", "亲友代付"),
     ("expense", "美妆", "美容美发"), ("expense", "娱乐", "文化休闲"),
@@ -233,9 +253,12 @@ def init_db() -> None:
                        "ALTER TABLE ledgers ADD COLUMN budget INTEGER DEFAULT 0")
         _ensure_column(conn, "transactions", "manual_cat",
                        "ALTER TABLE transactions ADD COLUMN manual_cat INTEGER DEFAULT 0")
+        _ensure_column(conn, "ledgers", "owner_uid",
+                       "ALTER TABLE ledgers ADD COLUMN owner_uid INTEGER")
         conn.execute("UPDATE attribution_groups SET avatar='f' WHERE avatar=''")
         if conn.execute("SELECT COUNT(*) FROM ledgers").fetchone()[0] == 0:
             seed()
+        _migrate(conn)
 
 def top_cat_id(conn: sqlite3.Connection, ledger_id: int, name: str,
                flow_type: str = "") -> int | None:
@@ -294,6 +317,38 @@ def seed() -> None:
         ledger_id = cur.lastrowid
         seed_ledger_defaults(conn, ledger_id)
         seed_default_mappings(conn, ledger_id)
+
+# ---------- 一次性库迁移（app_meta 键值打标） ----------
+
+# 2026-10 老库补「住房物业」一级分类 + 同名默认映射（v1.0.4 前的库没有）。
+# 不直接复用 seed_ledger_defaults 全量补种：那会把用户刻意删掉的默认分类在
+# 每次重启时复活。打标后只跑一遍——用户随后删掉该分类/映射也尊重其选择。
+def _m_housing_2026_10(conn: sqlite3.Connection) -> None:
+    name = "住房物业"
+    for r in conn.execute("SELECT id FROM ledgers").fetchall():
+        lid = r["id"]
+        cid = top_cat_id(conn, lid, name, "expense")
+        if not cid:
+            cid = conn.execute(
+                "INSERT INTO categories(ledger_id, type, name, parent_id, sort) VALUES(?,?,?,?,?)",
+                (lid, "expense", name, None, EXPENSE_CATEGORIES.index(name))).lastrowid
+        conn.execute(
+            "INSERT OR IGNORE INTO category_mappings(ledger_id, flow_type, source, category_id) "
+            "VALUES(?,?,?,?)", (lid, "expense", name, cid))
+
+_MIGRATIONS = [
+    ("m_housing_2026_10", _m_housing_2026_10),
+]
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """启动时按 app_meta 标记执行未跑过的一次性迁移（顺序注册，逐个打标）。
+    恢复旧版备份会换回无标记的 db 文件，下次启动自动重跑补齐。"""
+    done = {r["key"] for r in conn.execute("SELECT key FROM app_meta")}
+    for key, fn in _MIGRATIONS:
+        if key in done:
+            continue
+        fn(conn)
+        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, datetime('now'))", (key,))
 
 # ---------- 通用查询 ----------
 

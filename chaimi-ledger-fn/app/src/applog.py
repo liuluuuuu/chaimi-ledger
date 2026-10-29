@@ -4,7 +4,6 @@
   - getLogger("chaimi.xxx") 按 INFO 级输出，格式带时间/级别/模块；
   - 轮转文件落在 config.log_path()（飞牛 @var / 本地 app/data），2MB×3 份；
   - /api/logs/download 一并打包该文件（见 server.logs_download）。
-chaimi_mcp 是 stdio JSON-RPC 独立进程，其 stderr 输出保持原样（协议安全）。
 """
 from __future__ import annotations
 

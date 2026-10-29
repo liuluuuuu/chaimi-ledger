@@ -393,6 +393,20 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .attr-m:not(:last-child)::after{content:"、"}
 #ledgerTable td{vertical-align:middle}
 #ledgerTable{table-layout:fixed}
+/* 列宽进 CSS（表头内联样式会被移动端覆盖规则压不过）：名称吃剩余宽，币种/删除/共享固定。
+   手机（≤640）四列收窄防名称列被挤没（1.0.4 加共享列后固定列合计 300px > 手机内容宽） */
+#ledgerTable th:nth-child(2){width:120px}
+#ledgerTable th:nth-child(3){width:70px}
+#ledgerTable th:nth-child(4){width:110px}
+@media(max-width:640px){
+  #ledgerTable th:nth-child(2){width:84px}
+  #ledgerTable th:nth-child(3){width:52px}
+  #ledgerTable th:nth-child(4){width:64px}
+  #ledgerTable td:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #ledgerTable .lg-cur{padding:5px 4px;font-size:12px}
+  #ledgerTable .btn{padding:4px 8px;font-size:12px}
+  #accTable td:nth-child(2){white-space:nowrap;font-size:12.5px}   /* 账户表金额列防折行压字 */
+}
 
 .lg-addrow{display:grid;grid-template-columns:1fr 130px 70px;align-items:center}
 .lg-addrow>*{margin:0 6px}

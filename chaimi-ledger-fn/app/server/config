@@ -8,7 +8,7 @@
             "gatewayPrefix": "/app/chaimi-ledger",
             "gatewaySocket": "app.sock",
             "url": "/app/chaimi-ledger",
-            "allUsers": false,
+            "allUsers": true,
             "control": {
                 "accessPerm": "readonly"
             }

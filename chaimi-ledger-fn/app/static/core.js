@@ -1,6 +1,23 @@
 const $ = s => document.querySelector(s);
 const fmt = c => (c/100).toFixed(2);
 
+/* 当前飞牛用户（/api/whoami 一次拉取；uid=null=本地开发无网关身份）：
+   身份徽标/共享标记/默认归属选中/设置页 admin 门共用 */
+let ME = {uid:null, username:"", isadmin:false};
+let _mePromise = null;
+async function loadMe(){
+  if(!_mePromise) _mePromise = api("api/whoami").then(m=>{
+    ME = m || ME;
+    const b = $("#meBadge");
+    if(b){
+      b.style.display = ME.uid ? "" : "none";
+      b.textContent = "👤 " + (ME.username || ("uid " + ME.uid)) + (ME.isadmin ? " · 管理员" : "");
+    }
+    return ME;
+  }, ()=>ME);
+  return _mePromise;
+}
+
 const CUR_SYMBOLS = {CNY:"¥", USD:"$", EUR:"€", JPY:"¥", HKD:"HK$", GBP:"£"};
 let ledgersCache = [];   // loadAll 时刷新，供 curSym 反查当前账本币种
 function curSym(){
@@ -36,6 +53,7 @@ const CAT_SKIN = {
   "服饰装扮": ["--m-pink", "--m-pink-50"], "母婴亲子": ["--m-pink", "--m-pink-50"],
   "美容美发": ["--m-purple", "--m-purple-50"], "亲友代付": ["--m-purple", "--m-purple-50"],
   "文化休闲": ["--m-teal", "--m-teal-50"], "充值缴费": ["--m-teal", "--m-teal-50"],
+  "住房物业": ["--m-butter", "--m-butter-50"],
   "医疗健康": ["--m-butter", "--m-butter-50"],
   "教育培训": ["--m-mint", "--m-mint-50"], "人情往来": ["--m-mint", "--m-mint-50"],
   "交通出行": ["--m-blue-fg", "--m-blue-100"],
@@ -172,7 +190,9 @@ function moveScopeBar(p){
 
 let _navStack = [];    // 页面栈：元素=页名（loadAll 时推入初始页）；空 = 初始帧已弹尽（再按物理键=退出）
 let _navSkip = false;  // popstate 恢复中重入 showPage 不再 push
-/* 最顶层模态及其关闭动作（物理键优先关它；顺序≈叠放层级：确认/输入框最上，抽屉最下） */
+/* 最顶层模态及其关闭动作（物理键优先关它；顺序≈叠放层级：确认/输入框最上，抽屉最下）。
+   弹窗开启不 pushState，返回键先 pop 一条导航历史——未登记的弹窗会漏关（返回键
+   表现为"没反应"，连按直接退出应用），新弹窗必须在这里登记 */
 function navTopModal(){
   if($("#cfmMask").style.display === "flex") return () => cfmClose(false);    // 通用确认框
   if($("#prmMask").style.display === "flex") return () => prmClose(null);     // 通用输入框
@@ -180,7 +200,12 @@ function navTopModal(){
   if($("#editMask").classList.contains("on")) return () => txClose();          // 统一记账弹窗
   if($("#txSelMask").classList.contains("on")) return () => txSelCloseModal();
   if($("#pvMask").style.display === "flex") return () => closePv();            // 导入预览
+  if($("#wizMask").style.display === "flex") return () => wizClose();          // 模板向导（预览叠其上）
   if($("#dayMask").classList.contains("on")) return () => closeDay();          // 日历详情
+  if($("#llmModelsMask").style.display === "flex") return () => llmModelsClose();   // 模型列表
+  if($("#catNewMask").style.display === "flex") return () => catNewClose();    // 新建分类
+  if($("#shareMask").style.display === "flex") return () => shareClose();      // 账本共享（多用户）
+  if($("#avPop")?.style.display === "block") return () => _popHide();   // 头像选择浮层
   if($("#sidebar").classList.contains("open")) return () => toggleSidebar();   // 侧栏抽屉（移动端）
 
   const pw = $(".ai-plus-wrap");
@@ -222,9 +247,10 @@ document.querySelectorAll(".sidebar .nav-item[data-p]").forEach(b=>b.onclick=()=
 });
 
 /* ===== 数据加载 ===== */
-const ledgerOptions = (ls, sel) => ls.map(l=>   // 账本下拉 option（顶栏/机器人设置页共用；有图标时图标与名字间自动空格）
-  `<option value="${l.id}"${sel && l.id===sel ? " selected" : ""}>${l.icon ? esc(l.icon)+" " : ""}${esc(l.name)}</option>`).join("");
+const ledgerOptions = (ls, sel) => ls.map(l=>   // 账本下拉 option（顶栏/共享标记；有图标时图标与名字间自动空格；mine=false=别人共享来的）
+  `<option value="${l.id}"${sel && l.id===sel ? " selected" : ""}>${l.icon ? esc(l.icon)+" " : ""}${esc(l.name)}${l.mine===false ? "（共享）" : ""}</option>`).join("");
 async function loadAll(selectId){
+  await loadMe();   // 身份先行：默认归属选中/账本过滤共享标记都依赖 ME
   txCache = {};   // 切账本/初始加载：旧缓存作废（openEdit 取不到即静默返回，挡住跨账本误编辑）
   const ls = await getLedgers(true);   // 强制刷新：账本切换/增删入口都走这里，缓存随之换血
   // localStorage 是根因修复：此前整页重载(登录页回来/刷新)后 keep 取自空 select 回落第一个账本，
@@ -232,18 +258,32 @@ async function loadAll(selectId){
   let keep = selectId || +$("#ledgerSel").value || 0;
   if(!keep){ try{ keep = +localStorage.getItem("chaimi_ledger") || 0; }catch(_){} }
   $("#ledgerSel").innerHTML = ledgerOptions(ls, keep);
-  if(!ls.length){ msg("请先在设置页创建账本", false); return; }
+  if(!ls.length){ location.replace("static/home.html"); return; }   // 无账本（新飞牛用户/全新安装）→ home 页建账本，不再停在空白应用
   if(keep && ls.some(l=>l.id===+keep)) $("#ledgerSel").value = keep;
   try{ localStorage.setItem("chaimi_ledger", String(lid())); }catch(_){}   // 持久化当前账本（被删/失效时下次自然回落）
   await Promise.all([loadCats(), loadAccs(), loadAttrs(), loadTx(), refreshStats(), loadPendingBadge(), loadSumbarAi(), loadSumbarList(), aiToday()]);
   dtSet($("#monthSel"), thisMonth());
   await fillYearSel();
   syncScopeChips();
+  $("#bdg_amt").value = ""; bdgDirty = false;   // 切账本：预算框退出编辑态，stAccs 按新账本回填（未手改才回填，防覆盖输入）
+  if(document.body.dataset.page === "settings") stLoad();   // 停在设置页切账本：分类/账户/用户/预算各表随新账本重拉
   document.body.dataset.page = document.body.dataset.page || "ai";   // 初始默认 AI 页，供 body[data-page] 样式与顶栏渲染判断
 
   _navStack.push(document.body.dataset.page);
   history.pushState({chaimiNav: document.body.dataset.page}, "");
   moveScopeBar(document.body.dataset.page);
+}
+/* 账本列表同步（lrev 长轮询唤醒：他人共享给我/移除共享/建删改账本）：
+   重拉列表刷新下拉；当前账本已不在列表（被移除/被删）→ home 页自愈回落，
+   不再对着已失权的账本空转 403。幂等，无变化时只是重渲染下拉。 */
+async function syncLedgers(){
+  try{
+    const ls = await getLedgers(true);
+    const sel = $("#ledgerSel");
+    const cur = +sel.value || 0;
+    if(!ls.length || !ls.some(l=>l.id===cur)){ location.replace("static/home.html"); return; }
+    sel.innerHTML = ledgerOptions(ls, cur);
+  }catch(_){}
 }
 async function loadCats(){
   categories = await api(`/api/categories?ledger=${lid()}`);
@@ -306,6 +346,11 @@ function restoreCurUser(){
   let saved = 0;
   try{ saved = +localStorage.getItem("chaimi_user_"+lid()) || 0; }catch(_){}
   curUserId = attrGroups.some(g=>g.id===saved) ? saved : 0;
+  if(!curUserId && ME.username){
+    // 多用户：被共享者默认归属自己（同名归属组由共享时自动创建）；无匹配组再回落选择页
+    const g = attrGroups.find(g=>g.name===ME.username);
+    if(g) curUserId = g.id;
+  }
   renderGreet();
   userGateOpen();
 }
@@ -522,7 +567,9 @@ async function txPostItems(items, meta){   // 逐笔 POST；失败时抛错并�
 }
 function afterTxWrite(){   // 记账成功后统一刷新各页数据
   loadTx(); loadPendingBadge(); refreshStats(); loadSumbarAi(); loadSumbarList(); loadRenqing(); aiToday();
+  loadCats(); loadAccs(); loadAttrs();   // 下拉/弹窗/顶栏的全局数据源（记一笔分类、编辑弹窗账户、用户切换器）——任何端改设置后各端同步
   if(document.body.dataset.page === "io") loadBatches();   // 停在导入页时，远端导入/撤销也同步批次表
+  if(document.body.dataset.page === "settings"){ loadCatMgr(); stAccs(); stAttrs(); loadLedgers(); }   // 停在设置页时，共享对方改分类/账户/用户/预算同步各表
 
   if($("#dayMask").classList.contains("on") && dayRefresh) dayRefresh();
 }
@@ -587,18 +634,25 @@ function editRcpClear(){
    接口全重载,明细弹窗闪「加载中…」并丢选择态/滚动);真错过变更才刷,探测失败
    (网络抖)保守刷一次,兜底性与旧版持平。探测独立于长轮询环,环卡死也能发现变更。 */
 (function(){
-  let _rev = null, _t = null, _ctrl = null;
+  let _rev = null, _lrev = null, _t = null, _lt = null, _ctrl = null;
   const cv = "cv=" + (window.CHAIMI_VER || "");
   const bump = ()=>{ clearTimeout(_t); _t = setTimeout(()=>{ if(typeof afterTxWrite === "function") afterTxWrite(); }, 800); };
-  // rev 基线统一收口：首轮只立基线不刷,此后偏离才刷（loop 与 probe 共用）
-  const seen = rv => { rv = String(rv); if(_rev !== null && rv !== _rev) bump(); _rev = rv; };
+  // lrev（账本列表代数）变化：防抖后重拉账本下拉（共享/移除/建删账本实时生效）
+  const lsync = ()=>{ clearTimeout(_lt); _lt = setTimeout(()=>{ if(typeof syncLedgers === "function") syncLedgers(); }, 400); };
+  // rev/lrev 基线统一收口：首轮只立基线不刷,此后偏离才刷（loop 与 probe 共用）
+  const seen = r => {
+    const rv = String(r.rev), lv = String(r.lrev);
+    if(_rev !== null && rv !== _rev) bump();
+    if(_lrev !== null && lv !== _lrev) lsync();
+    _rev = rv; _lrev = lv;
+  };
   const loop = async ()=>{
     _ctrl = new AbortController();
     const to = setTimeout(()=>_ctrl.abort(), 35000);   // 半开连接兜底:超 hold+10s 强制重开
     try{
-      const r = await fetch("api/rev/wait" + (_rev === null ? "?" : "?since=" + _rev + "&") + cv,
-                            {signal: _ctrl.signal});
-      seen((await r.json()).rev);
+      const q = (_rev === null) ? "?" : `?since=${_rev}&lsince=${_lrev}&`;
+      const r = await fetch("api/rev/wait" + q + cv, {signal: _ctrl.signal});
+      seen((await r.json()));
       setTimeout(loop, 300);
     }catch(_){ setTimeout(loop, 2000); }   // 网络故障/被掐:2s 退避重试
     finally{ clearTimeout(to); }
@@ -607,7 +661,7 @@ function editRcpClear(){
   const probe = async ()=>{
     try{
       const r = await fetch("api/rev/wait?" + cv);
-      seen((await r.json()).rev);
+      seen((await r.json()));
     }catch(_){ bump(); }
   };
   const wake = ()=>{ if(_ctrl) _ctrl.abort(); probe(); };

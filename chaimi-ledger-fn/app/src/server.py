@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 from contextlib import asynccontextmanager
 import base64
@@ -82,8 +83,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="柴米记账", lifespan=lifespan)
 
 _AUTH_EXEMPT = ("/healthz",)   # NAS 探活放行；其余（含静态资源，浏览器记凭证后自动携带）一律过门
-# 自带 Bearer Token 鉴权的网关端点：web_auth 门凭 Token 等价放行（status/test 无自带鉴权，仍过 Basic 门）
-_BOT_TOKEN_PATHS = ("/api/bot/message", "/api/bot/receipt")
 
 def _basic_auth_ok(authorization: str, cfg: dict) -> bool:
     """Basic Auth 常量时间校验（评估 R-04 中期项，默认关闭，见 README 部署前提）。"""
@@ -104,14 +103,11 @@ def _basic_auth_ok(authorization: str, cfg: dict) -> bool:
 async def web_auth_guard(request: Request, call_next):
     """可选 Web 鉴权门（评估 R-04）：chaimi.conf 的 web_auth.enabled=true 时启用。
     定义于 strip_gateway_prefix 之前 → 作为内层中间件拿到剥完网关前缀的路径。
-    凭证为空视为未配置：拒绝并挑战，强制管理员补齐配置（fail-closed）。
-    网关端点（_BOT_TOKEN_PATHS）凭自带 Bearer Token 等价放行：Token 即该链路的门
-    （到达端点后 _bot_guard 同口径再验），Basic Auth 只管浏览器。"""
+    凭证为空视为未配置：拒绝并挑战，强制管理员补齐配置（fail-closed）。"""
     cfg = config.load().get("web_auth") or {}
     if cfg.get("enabled") and request.url.path not in _AUTH_EXEMPT:
         auth = request.headers.get("authorization") or ""
-        if not _basic_auth_ok(auth, cfg) and not (
-                request.url.path in _BOT_TOKEN_PATHS and _bot_token_ok(auth)):
+        if not _basic_auth_ok(auth, cfg):
             return Response(content=b'{"detail":"unauthorized"}', status_code=401,
                             headers={"WWW-Authenticate": 'Basic realm="chaimi-ledger"'},
                             media_type="application/json")
@@ -125,9 +121,52 @@ async def strip_gateway_prefix(request: Request, call_next):
         request.scope["path"] = p
     return await call_next(request)
 
+# ---------- 飞牛用户身份（多用户隔离，MULTIUSER-PLAN.md §2） ----------
+
+# 请求级用户上下文：None=系统上下文（机器人 A 通道轮询 / 本地开发 / 旧版 fnOS，不走 ACL）
+_CTX = contextvars.ContextVar("chaimi_user", default=None)
+
+def _user() -> dict | None:
+    return _CTX.get()
+
+def _uid() -> int | None:
+    u = _CTX.get()
+    return u["uid"] if u else None
+
+def _isadmin() -> bool:
+    u = _CTX.get()
+    return bool(u and u["isadmin"])
+
+@app.middleware("http")
+async def trim_identity(request: Request, call_next):
+    """网关身份解析：X-Trim-Userid/Username/Isadmin → 请求级 ContextVar（官方文档
+    developer.fnnas.com 统一网关章；应用只监听飞牛网关 UDS + 本地开发入口，头不可被
+    外部伪造）。无头=系统上下文；uid 非正整数一律 401（防脏值落库），不静默当系统上下文。"""
+    raw = (request.headers.get("x-trim-userid") or "").strip()
+    if not raw:
+        return await call_next(request)
+    if not raw.isdigit() or int(raw) <= 0:
+        return JSONResponse({"detail": "非法用户身份"}, status_code=401)
+    token = _CTX.set({"uid": int(raw),
+                      "username": (request.headers.get("x-trim-username") or "").strip(),
+                      "isadmin": (request.headers.get("x-trim-isadmin") or "").lower() == "true"})
+    try:
+        return await call_next(request)
+    finally:
+        _CTX.reset(token)
+
+def _admin_or_403() -> None:
+    """应用级操作门（配置写入/备份恢复，MULTIUSER-PLAN §3.3）：
+    系统上下文放行（机器人/本地开发/测试），web 用户须 NAS 管理员。
+    机器人扫码/解绑不在此门——A 通道按账本 ACL 收口（见 qrcode/unbind）。"""
+    if _uid() is not None and not _isadmin():
+        raise HTTPException(403, "该操作需要 NAS 管理员账号（应用级设置由管理员统一管理）")
+
 _auto_backup = backup.AutoBackup()
 _ilink = bot_ilink.ILinkManager()   # 通道 A：多凭证管理(一账本一用户一机器人)
 _REV = {"n": 0}                     # 数据变更计数(写库时 +1,长轮询 /api/rev/wait 按此唤醒前端刷新)
+_LREV = {"n": 0}                    # 账本列表代数(建/删/改账本、共享/移除成员 +1)：他人共享给我/
+                                   # 被移除共享时各端据此重拉账本下拉——rev 只刷当前账本数据不够
 _REV_COND = threading.Condition()  # Condition+wait_for：锁内原子判定谓词，杜绝 Event「检查与挂起之间
                                    # set() 被先醒者 clear() 吃掉」的丢失唤醒（该竞态会让某端变更后
                                    # 延迟整整一个 hold 周期才刷新）
@@ -137,19 +176,23 @@ def _bump_rev() -> None:
         _REV["n"] += 1
         _REV_COND.notify_all()
 
+def _bump_lrev() -> None:
+    """账本列表代数 +1（create/update/delete_ledger、共享/移除成员、恢复备份）。"""
+    with _REV_COND:
+        _LREV["n"] += 1
+        _REV_COND.notify_all()
+
 def _bot_cfg() -> dict:
     """bot 配置段便捷读取（段缺失回退空 dict）；写路径各自 load/save 整份配置。"""
     return config.load().get("bot") or {}
 
 def _bot_apply() -> None:
-    """机器人热切换（DESIGN 十章）：direct=按凭证列表差量启停;其余全停。
-    sidecar 随 mode 一并差量启停（仅 gateway 模式监听 TCP，默认部署不常驻白跑端口）。"""
+    """机器人热切换（DESIGN 十章）：direct=按凭证列表差量启停，其余全停。"""
     cfg = config.load()
     if (cfg.get("bot") or {}).get("mode") == "direct":
         _ilink.apply(bot_ilink.ilink_entries(cfg))
     else:
         _ilink.stop_all()
-    _sidecar_apply()
 
 def _app_version() -> str:
     """应用版本号:优先 build 时生成的 static/version.txt(真机部署树无 manifest),
@@ -212,10 +255,55 @@ def _safe_name(name: str) -> str:
         raise HTTPException(400)
     return name
 
-def _ledger_or_404(ledger_id: int):
-    row = conn().execute("SELECT id FROM ledgers WHERE id=?", (ledger_id,)).fetchone()
+def _ledger_access(ledger_id: int) -> None:
+    """账本访问判定（MULTIUSER-PLAN §2.3）：系统上下文放行（机器人/本地开发）；
+    飞牛用户须为 owner 或共享成员。不存在 404，无权 403。
+    所有带 ledger 参数/可反查 ledger_id 的端点都经此咽喉点。"""
+    uid = _uid()
+    if uid is None:
+        return
+    row = conn().execute("SELECT owner_uid FROM ledgers WHERE id=?", (ledger_id,)).fetchone()
     if not row:
         raise HTTPException(404, "账本不存在")
+    if row["owner_uid"] == uid or conn().execute(
+            "SELECT 1 FROM ledger_members WHERE ledger_id=? AND uid=?", (ledger_id, uid)).fetchone():
+        return
+    raise HTTPException(403, "无权访问该账本（可请所有者共享给你）")
+
+def _my_ledger_ids(uid: int) -> set:
+    """uid 可访问的账本 id 集（owner+共享成员，与 _ledger_access 同口径）。"""
+    return {r["id"] for r in conn().execute(
+        "SELECT id FROM ledgers WHERE owner_uid=? OR id IN "
+        "(SELECT ledger_id FROM ledger_members WHERE uid=?)", (uid, uid))}
+
+def _mine_only(entries: list) -> list:
+    """非管理员视角过滤：机器人绑定只留自己有权账本的（与 qrcode/unbind 的按账本
+    收口同口径）；admin/系统上下文全量。status 成员表 / bot_test 绑定选取共用。"""
+    uid = _uid()
+    if not entries or uid is None or _isadmin():
+        return entries
+    allowed = _my_ledger_ids(uid)
+    return [e for e in entries if e.get("ledger") in allowed]
+
+def _owner_or_403(ledger_id: int) -> None:
+    """账本级管理操作门（改名/删除/共享成员）：仅 owner；系统上下文放行。"""
+    uid = _uid()
+    if uid is None:
+        return
+    row = conn().execute("SELECT owner_uid FROM ledgers WHERE id=?", (ledger_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "账本不存在")
+    if row["owner_uid"] != uid:
+        raise HTTPException(403, "仅账本所有者可操作")
+
+def _row_ledger(table: str, rid: int) -> int:
+    """按资源 id 反查所属账本并过 ACL（id 类端点的越权防护：流水/分类/账户/映射/
+    归属等 id 全库自增，不反查就等于跳过隔离）。行不存在 404。"""
+    row = conn().execute(f"SELECT ledger_id FROM {table} WHERE id=?", (rid,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    _ledger_access(row["ledger_id"])
+    return row["ledger_id"]
 
 # ---------- 页面 / 健康 ----------
 
@@ -260,43 +348,135 @@ class LedgerIn(BaseModel):
     budget: Optional[int] = None
 
 @app.get("/api/ledgers")
-def list_ledgers():
-    return [dict(r) for r in conn().execute("SELECT * FROM ledgers ORDER BY sort, id")]
+def list_ledgers(all: bool = False):
+    """账本列表：飞牛用户=我拥有+共享给我（附 mine 标记，false=共享来的）；
+    ?all=1 仅 admin（设置页机器人绑定的账本下拉需全库账本名）；系统上下文返回全部。"""
+    uid = _uid()
+    if uid is None or (all and _isadmin()):
+        return [dict(r) for r in conn().execute("SELECT * FROM ledgers ORDER BY sort, id")]
+    return [{**dict(r), "mine": r["owner_uid"] == uid} for r in conn().execute(
+        "SELECT * FROM ledgers WHERE owner_uid=? OR id IN "
+        "(SELECT ledger_id FROM ledger_members WHERE uid=?) ORDER BY sort, id", (uid, uid))]
 
 @app.post("/api/ledgers")
 def create_ledger(body: LedgerIn):
     with conn() as c:
-        cur = c.execute("INSERT INTO ledgers(name, icon, currency) VALUES(?,?,?)",
-                        (body.name, body.icon, body.currency))
+        cur = c.execute("INSERT INTO ledgers(name, icon, currency, owner_uid) VALUES(?,?,?,?)",
+                        (body.name, body.icon, body.currency, _uid()))
         lid = cur.lastrowid
         # 新账本同样播种分类/账户（与首建 seed 共用，存在即跳过）
         dbm.seed_ledger_defaults(c, lid)
         # v6 起映射为账本级，新账本需显式种默认映射
         dbm.seed_default_mappings(c, lid)
+    _bump_lrev()   # 各端账本下拉即时出现新账本
     return {"id": lid}
 
 @app.put("/api/ledgers/{lid}")
 def update_ledger(lid: int, body: LedgerIn):
+    _owner_or_403(lid)
     with conn() as c:
         c.execute("UPDATE ledgers SET name=?, icon=?, currency=?, "
                   "budget=COALESCE(?, budget) WHERE id=?",
                   (body.name, body.icon, body.currency, body.budget, lid))
+    _bump_lrev()   # 名字/币种变了，各端下拉标签同步
+    _bump_rev()    # 预算变了，统计与设置页预算行跨端同步
+    return {"ok": True}
+
+class BudgetIn(BaseModel):
+    budget: Optional[int] = None
+
+@app.put("/api/ledgers/{lid}/budget")
+def update_ledger_budget(lid: int, body: BudgetIn):
+    """预算是账本级共享设置：owner 与共享成员都可改（2026-10-29 修订；
+    名称/币种/图标仍 owner-only，走 update_ledger）。"""
+    _ledger_access(lid)
+    with conn() as c:
+        c.execute("UPDATE ledgers SET budget=COALESCE(?, budget) WHERE id=?",
+                  (body.budget, lid))
+    _bump_rev()    # 预算行/统计跨端刷新
+    _bump_lrev()   # 各端 ledgersCache 随账本列表代数换血——预算展示读该缓存，只 bump rev 对端数字不更新
     return {"ok": True}
 
 @app.delete("/api/ledgers/{lid}")
 def delete_ledger(lid: int):
+    _owner_or_403(lid)
     with conn() as c:
-        # import_batches 一并清（审计发现的历史残余：漏清会留孤儿批次行）
+        # import_batches/ledger_members 一并清（审计发现的历史残余：漏清会留孤儿行）
         for t in ("transactions", "import_batches", "category_mappings", "categories",
-                  "accounts", "attributions", "attribution_groups"):
+                  "accounts", "attributions", "attribution_groups", "ledger_members"):
             c.execute(f"DELETE FROM {t} WHERE ledger_id=?", (lid,))
         c.execute("DELETE FROM ledgers WHERE id=?", (lid,))
+    _bump_lrev()   # 正在看该账本的端由 lrev 触发回落选择页
+    return {"ok": True}
+
+# ---------- 飞牛用户 / 账本共享（MULTIUSER-PLAN §3） ----------
+
+@app.get("/api/whoami")
+def whoami():
+    """当前飞牛用户（网关头解析结果）。顺带 UPSERT known_users（共享选人器数据源，
+    fnOS 无用户列表 API）；admin 打开时把升级前的无主账本一次性归属自己（MULTIUSER-PLAN
+    §3.5 定案：旧数据固定给 admin）。"""
+    u = _user()
+    if not u:
+        return {"uid": None, "username": "", "isadmin": False}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with conn() as c:
+        c.execute(
+            "INSERT INTO known_users(uid, username, isadmin, first_seen, last_seen) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(uid) DO UPDATE SET username=excluded.username, "
+            "isadmin=excluded.isadmin, last_seen=excluded.last_seen",
+            (u["uid"], u["username"], 1 if u["isadmin"] else 0, now, now))
+        if u["isadmin"]:
+            n = c.execute("UPDATE ledgers SET owner_uid=? WHERE owner_uid IS NULL",
+                          (u["uid"],)).rowcount
+            if n:
+                log.info(f"多用户迁移：{n} 个无主账本归属 admin「{u['username']}」(uid={u['uid']})")
+    return {"uid": u["uid"], "username": u["username"], "isadmin": u["isadmin"]}
+
+@app.get("/api/users")
+def list_users():
+    """打开过应用的飞牛用户（共享选人器数据源；家庭内网应用，用户名互通无隐私边界）。"""
+    return [dict(r) for r in conn().execute(
+        "SELECT uid, username, isadmin, last_seen FROM known_users ORDER BY last_seen DESC")]
+
+@app.get("/api/ledgers/{lid}/members")
+def list_members(lid: int):
+    _owner_or_403(lid)
+    return [dict(r) for r in conn().execute(
+        "SELECT m.uid, m.added_at, k.username, k.last_seen FROM ledger_members m "
+        "LEFT JOIN known_users k ON k.uid=m.uid WHERE m.ledger_id=? ORDER BY m.uid", (lid,))]
+
+@app.put("/api/ledgers/{lid}/members")
+def add_member(lid: int, body: dict):
+    """共享账本给飞牛用户：对方须打开过应用（known_users 有档）。只授权不动账本数据——
+    不自动建记账用户（用户反馈定案）：对方记账时自选账本里的记账用户，归属口径由
+    owner 在「用户与预算」自理；若存在与对方飞牛用户名同名的记账用户，前端仍会
+    默认选中它（core.restoreCurUser 的同名匹配，机会性生效）。"""
+    _owner_or_403(lid)
+    try:
+        uid = int(body.get("uid") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not conn().execute("SELECT 1 FROM known_users WHERE uid=?", (uid,)).fetchone():
+        raise HTTPException(400, "该用户还没打开过柴米记账，请对方先登录飞牛打开一次应用")
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO ledger_members(ledger_id, uid) VALUES(?,?)", (lid, uid))
+    _bump_lrev()   # 被共享方在线即见新账本（lrev 触发重拉账本下拉）
+    return {"ok": True}
+
+@app.delete("/api/ledgers/{lid}/members")
+def del_member(lid: int, uid: int):
+    _owner_or_403(lid)
+    with conn() as c:
+        c.execute("DELETE FROM ledger_members WHERE ledger_id=? AND uid=?", (lid, uid))
+    _bump_lrev()   # 被移除方正看着该账本 → lrev 触发回落选择页，不再对着 403 空转
     return {"ok": True}
 
 # ---------- 分类 / 账户 ----------
 
 @app.get("/api/categories")
 def list_categories(ledger: int):
+    _ledger_access(ledger)
     rows = [dict(r) for r in conn().execute(
         "SELECT c.*, p.name AS parent_name FROM categories c "
         "LEFT JOIN categories p ON c.parent_id=p.id WHERE c.ledger_id=? ORDER BY c.sort, c.id", (ledger,))]
@@ -310,23 +490,28 @@ class CategoryIn(BaseModel):
 
 @app.post("/api/categories")
 def create_category(ledger: int, body: CategoryIn):
+    _ledger_access(ledger)
     with conn() as c:
         cur = c.execute(
             "INSERT INTO categories(ledger_id, type, name, parent_id, icon) VALUES(?,?,?,?,?)",
             (ledger, body.type, body.name, body.parent_id, body.icon))
+    _bump_rev()   # 账本级设置跨端同步：共享账本任一方改动即唤醒对端刷新（账户/映射/归属分组同）
     return {"id": cur.lastrowid}
 
 @app.put("/api/categories/{cid}")
 def update_category(cid: int, body: CategoryIn):
+    _row_ledger("categories", cid)
     with conn() as c:
         c.execute("UPDATE categories SET name=?, icon=? WHERE id=?", (body.name, body.icon, cid))
         # v6 起映射走 category_id 外键，改名自动联动，无需同步映射表
+    _bump_rev()
     return {"ok": True}
 
 @app.delete("/api/categories/{cid}")
 def delete_category(cid: int):
     """删分类必须回炉关联流水（无分类的行因 INNER JOIN 不进任何列表，只能从
     待确认队列重新归类）——但留审计日志，静默大面积改数据必须可追溯。"""
+    _row_ledger("categories", cid)
     with conn() as c:
         n = c.execute("UPDATE transactions SET category_id=NULL, need_confirm=1 WHERE category_id=?",
                       (cid,)).rowcount
@@ -371,6 +556,7 @@ def _check_attr_group_name(c, ledger: int, name: str, gid: int | None = None) ->
 
 @app.get("/api/attribution-groups")
 def list_attr_groups(ledger: int):
+    _ledger_access(ledger)
     return [dict(r) for r in conn().execute(
         "SELECT g.*, (SELECT COUNT(*) FROM attributions a WHERE a.group_id=g.id) AS member_count, "
         "(SELECT group_concat(a.name, '、') FROM attributions a WHERE a.group_id=g.id) AS members "
@@ -385,29 +571,33 @@ def _check_avatar(v: str) -> str:
         raise HTTPException(400, "头像无效")
     return v
 
-@app.post("/api/attribution-groups")
-def create_attr_group(ledger: int, body: AttrGroupIn):
+def _group_body(body: AttrGroupIn) -> tuple[str, str]:
+    """归属分组请求体校验（新建/改名共用）：名称去空格非空 + 头像合法。"""
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(400, "用户名不能为空")
-    avatar = _check_avatar(body.avatar)
+    return name, _check_avatar(body.avatar)
+
+@app.post("/api/attribution-groups")
+def create_attr_group(ledger: int, body: AttrGroupIn):
+    _ledger_access(ledger)
+    name, avatar = _group_body(body)
     with conn() as c:
         _check_attr_group_name(c, ledger, name)
         _attr_group_absorb(c, ledger, name)   # 同名归属行吸收（其流水经同名路径仍归本组）
         cur = c.execute("INSERT INTO attribution_groups(ledger_id, name, avatar) VALUES(?,?,?)",
                         (ledger, name, avatar))
+    _bump_rev()
     return {"ok": True, "id": cur.lastrowid}
 
 @app.put("/api/attribution-groups/{gid}")
 def rename_attr_group(gid: int, body: AttrGroupIn):
-    name = (body.name or "").strip()
-    if not name:
-        raise HTTPException(400, "用户名不能为空")
-    avatar = _check_avatar(body.avatar)
+    name, avatar = _group_body(body)
     with conn() as c:
         g = c.execute("SELECT ledger_id, name FROM attribution_groups WHERE id=?", (gid,)).fetchone()
         if not g:
             raise HTTPException(404, "分组不存在")
+        _ledger_access(g["ledger_id"])
         _check_attr_group_name(c, g["ledger_id"], name, gid)
         # 手动账存的是组名（编辑弹窗选分组）：改名同步改写已存旧组名的流水，否则会「掉组」
         c.execute("UPDATE transactions SET tags=json_set(tags,'$.attribution',?) "
@@ -415,6 +605,7 @@ def rename_attr_group(gid: int, body: AttrGroupIn):
                   (name, g["ledger_id"], g["name"]))
         _attr_group_absorb(c, g["ledger_id"], name)
         c.execute("UPDATE attribution_groups SET name=?, avatar=? WHERE id=?", (name, avatar, gid))
+    _bump_rev()
     return {"ok": True}
 
 @app.delete("/api/attribution-groups/{gid}")
@@ -424,16 +615,19 @@ def delete_attr_group(gid: int):
         g = c.execute("SELECT ledger_id, name FROM attribution_groups WHERE id=?", (gid,)).fetchone()
         if not g:
             raise HTTPException(404, "用户不存在")
+        _ledger_access(g["ledger_id"])
         n = c.execute("SELECT COUNT(*) FROM attribution_groups WHERE ledger_id=?",
                       (g["ledger_id"],)).fetchone()[0]
         if n <= 1:
             raise HTTPException(400, "至少保留一个用户")
         _clear_user_attribution(c, g["ledger_id"], g["name"])
         c.execute("DELETE FROM attribution_groups WHERE id=?", (gid,))
+    _bump_rev()
     return {"ok": True}
 
 @app.get("/api/attributions")
 def list_attributions(ledger: int):
+    _ledger_access(ledger)
     return [dict(r) for r in conn().execute(
         "SELECT a.*, g.name AS group_name FROM attributions a "
         "LEFT JOIN attribution_groups g ON a.group_id=g.id "
@@ -449,17 +643,20 @@ def update_attribution(aid: int, body: AttrGroupSetIn):
         a = c.execute("SELECT ledger_id FROM attributions WHERE id=?", (aid,)).fetchone()
         if not a:
             raise HTTPException(404, "归属不存在")
+        _ledger_access(a["ledger_id"])
         if body.group_id is not None:
             g = c.execute("SELECT ledger_id FROM attribution_groups WHERE id=?",
                           (body.group_id,)).fetchone()
             if not g or g["ledger_id"] != a["ledger_id"]:
                 raise HTTPException(400, "分组不存在")
         c.execute("UPDATE attributions SET group_id=? WHERE id=?", (body.group_id, aid))
+    _bump_rev()   # 归属分组变化影响统计口径（蝴蝶图/归属下钻），跨端同步刷新
     return {"ok": True}
 
 @app.get("/api/accounts")
 def list_accounts(ledger: int, frm: str = Query("", alias="from"), to: str = ""):
     # frm：形参不能叫 from（Python 关键字），query 名用 alias 保持 ?from=
+    _ledger_access(ledger)
     rows = [dict(r) for r in conn().execute(
         "SELECT * FROM accounts WHERE ledger_id=? ORDER BY sort, id", (ledger,))]
     # spend 口径（毛支出-退款转账）在 db.account_spend_map 唯一实现，与 AI kind=account 共用
@@ -486,16 +683,20 @@ class AccountIn(BaseModel):
 
 @app.post("/api/accounts")
 def create_account(ledger: int, body: AccountIn):
+    _ledger_access(ledger)
     with conn() as c:
         cur = c.execute("INSERT INTO accounts(ledger_id, name, type) VALUES(?,?,?)",
                         (ledger, body.name, body.type))
+    _bump_rev()
     return {"id": cur.lastrowid}
 
 @app.put("/api/accounts/{aid}")
 def update_account(aid: int, body: AccountIn):
+    _row_ledger("accounts", aid)
     with conn() as c:
         c.execute("UPDATE accounts SET name=?, type=? WHERE id=?",
                   (body.name, body.type, aid))
+    _bump_rev()
     return {"ok": True}
 
 @app.delete("/api/accounts/{aid}")
@@ -503,15 +704,14 @@ def delete_account(aid: int):
     """1.0.1 起不再把关联流水打回待确认——旧版 `need_confirm=1` 会把该账户全部
     历史流水瞬间塞满待确认队列（真机事故：删一个旧账户，次日发现待确认爆满）。
     账户置空即可：分类/统计不受影响，流水照常显示为「未指定账户」。"""
+    _row_ledger("accounts", aid)
     c = conn()
-    row = c.execute("SELECT name FROM accounts WHERE id=?", (aid,)).fetchone()
-    if not row:
-        raise HTTPException(404)
+    name = c.execute("SELECT name FROM accounts WHERE id=?", (aid,)).fetchone()["name"]
     with c:
         n = c.execute("UPDATE transactions SET account_id=NULL WHERE account_id=?",
                       (aid,)).rowcount
         c.execute("DELETE FROM accounts WHERE id=?", (aid,))
-    log.info(f"删除账户 #{aid}「{row['name']}」：{n} 笔流水账户置空（分类与确认状态不动）")
+    log.info(f"删除账户 #{aid}「{name}」：{n} 笔流水账户置空（分类与确认状态不动）")
     _bump_rev()
     return {"ok": True, "affected": n}
 
@@ -545,6 +745,7 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
                       renqing_name: str = "", attribution: str = "",
                       to_exclusive: bool = False, with_refunds: bool = False,
                       page: int = 1, page_size: int = 50):
+    _ledger_access(ledger)
     sql = ["SELECT t.*, c.name AS category_name, a.name AS account_name, "
            "ro.id AS ro_id, ro.date AS ro_date, ro.name AS ro_name, ro.note AS ro_note, "
            "ro.amount AS ro_amount, ro.type AS ro_type, ro.category_id AS ro_category_id, "
@@ -655,7 +856,7 @@ def _insert_tx(c, ledger: int, t: TxIn):
 
 @app.post("/api/transactions")
 def create_transaction(ledger: int, body: TxIn):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     with conn() as c:
         tid = _insert_tx(c, ledger, body)
         if body.refund_for:
@@ -671,10 +872,12 @@ def update_transaction(tid: int, body: TxIn):
         # name/merchant/order_no 允许单独更新：传 null 保持原值（COALESCE），不传不会被清空
         # receipt_path：None=保持原值；""=清空(NULL)；非空=覆盖。SQLite 无「参数是否为 NULL」的
         # 内省，原 COALESCE(NULLIF(?, ''), receipt_path) 会把 "" 与 None 同视（都保留原值），
-        old = c.execute("SELECT receipt_path, date, category_id FROM transactions WHERE id=?",
+        # 故用 CASE WHEN 显式三分。
+        old = c.execute("SELECT ledger_id, receipt_path, date, category_id FROM transactions WHERE id=?",
                         (tid,)).fetchone()
         if not old:
             raise HTTPException(404, "流水不存在")
+        _ledger_access(old["ledger_id"])
         old_path = old["receipt_path"]
         c.execute(
             """UPDATE transactions SET type=?, amount=?, category_id=?, account_id=?, to_account_id=?,
@@ -739,7 +942,7 @@ class TxBatchIn(BaseModel):
 
 @app.post("/api/transactions/batch_update")
 def batch_update_transactions(ledger: int, body: TxBatchIn):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     if not body.ids:
         raise HTTPException(400, "未选择流水")
     updated = 0
@@ -752,6 +955,9 @@ def batch_update_transactions(ledger: int, body: TxBatchIn):
             if body.category_id is not None:
                 sets.append("category_id=?")
                 args.append(body.category_id)
+                # 批量改分类=用户手选，与单笔编辑/待确认确认同打 manual_cat（真机 1.0.4 事故：
+                # 漏打导致批量归类的停车费被修复预览翻出来 second-guess）
+                sets.append("manual_cat=1")
             if body.account_id is not None:
                 sets.append("account_id=?")
                 args.append(body.account_id)
@@ -771,8 +977,33 @@ def batch_update_transactions(ledger: int, body: TxBatchIn):
         _bump_rev()
     return {"updated": updated}
 
+class TxBatchDelIn(BaseModel):
+    ids: list[int]
+
+@app.post("/api/transactions/batch_delete")
+def batch_delete_transactions(ledger: int, body: TxBatchDelIn):
+    """批量删除：跳过规则与批量修改同款（跨账本/已删 id 直接跳过，全选后他端删数据的竞态）。
+    逐笔走 delete_tx——删原消费自动解链其退款行；关联小票文件一并清理。"""
+    _ledger_access(ledger)
+    if not body.ids:
+        raise HTTPException(400, "未选择流水")
+    paths = []
+    with conn() as c:
+        for tid in body.ids:
+            row = c.execute("SELECT ledger_id FROM transactions WHERE id=?", (tid,)).fetchone()
+            if not row or row["ledger_id"] != ledger:
+                continue
+            paths.append(dbm.delete_tx(c, tid))
+    for p in paths:
+        bot_core.unlink_receipt(p)   # 无小票路径时 no-op
+    if paths:
+        log.info(f"批量删除 {len(paths)} 笔流水（用户确认触发）")
+        _bump_rev()
+    return {"deleted": len(paths)}
+
 @app.delete("/api/transactions/{tid}")
 def delete_transaction(tid: int):
+    _row_ledger("transactions", tid)
     with conn() as c:
         old_path = dbm.delete_tx(c, tid)
     bot_core.unlink_receipt(old_path)   # 无小票路径时 no-op
@@ -783,6 +1014,7 @@ def delete_transaction(tid: int):
 
 @app.get("/api/pending")
 def pending(ledger: int, kind: str = ""):
+    _ledger_access(ledger)
     sql = ("SELECT t.*, c.name AS category_name, " + _ATTR_DISPLAY + " "
            "FROM transactions t "
            "LEFT JOIN categories c ON t.category_id=c.id "
@@ -802,10 +1034,9 @@ class ResolveIn(BaseModel):
 def resolve_pending(tid: int, body: ResolveIn):
     """处理待确认：改分类 / 关联退款。改分类只对当笔负责（manual_cat 保护），
     不回写学习映射——1.0.2 前这里会把用户手选泛化成该源分类的全局规则。"""
+    _row_ledger("transactions", tid)
     c = conn()
-    tx = c.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()
-    if not tx:
-        raise HTTPException(404)
+    tx_amount = c.execute("SELECT amount FROM transactions WHERE id=?", (tid,)).fetchone()["amount"]
     with c:
         if body.category_id is not None:
             # 待确认里选分类=用户手选 → 打 manual_cat 标，数据修复不再翻动
@@ -815,7 +1046,7 @@ def resolve_pending(tid: int, body: ResolveIn):
             c.execute("UPDATE transactions SET account_id=? WHERE id=?", (body.account_id, tid))
         if body.refund_for is not None:
             # 队列确认的退款关联与手动编辑同一套校验/口径（_link_refund），high=人工已核对
-            _link_refund(c, tid, body.refund_for, tx["amount"], confidence="high")
+            _link_refund(c, tid, body.refund_for, tx_amount, confidence="high")
         c.execute("UPDATE transactions SET need_confirm=0 WHERE id=?", (tid,))
     _bump_rev()
     return {"ok": True}
@@ -824,18 +1055,22 @@ def resolve_pending(tid: int, body: ResolveIn):
 
 @app.get("/api/stats/summary")
 def stats_summary(ledger: int, month: str):
+    _ledger_access(ledger)
     return dbm.stats_summary(conn(), ledger, month)
 
 @app.get("/api/stats/calendar")
 def stats_calendar(ledger: int, month: str):
+    _ledger_access(ledger)
     return dbm.stats_calendar(conn(), ledger, month)
 
 @app.get("/api/stats/category")
 def stats_category(ledger: int, month: str, type: str = "expense"):
+    _ledger_access(ledger)
     return dbm.stats_category(conn(), ledger, month, type)
 
 @app.get("/api/stats/monthly")
 def stats_monthly(ledger: int, year: str):
+    _ledger_access(ledger)
     try:
         nxt = int(year) + 1
     except ValueError:
@@ -844,20 +1079,24 @@ def stats_monthly(ledger: int, year: str):
 
 @app.get("/api/stats/yearly")
 def stats_yearly(ledger: int):
+    _ledger_access(ledger)
     return dbm.stats_yearly(conn(), ledger)
 
 @app.get("/api/stats/trend")
 def stats_trend_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
     """任意区间的按月趋势。"""
+    _ledger_access(ledger)
     return dbm.stats_trend(conn(), ledger, _from, to)
 
 @app.get("/api/stats/range")
 def stats_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
+    _ledger_access(ledger)
     return dbm.stats_summary_range(conn(), ledger, _from, to)
 
 @app.get("/api/stats/category-range")
 def stats_category_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...,
                          type: str = "expense"):
+    _ledger_access(ledger)
     return dbm.stats_category_range(conn(), ledger, _from, to, type)
 
 def _attribution_rows(ledger: int, _from: str, to: str) -> list[dict]:
@@ -868,12 +1107,14 @@ def _attribution_rows(ledger: int, _from: str, to: str) -> list[dict]:
 
 @app.get("/api/stats/attribution")
 def stats_attribution(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
+    _ledger_access(ledger)
     return _attribution_rows(ledger, _from, to)
 
 @app.get("/api/stats/renqing")
 def stats_renqing(ledger: int):
     """人情往来汇总：db.stats_renqing 唯一实现（统计页与 AI 查账 kind=renqing 共用）。
-    given=我给出（支出）、received=我收到（收入），balance=given-received>0 即对方尚未还礼。"""
+    given=我给出（支出），received=我收到（收入），balance=given-received>0 即对方尚未还礼。"""
+    _ledger_access(ledger)
     return dbm.stats_renqing(conn(), ledger)
 
 # ---------- 导入 / 导出 ----------
@@ -895,7 +1136,7 @@ def _upload_guard(filename: str | None, data: bytes) -> None:
 @app.post("/api/import/parse")
 async def import_parse(ledger: int, file: UploadFile = File(...), use_ai: bool = True,
                        template: str = Form("")):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     data = await file.read()
     _upload_guard(file.filename, data)
     try:
@@ -932,7 +1173,7 @@ class ConfirmIn(BaseModel):
 
 @app.post("/api/import/confirm")
 def import_confirm(ledger: int, body: ConfirmIn):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     batch_id = ib.apply_import(conn(), ledger, body.previews, body.filename, body.source)
     n = conn().execute("SELECT count FROM import_batches WHERE id=?", (batch_id,)).fetchone()[0]
     with conn() as c:
@@ -947,11 +1188,13 @@ def import_confirm(ledger: int, body: ConfirmIn):
 
 @app.get("/api/import/batches")
 def list_batches(ledger: int):
+    _ledger_access(ledger)
     return [dict(r) for r in conn().execute(
         "SELECT * FROM import_batches WHERE ledger_id=? ORDER BY id DESC", (ledger,))]
 
 @app.delete("/api/import/batches/{batch_id}")
 def undo_import(batch_id: int):
+    _row_ledger("import_batches", batch_id)
     n = ib.undo_batch(conn(), batch_id)
     _bump_rev()
     return {"deleted": n}
@@ -963,12 +1206,12 @@ def undo_import(batch_id: int):
 
 @app.get("/api/repair/preview")
 def repair_preview(ledger: int):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     return ic.repair_preview(conn(), ledger)
 
 @app.post("/api/repair/apply")
 def repair_apply(ledger: int):
-    _ledger_or_404(ledger)
+    _ledger_access(ledger)
     r = ic.repair_apply(conn(), ledger)
     _bump_rev()
     return r
@@ -1111,6 +1354,7 @@ def _export_table(rows, ledger_id: int) -> list:
 def export_receipts(ledger: int, _from: str = Query("", alias="from"), to: str = ""):
     """小票打包下载：按所选时间范围把流水带的小票打成 zip。
     文件名 = 日期_交易名.jpeg（重名加交易 id 前缀）；范围/账本内无小票返回 404 提示。"""
+    _ledger_access(ledger)
     sql = ("SELECT t.id, t.date, t.name, t.receipt_path FROM transactions t "
            "WHERE t.ledger_id=? AND t.receipt_path IS NOT NULL AND t.receipt_path!=''")
     frag, params = _date_where(_from, to, end="<=")
@@ -1118,16 +1362,15 @@ def export_receipts(ledger: int, _from: str = Query("", alias="from"), to: str =
     args: list = [ledger, *params]
     rows = conn().execute(sql + " ORDER BY t.date", args).fetchall()
     rdir = config.receipts_dir()
-    files = [(rdir / Path(r["receipt_path"]).name) for r in rows]
-    files = [f for f in files if f.is_file()]
-    if not files:
+    # 行与文件成对过滤（文件缺失剔除该对）：zip(rows, files) 在中间文件缺失时会错位配对
+    pairs = [(r, rdir / Path(r["receipt_path"]).name) for r in rows]
+    pairs = [(r, f) for r, f in pairs if f.is_file()]
+    if not pairs:
         raise HTTPException(404, "所选范围内没有小票")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
         used: set[str] = set()
-        for r, f in zip(rows, files):
-            if not f.is_file():
-                continue
+        for r, f in pairs:
             safe = "".join(c for c in (r["name"] or "小票") if c not in '\\/:*?"<>|')[:30] or "小票"
             name = f"{(r['date'] or '')[:10]}_{safe}{f.suffix}"
             while name in used:   # 同日同名：加交易 id 防覆盖
@@ -1141,6 +1384,7 @@ def export_receipts(ledger: int, _from: str = Query("", alias="from"), to: str =
 
 @app.get("/api/export")
 def export(ledger: int, _from: str = Query("", alias="from"), to: str = "", format: str = "json"):
+    _ledger_access(ledger)
     sql = ("SELECT t.id, t.refund_for, t.date, t.type, t.amount, t.name, c.name AS category, "
            "a.name AS account, a2.name AS to_account, t.note, "
            "t.order_no, t.source, t.tags, " + _ATTR_DISPLAY + " "
@@ -1205,6 +1449,7 @@ class MappingIn(BaseModel):
 
 @app.get("/api/mappings")
 def list_mappings(ledger: int):
+    _ledger_access(ledger)
     return [dict(r) for r in conn().execute(
         "SELECT m.id, m.flow_type, m.source, m.category_id, m.learned, c.name AS target "
         "FROM category_mappings m JOIN categories c ON m.category_id=c.id "
@@ -1213,38 +1458,46 @@ def list_mappings(ledger: int):
 @app.post("/api/mappings")
 def create_mapping(ledger: int, body: MappingIn):
     """v6：目标必须是已存在的分类（category_id 外键），悬空映射从结构上不可能。"""
+    _ledger_access(ledger)
     if not dbm.top_cat_by_id(conn(), ledger, body.category_id):
         raise HTTPException(400, "目标分类不存在或不属于当前账本")
     with conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO category_mappings(ledger_id, flow_type, source, category_id) VALUES(?,?,?,?)",
             (ledger, body.flow_type, body.source.strip(), body.category_id))
+    _bump_rev()
     return {"ok": True}
 
 @app.delete("/api/mappings/{mid}")
 def delete_mapping(mid: int):
+    _row_ledger("category_mappings", mid)
     with conn() as c:
         c.execute("DELETE FROM category_mappings WHERE id=?", (mid,))
+    _bump_rev()
     return {"ok": True}
 
 @app.put("/api/mappings/{mid}")
 def update_mapping(mid: int, body: dict):
     """编辑模式改名：只改本条映射的匹配词；目标 = 分类本身（改名走分类接口，外键自动联动）。"""
+    _row_ledger("category_mappings", mid)
     source = (body.get("source") or "").strip()
     if not source:
         raise HTTPException(400, "无可更新字段")
     with conn() as c:
         c.execute("UPDATE category_mappings SET source=? WHERE id=?", (source[:60], mid))
+    _bump_rev()
     return {"ok": True}
 
 # ---------- 备份 ----------
 
 @app.post("/api/backup")
 def do_backup():
+    _admin_or_403()   # 整库备份含所有用户的账本（MULTIUSER-PLAN §3.3）
     return backup.create_backup()
 
 @app.get("/api/backups")
 def get_backups():
+    _admin_or_403()
     return backup.list_backups()
 
 def _backup_call(op, name: str) -> None:
@@ -1256,21 +1509,25 @@ def _backup_call(op, name: str) -> None:
 
 @app.post("/api/restore")
 def do_restore(body: dict):
+    _admin_or_403()   # 恢复整库影响所有用户
     _backup_call(backup.restore_backup, body.get("file", ""))
     dbm.init_db()
-    # chaimi.conf 随备份回滚：sidecar(18710)/直连轮询线程必须按新模式差量对齐，
-    # 否则旧 gateway 的监听会残留（off 后端口仍开），或恢复 gateway 却不开
+    # chaimi.conf 随备份回滚：直连轮询线程必须按新模式差量对齐，否则旧监听残留
     _bot_apply()
+    _bump_rev()    # 整库被替换：各端全量刷新（数据 + 账本列表）
+    _bump_lrev()
     return {"ok": True}
 
 @app.post("/api/backups/delete")
 def backup_delete(body: dict):
+    _admin_or_403()
     _backup_call(backup.delete_backup, body.get("file", ""))
     return {"ok": True}
 
 @app.get("/api/backups/download")
 def backup_download(file: str = Query(...)):
     """下载备份文件到本地（文件名校验同 restore）。"""
+    _admin_or_403()
     try:
         p = backup._locate(file)
     except (ValueError, FileNotFoundError) as e:
@@ -1280,6 +1537,7 @@ def backup_download(file: str = Query(...)):
 @app.get("/api/logs/download")
 def logs_download():
     """日志收集打包下载（参考 liuku）：运行日志 + 飞牛安装日志，ZIP 内存打包。"""
+    _admin_or_403()
     sources: list[tuple[str, Path]] = []          # (zip内路径, 源文件)
     sources.append(("app/chaimi-ledger.log", config.log_path()))   # applog 轮转文件（本地开发也有）
     if config.TRIM_PKGVAR:
@@ -1328,9 +1586,8 @@ def _mask(d: dict, *keys: str) -> None:
 def get_config():
     cfg = config.load()
     _mask(cfg["llm"], "api_key", "vl_api_key")
+    # A 通道凭证掩码；兼容旧版单 dict 与列表两种形态
     bot = cfg.get("bot") or {}
-    _mask(bot, "api_token")
-    # A 通道凭证同口径掩码；兼容旧版单 dict 与列表两种形态
     ilink = bot.get("ilink")
     for e in ([ilink] if isinstance(ilink, dict) else (ilink or [])):
         if isinstance(e, dict):
@@ -1341,7 +1598,7 @@ def get_config():
 _LLM_KEYS = ("base_url", "model", "vl_model", "api_key", "vl_base_url", "vl_api_key")
 
 def _cfg_int(b: dict, old: dict, key: str, lo: int, hi: int) -> int:
-    """配置数字字段钳制（backup/bot 共用）：越界截断，非数字 400。"""
+    """配置数字字段钳制（备份计划用）：越界截断，非数字 400。"""
     try:
         return max(lo, min(hi, int(b.get(key, old[key]))))
     except (TypeError, ValueError):
@@ -1349,6 +1606,7 @@ def _cfg_int(b: dict, old: dict, key: str, lo: int, hi: int) -> int:
 
 @app.put("/api/config")
 def put_config(body: dict):
+    _admin_or_403()   # AI Key/机器人/备份计划是应用级配置，管理员统一管理（MULTIUSER-PLAN §3.3）
     cfg = config.load()
     for k, v in (body.get("llm") or {}).items():
         if k not in _LLM_KEYS:   # 白名单外的键不落盘（防任意键注入配置文件）
@@ -1368,20 +1626,12 @@ def put_config(body: dict):
     if isinstance(body.get("bot"), dict):
         b = body["bot"]
         old = cfg.setdefault("bot", {})
-        if b.get("mode") in ("off", "direct", "gateway"):
+        if b.get("mode") in ("off", "direct"):   # 网关模式(B通道)已下线
             old["mode"] = b["mode"]
-        if b.get("default_ledger") is not None:
-            try:
-                old["default_ledger"] = int(b["default_ledger"])
-            except (TypeError, ValueError):
-                raise HTTPException(400, "default_ledger 必须是数字")
-        for key in ("allowed_users", "gateway_users"):   # 网关白名单独立保存(默认 ["gateway"])
-            if isinstance(b.get(key), list):
-                old[key] = [str(x).strip() for x in b[key] if str(x).strip()]
-        if isinstance(b.get("api_token"), str) and b["api_token"] != "***":
-            old["api_token"] = b["api_token"].strip()
+        if isinstance(b.get("allowed_users"), list):
+            old["allowed_users"] = [str(x).strip() for x in b["allowed_users"] if str(x).strip()]
     config.save(cfg)
-    _bot_apply()   # 热切换（6.2）：direct 启停轮询线程 / gateway 放行 API / off 全停
+    _bot_apply()   # 热切换（6.2）：direct 启停轮询线程 / off 全停
     return {"ok": True}
 
 # ---------- AI ----------
@@ -1391,10 +1641,11 @@ class AiParseIn(BaseModel):
 
 @app.post("/api/ai/parse")
 def ai_parse(ledger: int, body: AiParseIn):
+    _ledger_access(ledger)
     return ai.parse_booking(body.text, ledger, date.today().strftime("%Y-%m-%d"))
 
 async def _save_receipt(file: UploadFile) -> tuple[Path, str]:
-    """上传小票落盘（/api/ai/receipt 与 /api/bot/receipt 共用）：魔数校验 + 裁剪压缩 + 时间戳随机名。
+    """上传小票落盘（/api/ai/receipt 用）：魔数校验 + 裁剪压缩 + 时间戳随机名。
     process_receipt 原地覆写：裁掉桌面留白 + 缩至 1080px + JPEG 85（典型 3MB→200KB）。"""
     data = await file.read()
     if not bot_core.is_image(data):
@@ -1409,6 +1660,7 @@ async def _save_receipt(file: UploadFile) -> tuple[Path, str]:
 
 @app.post("/api/ai/receipt")
 async def ai_receipt(ledger: int, file: UploadFile = File(...)):
+    _ledger_access(ledger)
     path, rp = await _save_receipt(file)
     result = ai.parse_receipt(str(path))
     if result.get("error"):
@@ -1462,17 +1714,20 @@ def sweep_orphan_receipts(grace_hours: int = 24) -> int:
         log.info(f"兜底清理 {n} 个无引用小票文件")
     return n
 
+def _sse(gen) -> StreamingResponse:
+    """AI 事件流统一响应（X-Accel-Buffering 关网关缓冲，前端逐块收到）。"""
+    return StreamingResponse(ai.sse_stream(gen), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
 @app.get("/api/ai/analyze")
 def ai_analyze(ledger: int, month: str):
-    return StreamingResponse(ai.sse_stream(ai.monthly_analysis(ledger, month)),
-                             media_type="text/event-stream",
-                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+    _ledger_access(ledger)
+    return _sse(ai.monthly_analysis(ledger, month))
 
 @app.get("/api/ai/chat")
 def ai_chat(ledger: int, q: str):
-    return StreamingResponse(ai.sse_stream(ai.chat(q, ledger)),
-                             media_type="text/event-stream",
-                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+    _ledger_access(ledger)
+    return _sse(ai.chat(q, ledger))
 
 # ---------- 静态资源（小票图） ----------
 
@@ -1516,83 +1771,45 @@ def crop_receipt(path: str = Query(...), body: dict = None):
     except Exception as e:
         raise HTTPException(500, f"裁剪失败: {e}")
 
-class BotMsgIn(BaseModel):
+class BotTestIn(BaseModel):
     text: str = ""
-    user: str = "gateway"
 
 def _ct_eq(a: str, b: str) -> bool:
-    """常量时间字符串比较（Token/Basic Auth 共用）：非 ASCII 输入判失败而非抛异常。"""
+    """常量时间字符串比较（Basic Auth 用）：非 ASCII 输入判失败而非抛异常。"""
     try:
         return secrets.compare_digest(a, b)
     except (TypeError, UnicodeError):
         return False
 
-def _token_ok(authorization: str, token: str) -> bool:
-    """常量时间 Bearer 校验（评估 R-08）：逐字节比较不随匹配长度泄漏时序。"""
-    return authorization.startswith("Bearer ") and _ct_eq(authorization, f"Bearer {token}")
-
-def _bot_token_ok(authorization: str) -> bool:
-    """网关 Bearer Token 是否有效（_bot_guard 的布尔版，供 web_auth 门放行判定，同口径）：
-    gateway 模式 + 已配置 api_token + 常量时间校验。任一不满足都不放行。"""
-    cfg = _bot_cfg()
-    token = cfg.get("api_token") or ""
-    return cfg.get("mode") == "gateway" and bool(token) and _token_ok(authorization, token)
-
-def _bot_guard(authorization: str) -> None:
-    """B 通道双门：mode=gateway 才放行 + Bearer Token 校验（设置页生成/重置）。"""
-    cfg = _bot_cfg()
-    if cfg.get("mode") != "gateway":
-        raise HTTPException(403, "机器人未启用网关模式（App 设置→微信机器人）")
-    token = cfg.get("api_token") or ""
-    if not token or not _token_ok(authorization, token):
-        raise HTTPException(401, "Token 无效（设置→微信机器人→生成 Token）")
-
-@app.post("/api/bot/message")
-def bot_message(body: BotMsgIn, request: Request):
-    """外部网关（OpenClaw/Hermes 等）→ bot_core。同步接口：LLM 解析 2~10s、
-    查账多轮可 20s+，网关侧技能调用超时建议 120s。"""
-    _bot_guard(request.headers.get("authorization") or "")
-    return {"reply": bot_core.handle(body.text, body.user or "gateway")}
-
-@app.post("/api/bot/receipt")
-async def bot_receipt(request: Request, file: UploadFile = File(...), user: str = "gateway"):
-    """小票图片 → bot_core（开草稿/追加）。与 /api/ai/receipt 同款落盘，走 bot 链路。"""
-    _bot_guard(request.headers.get("authorization") or "")
-    path, rp = await _save_receipt(file)
-    reply = bot_core.handle("", user, image_path=str(path))
-    out = {"reply": reply}
-    if path.exists():   # 识别失败时 _receipt 已清理文件，不再回传失效路径
-        out["receipt_path"] = rp
-    return out
-
-@app.get("/api/bot/status")
-def bot_status(user: str = "gateway"):
-    """面板 / MCP 共用：模式与草稿态（不含敏感字段）。"""
-    return bot_core.status(user)
-
 @app.post("/api/bot/test")
-def bot_test(body: BotMsgIn):
-    """设置页「测试」按钮：面板上下文直调 bot_core（bypass_auth，不耗 Token）;
-    """
-    return {"reply": bot_core.handle(body.text, "_panel", bypass_auth=True)}
+def bot_test(body: BotTestIn):
+    """设置页「测试」按钮：按直连绑定的账本+归属走完整机器人链路（bypass_auth）。
+    admin/系统上下文取首条绑定；普通用户取自己有权账本的首条（免得测试账落进他人账本）。
+    B 通道（网关/MCP/TCP sidecar）已下线——bot 仅剩 A 通道 iLink 直连。"""
+    entries = _mine_only(bot_ilink.ilink_entries(config.load()))
+    if not entries:
+        return {"reply": "尚无直连绑定：请先在上方选账本和用户生成二维码、扫码绑定后再测试"}
+    e = entries[0]
+    return {"reply": bot_core.handle(body.text, "_panel", bypass_auth=True,
+                                     ledger_id=int(e.get("ledger") or 0),
+                                     attribution=str(e.get("label") or ""))}
 
 @app.get("/api/rev/wait")
-def rev_wait(since: int = -1, hold: int = 25):
-    """长轮询(方案B,替代被飞牛网关掐杀的 SSE 无限流):挂住直到 rev 偏离 since
-    或 hold 秒超时再返回;不带 since 立即返回当前值(首轮立基线/回前台轻量探测共用)。
-    每个请求时长有限(<60s 网关掐杀线,hold 收敛 1..30s),缓冲网关下照常送达——
-    与 AI 聊天流可用同理。前端循环调用,变更后 1s 内刷新。"""
+def rev_wait(since: int = -1, lsince: int = -1, hold: int = 25):
+    """长轮询(方案B,替代被飞牛网关掐杀的 SSE 无限流):挂住直到 rev(数据代数)或
+    lrev(账本列表代数,多用户共享/移除实时生效)偏离 since/lsince,或 hold 秒超时再返回;
+    双缺省(首轮立基线/轻量探测)立即返回当前值。每请求时长有限(<60s 网关掐杀线,
+    hold 收敛 1..30s),缓冲网关下照常送达——与 AI 聊天流可用同理。前端循环调用,变更后
+    1s 内刷新。lsince 缺省 -1=不参与判定(旧客户端兼容:仍只看 rev)。"""
+    def _changed() -> bool:
+        if since >= 0 and _REV["n"] != since:
+            return True
+        if lsince >= 0 and _LREV["n"] != lsince:
+            return True
+        return since < 0 and lsince < 0
     with _REV_COND:
-        _REV_COND.wait_for(lambda: _REV["n"] != since, timeout=max(1, min(hold, 30)))
-        return {"rev": _REV["n"]}
-
-@app.post("/api/bot/token")
-def bot_token():
-    """生成/重置 B 通道 Token（明文仅此一次返回；GET /api/config 回显掩码）。"""
-    cfg = config.load()
-    cfg.setdefault("bot", {})["api_token"] = secrets.token_hex(16)
-    config.save(cfg)
-    return {"token": cfg["bot"]["api_token"]}
+        _REV_COND.wait_for(_changed, timeout=max(1, min(hold, 30)))
+        return {"rev": _REV["n"], "lrev": _LREV["n"]}
 
 # ---------- 通道 A：iLink 直连（DESIGN 10.3） ----------
 
@@ -1625,14 +1842,18 @@ def _ilink_on_confirmed(bot, creds: dict) -> None:
 
 @app.post("/api/bot/ilink/qrcode")
 def bot_ilink_qrcode(body: dict):
-    """按账本发起扫码(DESIGN 10.6):{ledger, label}——扫哪个账本的码记哪本。"""
-    # 入口闸:直连未开启不发票,网关/关闭模式下扫码无意义(回调还有出口闸兜底)
-    if _bot_cfg().get("mode") != "direct":
-        raise HTTPException(400, "直连未开启：请先把模式切到「直连」再扫码")
+    """按账本发起扫码(DESIGN 10.6):{ledger, label}——扫哪个账本的码记哪本。
+    权限=目标账本 ACL（A 通道按账本收口，成员可给自己的账本发起绑定）；
+    模式总开关/白名单仍是应用级配置（admin，MULTIUSER-PLAN §3.3）。"""
     try:
         ledger = int(body.get("ledger") or 1)
     except (TypeError, ValueError):
         raise HTTPException(400, "ledger 必须是数字")
+    if _uid() is not None and not _isadmin():
+        _ledger_access(ledger)
+    # 入口闸:直连未开启不发票,网关/关闭模式下扫码无意义(回调还有出口闸兜底)
+    if _bot_cfg().get("mode") != "direct":
+        raise HTTPException(400, "微信扫码未开启：请先把模式切到「微信扫码」再生成二维码")
     label = str(body.get("label") or "")[:20]
     try:
         return _ilink.begin_login(ledger, label, "", _ilink_on_confirmed)
@@ -1641,20 +1862,25 @@ def bot_ilink_qrcode(body: dict):
 
 @app.get("/api/bot/ilink/status")
 def bot_ilink_status():
-    """直连聚合状态:待扫码态 + 各成员实例状态(多人记账)。"""
+    """直连聚合状态:待扫码态 + 各成员实例状态(多人记账)。
+    非管理员仅见自己有权访问的账本的绑定（与 qrcode/unbind 的按账本收口同口径）。"""
     return {"mode": _bot_cfg().get("mode", "off"),
-            "pending": _ilink.pending(), "bots": _ilink.states()}
+            "pending": _ilink.pending(), "bots": _mine_only(_ilink.states())}
 
 @app.post("/api/bot/ilink/unbind")
 def bot_ilink_unbind(body: dict):
-    """解绑成员:停实例 + 删凭证(白名单保守不动,孤儿 id 无害)。"""
+    """解绑成员:停实例 + 删凭证(白名单保守不动,孤儿 id 无害)。
+    权限与 qrcode 同口径：admin 全局管，普通用户只能解绑自己账本的绑定。"""
     aid = str(body.get("account_id") or "")
     if not aid:
         raise HTTPException(400, "account_id 必填")
     cfg = config.load()
-    bot_cfg = cfg.setdefault("bot", {})
-    bot_cfg["ilink"] = [e for e in bot_ilink.ilink_entries(cfg)
-                        if str(e.get("account_id")) != aid]
+    entries = bot_ilink.ilink_entries(cfg)
+    entry = next((e for e in entries if str(e.get("account_id")) == aid), None)
+    if entry and _uid() is not None and not _isadmin():
+        _ledger_access(int(entry.get("ledger") or 0))
+    cfg.setdefault("bot", {})["ilink"] = [e for e in entries
+                                          if str(e.get("account_id")) != aid]
     config.save(cfg)
     _bot_apply()
     return {"ok": True}
@@ -1679,41 +1905,6 @@ def bot_ilink_qrimg():
     return Response(buf.getvalue(), media_type="image/png",
                     headers={"Cache-Control": "no-cache"})
 
-_SIDECAR: dict = {"server": None}   # 当前 sidecar 实例（None=未启动）；should_exit 置位即优雅退出
-
-def _sidecar_run(srv) -> None:
-    """线程体：独立线程隔离（失败只损失直连不影响主服务）；退出后注销实例。"""
-    try:
-        srv.run()
-    except Exception as e:   # noqa: BLE001 - sidecar 任何失败都不许拖垮主服务
-        log.warning(f"tcp-sidecar 启动失败（忽略，B 通道直连不可用）: {e}")
-    finally:
-        if _SIDECAR["server"] is srv:
-            _SIDECAR["server"] = None
-
-def _sidecar_apply() -> None:
-    """B 通道 TCP 直连（与 UDS 并行，DESIGN 10.4）——飞牛部署只有 Unix socket，
-    容器/外部进程（OpenClaw 的 MCP/REST）走 HTTP 进不来，需要一条不经飞牛网关的 TCP 通道。
-    随 bot.mode 差量启停（_bot_apply 调用，与轮询线程/网关开关同一条热切换链）：
-    gateway=按 CHAIMI_BOT_BIND/CHAIMI_BOT_PORT 监听（默认 127.0.0.1:18710）；其余模式优雅停。
-    lifespan=off：启动钩子由 UDS 主服务独跑不重复；端口独立于 --port（本地开发主服务口）。"""
-    want = _bot_cfg().get("mode") == "gateway"
-    bind = os.environ.get("CHAIMI_BOT_BIND", "127.0.0.1")
-    if bind.lower() in ("off", "", "0"):
-        return
-    srv = _SIDECAR["server"]
-    if want and srv is None:
-        # log_config=None：sidecar 不重配进程级 uvicorn logger——否则其 warning 级配置
-        # 会把主服务的访问日志（INFO）一并静默（真机 10-13 实测：热切网关后 info.log 失明）
-        srv = uvicorn.Server(uvicorn.Config(
-            app, host=bind, port=int(os.environ.get("CHAIMI_BOT_PORT", "18710")),
-            lifespan="off", log_config=None))
-        _SIDECAR["server"] = srv   # 先登记再起线程：快速切换时防重复启动
-        log.info(f"tcp-sidecar 监听 {bind}:{srv.config.port}（网关模式）")
-        threading.Thread(target=_sidecar_run, args=(srv,), daemon=True, name="tcp-sidecar").start()
-    elif not want and srv is not None:
-        srv.should_exit = True   # uvicorn serve 循环检查位：优雅退出
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--uds")
@@ -1721,7 +1912,6 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=18710)
     args = ap.parse_args()
     if args.uds:
-        # B 通道 TCP 直连由 _startup→_bot_apply→_sidecar_apply 按 bot.mode 差量启停（仅 gateway 监听）
         uvicorn.run(app, uds=args.uds, log_level="info")
     else:
         uvicorn.run(app, host=args.host, port=args.port, log_level="info")

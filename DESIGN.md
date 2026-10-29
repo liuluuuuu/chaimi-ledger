@@ -2,7 +2,7 @@
 
 > 飞牛 NAS（fnOS）原生家庭记账应用。多账本分账 + 账单导入 + 统计看板 + AI 记账 + 微信机器人，数据全在本机 SQLite。
 >
-> 状态：**v1.0.0（首个正式版，2026-10-18）**。本文描述当前实现。
+> 状态：**v1.0.4（2026-10-24）**。本文描述当前实现。
 
 ***
 
@@ -12,16 +12,16 @@
 - **存储**：SQLite 单文件（`chaimi.db`），零配置，备份 = 拷文件
 - **后端**：FastAPI（Python 3.12，`--target` 隔离装依赖，不污染系统）
 - **前端**：单 HTML + 原生 JS + Chart.js 4（按需加载，无构建链）
-- **用户模型**：家庭共用，多账本（日常/旅行/装修），「用户」是记账人维度而非登录账号，无权限隔离（内网部署信任飞牛网关鉴权）
-- **AI**：OpenAI 兼容协议，设置页填 Key 即用（文本默认 DeepSeek，视觉默认 qwen-vl-max，兼容百炼/智谱/本地模型）
-- **微信机器人**：同一份记账大脑，直连微信（iLink 长轮询）或经外部 Agent 网关（REST/MCP）调用
+- **用户模型**：飞牛多用户（v1.0.4）——登录身份取自飞牛网关注入的请求头，各自账本互不可见、可共享（单账本多人记账互见）；「用户」（归属分组）是账本内的记账人维度而非登录账号。应用级配置 admin 收口；账本级数据按 ACL（owner/共享成员），分类/映射/账户/用户/预算成员均可写，账本名/币种/删除/共享管理仅 owner
+- **AI**：OpenAI 兼容协议，设置页填 Key 即用（预设百炼/智谱/DeepSeek 均含文本+视觉，亦支持本地模型；视觉模型缺位时图片记账自动禁用）
+- **微信机器人**：同一份记账大脑，直连微信（iLink 长轮询，A 通道；B 通道网关/MCP 已于 v1.0.4 下线）
 
 ### 模块清单（app/src/）
 
 | 文件 | 职责 |
 |---|---|
 | server.py | FastAPI 入口：记账 CRUD / 统计 / 导入 / 配置 / 备份 / AI / bot 路由 |
-| config.py | JSON 配置（chaimi.conf）+ TRIM_* 环境变量 + llm/vision/bot 段 |
+| config.py | JSON 配置（chaimi.conf）+ TRIM_* 环境变量 + llm（含视觉 vl_*）/backup/bot/web_auth 段 |
 | db.py | SQLite schema、迁移、公共查询、默认映射种子（DEFAULT_MAPPINGS） |
 | import_bill.py | 导入门面：统一路由 + 模板引擎与原语（对外入口 `parse_bill/build_previews`） |
 | platform_templates.py | 内置平台模板声明数据（支付宝/微信/京东/导出/美团，随应用发版） |
@@ -33,7 +33,6 @@
 | backup.py | SQLite 文件备份 + 配置副本 |
 | bot_core.py | 机器人大脑：白名单、指令路由、草稿会话、回复格式化（通道无关） |
 | bot_ilink.py | 通道 A：iLink 客户端（QR 登录、长轮询、收发、媒体下载解密） |
-| chaimi_mcp.py | 通道 B 的 MCP server（stdio，独立进程） |
 
 前端（app/static/）：app.html 主界面 + home.html 登录/选用户页 + core/ledger/stats/settings/ai/import .js 分页逻辑。
 
@@ -51,9 +50,7 @@
    └─────────┴──────────┴──────────┴──────┬───────┘
                                           ▼
                                     SQLite(chaimi.db)
-微信 ──iLink──▶ bot_ilink(A直连) ──┐
-                                  ├─▶ bot_core.handle() ──▶ db / ai.chat
-OpenClaw ──MCP/REST──▶ /api/bot(B网关) ──┘
+微信 ──iLink──▶ bot_ilink(长轮询线程) ──▶ bot_core.handle() ──▶ db / ai.chat
 ```
 
 **网关三件套**（SSE 流式与相对路径必需）：
@@ -62,7 +59,7 @@ OpenClaw ──MCP/REST──▶ /api/bot(B网关) ──┘
 - `<base href="/app/chaimi-ledger/">` 注入
 - SSE 流内 15s 心跳注释行保活
 
-**多端实时刷新（长轮询）**：`GET /api/rev/wait?since=N&hold=25` 挂住最多 25s（服务端钳制 1~30s），数据版本 rev 偏离立即返回；前端返回后 300ms 续下一条、出错 2s 退避、单请求 35s 强制 abort 防半开连接；页面回前台（focus/visibilitychange/pageshow）掐掉挂起请求并主动刷一次。任意端记账，其他端 1s 内刷新。写库侧统一 `_bump_rev`：交易增/改/删、待确认转正、导入应用/撤销、bot 写库全部同源。请求带 `?cv=版本信标`（build 时烘焙 `static/version.txt`，页面注入 `window.CHAIMI_VER`），日志可分辨各客户端前端版本。
+**多端实时刷新（长轮询）**：`GET /api/rev/wait?since=N&hold=25` 挂住最多 25s（服务端钳制 1~30s），数据版本 rev 偏离立即返回；前端返回后 300ms 续下一条、出错 2s 退避、单请求 35s 强制 abort 防半开连接；页面回前台（focus/visibilitychange/pageshow）掐掉挂起请求并主动刷一次。任意端记账或改账本级设置，其他端 1s 内刷新。写库侧统一 `_bump_rev`：交易增/改/删、待确认转正、导入应用/撤销、bot 写库、账本级设置（分类/映射/账户/归属分组/预算）写入全部同源；前端唤醒后统一重拉流水/统计与全局下拉数据源（记一笔分类/编辑弹窗账户/顶栏用户），停在设置页时各表同步重画。预算与账本名/币种改动另推 lrev 换血各端账本缓存（预算展示读该缓存）。请求带 `?cv=版本信标`（build 时烘焙 `static/version.txt`，页面注入 `window.CHAIMI_VER`），日志可分辨各客户端前端版本。
 
 **SSE 仅用于 AI 流式**（对话/月报）：ai 内部为结构化事件流（生成器产 dict，HTTP 边界 `sse_stream` 统一序列化），bot 通道直接消费同一生成器，不二次解析文本。
 
@@ -74,7 +71,7 @@ OpenClaw ──MCP/REST──▶ /api/bot(B网关) ──┘
 chaimi-ledger/
 ├── DESIGN.md / README.md / LICENSE
 ├── build.bat                    # 读 manifest 版本 → 烘焙 version.txt → py_compile 自检
-│                                #   → 清理开发数据(app/data) → fnpack 打包
+│                                #   → 单元测试全绿 → 清理开发数据(app/data) → fnpack 打包
 └── chaimi-ledger-fn/
     ├── manifest                 # 飞牛应用清单（appname/version/install_dep_apps=python312…）
     ├── config/                  # resource（api-scope）/ privilege（run-as: root）
@@ -83,7 +80,6 @@ chaimi-ledger/
     ├── wizard/                  # 卸载向导
     └── app/
         ├── server/              # config（桌面注册 iframe）/ images（图标、牛牛头像，禁缓存路由）
-        ├── skills/chaimi-ledger/  # OpenClaw 技能包（SKILL.md，B 通道备选形态）
         ├── src/                 # 后端源码（见模块清单）
         └── static/              # 前端（app.html/home.html/*.js/base.css/views.css/Chart.js）
 ```
@@ -92,7 +88,7 @@ chaimi-ledger/
 
 ## 四、数据库设计（SQLite）
 
-8 张表：`ledgers`（账本）、`categories`（分类，expense/income 平行两套，支持二级 parent_id）、`accounts`（账户）、`transactions`（流水）、`import_batches`（导入批次）、`category_mappings`（类型映射）、`attribution_groups`（归属分组=用户）、`attributions`（归属名单）。完整 DDL 见 `db.py`，要点：
+10 张表：`ledgers`（账本，v1.0.4 起 `owner_uid` 标记归属飞牛用户）、`categories`（分类，expense/income 平行两套，支持二级 parent_id）、`accounts`（账户）、`transactions`（流水）、`import_batches`（导入批次）、`category_mappings`（类型映射）、`attribution_groups`（归属分组=用户）、`attributions`（归属名单）、`ledger_members`（账本共享名单，v1.0.4）、`known_users`（打开过应用的飞牛用户档案，v1.0.4）。完整 DDL 见 `db.py`，要点：
 
 **不变式与口径**
 
@@ -113,17 +109,23 @@ PRAGMA journal_mode=WAL; busy_timeout=5000; foreign_keys=ON;
 
 **迁移**：`PRAGMA user_version` 记录版本，启动按序执行（只增不删列）；对已发布表加列走 `_ensure_column`（PRAGMA table_info 查缺 → 幂等 ALTER），老库升级/新库建表共用同一路径。
 
+**多用户与账本 ACL（v1.0.4，方案详见 MULTIUSER-PLAN.md）**：单库不拆文件，隔离靠账本级授权——飞牛统一网关注入 `X-Trim-Userid/Username/Isadmin` 请求头（应用只监听网关 UDS + 本地开发入口，头不可被外部伪造），中间件解析为请求级 ContextVar；访问判定收敛在 `_ledger_access`（owner 或 `ledger_members` 成员放行，系统上下文=机器人/本地开发全放行），所有按资源 id 操作的端点先经 `_row_ledger` 反查所属账本再判定。无头请求/无主账本的兜底：升级后首个 admin 打开应用认领全部 `owner_uid IS NULL` 的账本；`known_users` 由 `/api/whoami` 落档（fnOS 无用户列表 API，共享选人器数据源）。应用级操作（配置写/备份恢复/扫码总开关）走 `_admin_or_403`；账本级设置（分类/映射/账户/归属分组/预算）owner 与共享成员均可写，账本名/币种/删除/共享管理仅 owner（预算为独立端点 `PUT /api/ledgers/{id}/budget`）。
+
 ***
 
 ## 五、API 概览（前缀 /app/chaimi-ledger）
 
 ```
 页面     GET /                    app.html      GET /home   登录/选用户页
-账本     GET/POST/PUT/DELETE /api/ledgers[/{id}]
+身份     GET /api/whoami（当前飞牛用户，顺带落档 known_users/admin 认领）
+         GET /api/users（打开过应用的飞牛用户=共享选人器）
+账本     GET/POST/PUT/DELETE /api/ledgers[/{id}]（GET ?all=1 仅 admin 全量；PUT 改名/币种/图标仅 owner）
+         PUT /api/ledgers/{id}/budget（预算=账本级共享设置，owner 与共享成员都可改）
+共享     GET/PUT/DELETE /api/ledgers/{id}/members（仅 owner；只授权不动账本数据，不自动建记账用户）
 流水     GET /api/transactions?ledger=&from=&to=&type=&category=&page=…
          POST/PUT/DELETE /api/transactions[/{id}]   （PUT 支持 refund_for 关联/取消）
 待确认   GET /api/pending?ledger=&kind=     POST /api/pending/{tx_id}/resolve
-分类/账户/映射  常规 CRUD（/api/categories /api/accounts /api/mappings，均带 ledger=）
+分类/账户/映射  常规 CRUD（/api/categories /api/accounts /api/mappings，均带 ledger=；共享成员可写，改动经 rev 长轮询同步各端）
 统计     /api/stats/{calendar|summary|category|trend|monthly|attribution}
 导入     POST /api/import/parse（预览不入库）  POST /api/import/confirm（入库+learn 回写）
          GET /api/import/batches   DELETE /api/import/batches/{id}（整批撤销）
@@ -133,9 +135,10 @@ PRAGMA journal_mode=WAL; busy_timeout=5000; foreign_keys=ON;
          GET /api/attributions   PUT /api/attributions/{aid}（仅设组；增删已下线）
 AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POST /api/ai/receipt（小票）
          GET /api/ai/analyze（SSE 月报）  POST /api/ai/parse（保留接口）
-实时     GET /api/rev/wait（长轮询，见第二章）
-机器人   POST /api/bot/message|receipt  GET /api/bot/status（B 通道，Bearer 鉴权）
-         /api/bot/ilink/*（扫码/状态/解绑，A 通道面板用）
+实时     GET /api/rev/wait（长轮询，见第二章；rev=数据代数 + lrev=账本列表代数，
+         共享/移除/建删账本与账本级设置改动实时同步各端，lsince 缺省兼容旧客户端）
+机器人   POST /api/bot/test（设置页测试，按首条直连绑定走链路）
+         /api/bot/ilink/*（扫码/状态/解绑，A 通道面板用；B 通道已下线）
 资源     GET /images/{name}（图标/头像，禁缓存——替换同名 PNG 即生效）
 ```
 
@@ -164,9 +167,12 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 **配置**（chaimi.conf，设置页向导填写）：
 
 ```json
-"llm":   {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key": ""},
-"vision":{"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-vl-max", "api_key": ""}
+"llm": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus",
+        "vl_model": "qwen3-vl-plus", "api_key": "",
+        "vl_base_url": "", "vl_api_key": ""}
 ```
+
+单 `llm` 段：`vl_model` 视觉模型（图片记账），`vl_base_url`/`vl_api_key` 留空共用文本端点、可单独覆盖。
 
 ***
 
@@ -205,7 +211,7 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 
 ## 八、分类体系与统计口径
 
-**分类**：支出 15 一级（餐饮美食/日用百货/数码电器…）+ 二级细分；收入**独立** 8 一级（工资薪酬/兼职副业/理财收益/红包礼金/退款返还/报销/投资本金/其他收入），收支两套平行，映射表按 flow_type 分流——工资/兼职不再混进「投资理财」。种子数据见 db.py。
+**分类**：支出 18 一级（餐饮美食/日用百货/数码电器/…/住房物业，2026-09 起取消二级细分，2026-10 补住房物业——房贷/房租/物业费原挤在充值缴费）；收入**独立** 8 一级（工资薪酬/兼职副业/理财收益/红包礼金/人情往来/报销/投资本金/其他收入，无退款返还——退款走 transfer 冲减），收支两套平行，映射表按 flow_type 分流——工资/兼职不再混进「投资理财」。种子数据见 db.py；历史库新增默认分类走 app_meta 打标的一次性迁移（db._migrate）。
 
 **统计隔离规则**：
 
@@ -244,19 +250,18 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 ### 10.1 传输与大脑分离
 
 ```
-微信 ──iLink──▶ [A] bot_ilink(长轮询线程) ──┐
-                                            ├──▶ bot_core.handle(text, user, image?)
-微信 ──iLink──▶ OpenClaw ──MCP/REST──▶ [B] /api/bot/* ──┘        │
-                                                        对话式草稿(内存会话) ──「确认」──▶ db
-                                                                  │
-                                                        统一回复文本(各通道自行送出)
+微信 ──iLink──▶ bot_ilink(长轮询线程) ──▶ bot_core.handle(text, user, image?)
+                                                  │
+                                        对话式草稿(内存会话) ──「确认」──▶ db
+                                                  │
+                                        统一回复文本(A 通道自行送出)
 ```
 
-A（直连）/B（网关）只是「谁持有微信通道」的差别，共用 bot_core 保证行为/话术/数据一致。iLink bot 身份单会话，A、B 用 `bot.mode` 开关互斥切换（热切换不重启）。企微通道与图片外发链路已移除（微信端图文渲染效果不佳），只发文本；小票识别收图完整保留。
+传输与大脑分离：bot_core 通道无关（新通道可插；B 网关通道已下线，见 10.4），A 直连是当前唯一传输层，共用大脑保证行为/话术/数据一致。iLink bot 身份单会话，`bot.mode` off↔direct 热切换（不重启）。企微通道与图片外发链路已移除（微信端图文渲染效果不佳），只发文本；小票识别收图完整保留。
 
 ### 10.2 bot_core（指令路由，1~7 确定性规则 + 8 兜底）
 
-1. **白名单**：不在名单返回 ID 提示绑定（扫码自动加入；A/B 双域白名单）
+1. **白名单**：不在名单返回 ID 提示绑定（扫码自动加入）
 2. **草稿指令**（DRAFT_PENDING 态）：确认/丢弃/草稿重发
 3. **删除确认**（PENDING_DELETE 态）：确认删除/取消删除
 4. **翻页**：更多/上一页（续看上次查询）
@@ -282,36 +287,34 @@ A（直连）/B（网关）只是「谁持有微信通道」的差别，共用 b
 - **凭证生命周期**：过期收 401 → 线程停、面板亮「凭证过期请重新扫码」（重扫必须人扫，无自动续期）
 - **网络**：长轮询是出站连接，**无需公网穿透**，全程无回调端口
 
-### 10.4 通道 B：REST + MCP（外部 Agent 网关）
+### 10.4 通道 B：已下线（v1.0.4）
 
-- `POST /api/bot/message` / `POST /api/bot/receipt` / `GET /api/bot/status`，`Authorization: Bearer {bot.api_token}`；同步接口，LLM 解析 2~10s、查账可 20s+，网关侧超时设 120s
-- 真机 cmd 以 `--uds` 起 server，HTTP 进不了 Unix socket——server 在 UDS 之外并行监听 TCP（`_sidecar_apply`：**仅 gateway 模式启动**、随 bot.mode 热切换优雅启停，默认部署不常驻白跑端口；`CHAIMI_BOT_BIND` 默认 127.0.0.1，端口默认 18710（`CHAIMI_BOT_PORT` 可覆盖），跨容器置 0.0.0.0，off 关闭）
-- **chaimi_mcp.py**（stdio MCP server，三工具）：`ledger_message`（原样转发）/ `ledger_receipt` / `ledger_status`。工具描述写死约束：凡涉记账查账必须原样调用 ledger_message，禁止网关 LLM 自行解析金额、编造账目——柴米的调优提示词是唯一大脑，OpenClaw 只当管道
-- `skills/chaimi-ledger/`：纯 REST 技能包（SKILL.md），与 MCP 二选一，随 fpk 上机
+网关/MCP 通道（OpenClaw 等 REST/MCP 对接、TCP sidecar 127.0.0.1:18710、api_token、
+chaimi_mcp.py、技能包）整体移除：网关客户端只连一个 MCP，且其微信 bot 通道仅扫码人
+私有（无法区分记账人），绑定方案在该形态下不成立。机器人仅保留 A 通道直连；
+`_ledger` 仅认显式账本，不做任何默认兜底（多用户同库防串账）。
 
 ### 10.5 配置与热切换（chaimi.conf `bot` 段）
 
 ```json
 "bot": {
-  "mode": "off",                  // off | direct(A) | gateway(B)
-  "default_ledger": 1,
-  "allowed_users": [],            // A：微信ID白名单（扫码自动加入）
-  "gateway_users": ["gateway"],   // B：网关标识白名单（独立保存）
-  "api_token": "",                // B：Bearer 鉴权（设置页生成/重置）
+  "mode": "off",                  // off | direct
+  "allowed_users": [],            // 微信ID白名单（扫码自动加入）
   "ilink": [ {"account_id":"","token":"","base_url":"","user":"","ledger":"","label":""} ]
 }
 ```
 
-保存设置时 `bot_manager.apply(cfg)` 差量生效（off↔direct↔gateway 启停轮询线程/开关 API，不重启）。A⇄B 切换顺序：先停旧方再扫码新方（iLink 单会话）。
+保存设置时 `_bot_apply` 差量生效（off↔direct 启停轮询线程，不重启）。设置页测试按钮
+按首条 ilink 绑定的账本+归属走完整链路。
 
 ### 10.6 多人多账本绑定（一账本一用户一机器人）
 
-绑定模型：**（账本, 用户）→ 一个 bot 实例**，凭证以 user 为唯一键（同微信重扫顶替、旧实例差量停机防僵尸轮询）。成员用自己的微信扫某账本的码，微信出现专属 bot 联系人，消息记入该账本，确认响应自动进白名单——身份即授权。绑定谁的码，记账自动写 `tags.attribution=该用户`。例：大牛扫「日常」的码→消息进日常；小牛另扫「日常」→也进日常（家庭共账）；大牛再扫「旅行」→顶替旧绑定转进旅行。二维码一次一扫；B 通道/CLI 测试走 default_ledger 不参与多账本。
+绑定模型：**（账本, 用户）→ 一个 bot 实例**，凭证以 user 为唯一键（同微信重扫顶替、旧实例差量停机防僵尸轮询）。成员用自己的微信扫某账本的码，微信出现专属 bot 联系人，消息记入该账本，确认响应自动进白名单——身份即授权。绑定谁的码，记账自动写 `tags.attribution=该用户`。例：大牛扫「日常」的码→消息进日常；小牛另扫「日常」→也进日常（家庭共账）；大牛再扫「旅行」→顶替旧绑定转进旅行。二维码一次一扫。
 
 ### 10.7 数据量与隐私
 
 - 长轮询 ~1KB/次 × 3000 次/天 ≈ 月 <100MB；记账一次 LLM ≈ 2500 in + 400 out ≈ 0.3 分，家庭使用（~10 笔/天）月成本不到 1 元
-- 隐私出网口径与 AI 页一致（一句话/一张图 + 清单 + 少样本 + 聚合）；B 通道多一跳本机网关，A 直连最干净
+- 隐私出网口径与 AI 页一致（一句话/一张图 + 清单 + 少样本 + 聚合），全程出站直连
 - 设置面板遗留待办：移除「测试对话」行（联调期保留）
 
 ***
@@ -319,8 +322,8 @@ A（直连）/B（网关）只是「谁持有微信通道」的差别，共用 b
 ## 十一、构建与部署
 
 ```
-build.bat：读 manifest 版本 → 烘焙 static/version.txt → py_compile 自检 → 清理 app/data 开发残留
-          → fnpack 打包 → chaimi-ledger.<版本>.fpk
+build.bat：读 manifest 版本 → 烘焙 static/version.txt → py_compile 自检 → 单元测试全绿
+          → 清理 app/data 开发残留 → fnpack 打包 → chaimi-ledger.<版本>.fpk
 NAS 安装：install_init ─▶ pip --target ${PKGVAR}/site-packages（清华/阿里源兜底）
 cmd/main：系统 python3 + PYTHONPATH=site-packages 直跑；启动时依赖双保险补装
 ```
@@ -336,9 +339,9 @@ cmd/main：系统 python3 + PYTHONPATH=site-packages 直跑；启动时依赖双
 3. **预览制导入**：解析不入库 → 用户确认 → 整批可撤销；低置信不阻断（打标事后处理），几百行账单不被几行待确认卡住
 4. **退款统一口径**：原消费恒 expense、退款行恒 transfer、扣减归因原消费日期——导入顺序无关，统计口径不分叉
 5. **确认才入库**：AI 草稿（App/微信同语义）、对话式修订、删除两步确认——确认前统计零污染、丢弃零残留
-6. **传输与大脑分离**：bot_core 通道无关，新通道可插；A/B 互斥由配置热切换
+6. **传输与大脑分离**：bot_core 通道无关，新通道可插；当前仅 A 通道直连，off↔direct 配置热切换（B 通道 v1.0.4 下线）
 7. **导入上传安全**：大小/白名单/魔数/行数四重校验，防伪装与解压炸弹
-8. **无账号体系**：内网部署信任飞牛网关鉴权，「用户」是记账人维度非登录账号
+8. **身份复用飞牛账号**：无自建账号体系——网关注入头即身份，账本级 ACL 隔离（v1.0.4 多用户）；「用户」（归属分组）是账本内的记账人维度
 
 ***
 

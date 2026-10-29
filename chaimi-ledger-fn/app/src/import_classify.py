@@ -33,7 +33,12 @@ TOP_KEYWORD_LEXICON = [
                   "4S店", "维保", "保养", "汽修", "轮胎"]),
     ("交通出行", ["滴滴", "打车", "快车", "顺风车", "出租车", "网约车", "12306", "中铁网络", "铁路",
                   "高铁", "客运站", "汽车客运", "地铁", "公交", "机票", "航空", "机场", "共享单车"]),
-    ("充值缴费", ["话费", "宽带", "水费", "电费", "燃气", "物业费", "有线电视", "阿里云", "卡充值",
+    # 物业费原在充值缴费，2026-10 拆独立一级后移入。只收带"费"的显式词——裸「物业」
+    # 真机误伤：物业公司在小区里代收停车费，账单商品名只有"XX物业公司"没有"停车"，
+    # ¥3~25 的停车费全被荐改住房物业（2026-10-23 真机反馈）；公司名里的
+    # 物业管理/物业服务同理不收，停车与物业费从文本上无法区分，留给待确认
+    ("住房物业", ["房贷", "房租", "租房", "物业费", "物业管理费"]),
+    ("充值缴费", ["话费", "宽带", "水费", "电费", "燃气", "有线电视", "阿里云", "卡充值",
                   "采暖", "取暖", "暖气"]),
     ("餐饮美食", ["食堂", "餐厅", "餐饮", "吃饭", "早餐", "早饭", "午饭", "午餐", "晚饭", "晚餐", "烧烤", "小吃", "奶茶", "咖啡", "早点", "外卖", "面馆", "火锅", "市集", "农贸市场", "饭馆", "快餐", "小吃部",
                   "饮品", "蛋糕", "烘焙", "甜品", "夜宵"]),   # 餐时词：AI 记一笔高频（早餐5元/打车15 这类），导入侧同样受益
@@ -116,7 +121,8 @@ def _purge_bad_learned_mappings(conn: sqlite3.Connection) -> int:
     """修复历史 AI 误判写入的脏学习映射（v6 单行模型；仅 /api/repair/apply 确认后触发）：
     ① 删与默认冲突的学习行——冲突口径同 mapping_reset_candidates（单一来源），
        按 UNIQUE(ledger_id, flow_type, source) 三元组定位删除；
-    ② 学习行=默认 → 还原 learned=0（它就是默认）；③ 补种缺失默认（①删过的在此补回）。"""
+    ② 学习行=默认 → 还原 learned=0（它就是默认）；③ 补种缺失默认（①删过的在此补回，
+       复用建账同款 seed_default_mappings）。默认目标分类被用户删掉的源不参与②③。"""
     removed = 0
     with conn:
         for m in mapping_reset_candidates(conn):
@@ -125,20 +131,13 @@ def _purge_bad_learned_mappings(conn: sqlite3.Connection) -> int:
                          (m["ledger_id"], m["flow_type"], m["source"]))
             removed += 1
         for lid in [r["id"] for r in conn.execute("SELECT id FROM ledgers")]:
+            dbm.seed_default_mappings(conn, lid)          # ③ 补种缺失默认
             for flow, source, target in dbm.DEFAULT_MAPPINGS:
-                cid = dbm.top_cat_id(conn, lid, target, flow)
-                if not cid:
-                    continue
-                row = conn.execute(
-                    "SELECT id, learned FROM category_mappings "
-                    "WHERE ledger_id=? AND flow_type=? AND source=?",
-                    (lid, flow, source)).fetchone()
-                if not row:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO category_mappings(ledger_id, flow_type, source, category_id) "
-                        "VALUES(?,?,?,?)", (lid, flow, source, cid))
-                elif row["learned"]:
-                    conn.execute("UPDATE category_mappings SET learned=0 WHERE id=?", (row["id"],))
+                if dbm.top_cat_id(conn, lid, target, flow):
+                    conn.execute(                          # ② 默认目标在 → 学习行还原 learned=0
+                        "UPDATE category_mappings SET learned=0 "
+                        "WHERE ledger_id=? AND flow_type=? AND source=? AND learned=1",
+                        (lid, flow, source))
     if removed:
         _log.info(f"数据修复：重置 {removed} 条与内置默认冲突的学习映射（用户确认触发）")
     return removed
@@ -155,7 +154,12 @@ def fix_candidates(conn: sqlite3.Connection, ledger_id: int) -> list[dict]:
     词典是类型盲的（如收入行名称也能命中「数码电器」），目标分类按**行类型**解析
     id——该类型下不存在的分类不可修也不列出（否则应用时永远跳过、预览里赖着不走）。
     manual_cat=1（用户手选过分类）的行永不列出——手动整理是用户意图，不 second-guess；
+    当前分类是**用户自建**（不在默认分类名单）的行同理：自动路径只会落默认分类，
+    进自建分类必是批量改/单笔改/用户配的映射目标，全是刻意安置（真机 1.0.4 事故：
+    早期批量改漏打 manual_cat，自建「房贷」几十笔被建议翻内置「住房物业」）；
     人情二分类两侧均不参与（见 _REPAIR_RENQING）。"""
+    _default_names = (set(dbm.EXPENSE_CATEGORIES) | set(dbm.INCOME_CATEGORIES)
+                      | set(dbm.TRANSFER_CATEGORIES))
     cat_ids = {(c["name"], c["type"]): c["id"] for c in conn.execute(
         "SELECT id, name, type FROM categories "
         "WHERE ledger_id=? AND parent_id IS NULL", (ledger_id,))}
@@ -169,7 +173,7 @@ def fix_candidates(conn: sqlite3.Connection, ledger_id: int) -> list[dict]:
         (ledger_id,)).fetchall()
     out = []
     for r in rows:
-        if r["top_name"] in _REPAIR_RENQING:
+        if r["top_name"] in _REPAIR_RENQING or r["top_name"] not in _default_names:
             continue
         kw = _top_by_keyword(f"{r['name'] or ''} {r['merchant'] or ''} {r['note'] or ''}", r["amount"])
         cid = cat_ids.get((kw, r["type"])) if kw not in _REPAIR_RENQING else None

@@ -86,9 +86,15 @@ _MODEL_RANKS = {
     },
     "api.deepseek.com": {
         "txt": ("deepseek-chat", "deepseek-reasoner"),
-        "vl": (),
+        # 2026-08 DeepSeek 上线视觉（官方指南：deepseek-flash 收图；旧名 v4-flash-vision-exp
+        # 已弃用但仍承接请求），与图示的 deepseek-chat/V3-0324 文本映射并存
+        "vl": ("deepseek-flash", "deepseek-v4-flash-vision-exp"),
     },
 }
+
+# 预设发布时视觉默认为空的服务商域名：这些域上存量配置的空 vl_model 是「当时没有」
+# 而非「用户关闭」，服务商上线视觉后 ensure_models 据此回填
+_VL_BACKFILL_HOSTS = {"api.deepseek.com"}
 
 
 def _list_models(base_url: str, api_key: str) -> list[str] | None:
@@ -102,28 +108,35 @@ def _list_models(base_url: str, api_key: str) -> list[str] | None:
 
 def ensure_models() -> list[str]:
     """核对配置的文本/视觉模型在服务商可用列表里是否仍存在；不在则按候选序切到
-    第一个存在的并落盘。返回日志行（无变更为空）。未知服务商不猜、无法核对不动。"""
+    第一个存在的并落盘。返回日志行（无变更为空）。未知服务商不猜、无法核对不动。
+    视觉额外一条：vl_model 为空且服务商在 _VL_BACKFILL_HOSTS（曾以「无视觉」发布的
+    预设域）时，空=当时没有而非用户关闭，按候选序回填。"""
     cfg = config.load()
     llm = cfg["llm"]
     notes: list[str] = []
 
-    def pick(kind: str, model: str, base_url: str, key: str) -> str | None:
-        ranks = _MODEL_RANKS.get(_host(base_url))
-        if not ranks or not model or not key:
+    def pick(kind: str, model: str, base_url: str, key: str, backfill: bool = False) -> str | None:
+        host = _host(base_url)
+        ranks = _MODEL_RANKS.get(host)
+        if not ranks or not key or (not model and not (backfill and kind == "vl"
+                                                       and host in _VL_BACKFILL_HOSTS)):
             return None
         ids = _list_models(base_url, key)
-        if ids is None or model in ids:
+        if model and (ids is None or model in ids):
             return None
-        return next((c for c in ranks[kind] if c in ids), None)
+        return next((c for c in ranks[kind] if ids and c in ids), None)
 
     new_txt = pick("txt", llm.get("model") or "", llm["base_url"], llm.get("api_key") or "")
     if new_txt:
         notes.append(f"[llm] 文本模型 {llm['model']} 已不在可用列表，自动切换为 {new_txt}")
         llm["model"] = new_txt
-    new_vl = pick("vl", llm.get("vl_model") or "",
-                  llm.get("vl_base_url") or llm["base_url"], llm.get("vl_api_key") or llm.get("api_key") or "")
+    vl_url = llm.get("vl_base_url") or llm["base_url"]
+    vl_empty = not llm.get("vl_model")
+    new_vl = pick("vl", llm.get("vl_model") or "", vl_url,
+                  llm.get("vl_api_key") or llm.get("api_key") or "", backfill=vl_empty)
     if new_vl:
-        notes.append(f"[llm] 视觉模型 {llm['vl_model']} 已不在可用列表，自动切换为 {new_vl}")
+        notes.append((f"[llm] 视觉模型为空，{_host(vl_url)} 已上线视觉，自动填入 {new_vl}" if vl_empty
+                      else f"[llm] 视觉模型 {llm['vl_model']} 已不在可用列表，自动切换为 {new_vl}"))
         llm["vl_model"] = new_vl
     if notes:
         config.save(cfg)
@@ -132,6 +145,8 @@ def ensure_models() -> list[str]:
 
 # 模型分组（设置页「模型列表」按钮）：名字含 vl/4v/vision 视为视觉；非对话类（向量/语音/绘图等）滤掉
 _VL_PAT = re.compile(r"vl|4v|vision", re.I)
+# 名字不带 vl/vision 字样但确为视觉的已知模型（deepseek-flash：DeepSeek 官方图像理解指南口径）
+_VL_KNOWN = {"deepseek-flash"}
 _NOISE_PAT = re.compile(r"embedding|embed|rerank|tts|asr|audio|speech|voice|paraformer|sambert"
                         r"|wanx|wan2|t2v|i2v|cogview|cogvideo|generation", re.I)
 
@@ -148,7 +163,7 @@ def list_models_grouped() -> dict:
     vision: list[str] = []
     for mid in sorted({m for lst in (txt_ids, vl_ids) if lst for m in lst}):
         if not _NOISE_PAT.search(mid):
-            (vision if _VL_PAT.search(mid) else text).append(mid)
+            (vision if (_VL_PAT.search(mid) or mid in _VL_KNOWN) else text).append(mid)
     if not llm.get("api_key") and not vl_key:
         return {"text": [], "vision": [], "error": "未配置 API Key"}
     errs = []
@@ -964,7 +979,7 @@ def parse_receipt(path: str) -> dict:
                  '{"type":"expense 或 income","amount":金额数字(单位元,价税合计),'
                  '"date":"YYYY-MM-DD HH:MM(票据上的日期和时间;有时刻就带上,没有只给日期;都没有给空)",'
                  '"category_name":"最贴近的一级分类(餐饮美食/日用百货/数码电器/服饰装扮/交通出行/'
-                 '医疗健康/充值缴费/教育培训/工资薪酬等)",'
+                 '医疗健康/充值缴费/住房物业/教育培训/工资薪酬等)",'
                  '"name":"商家/门店名/销售方名称(如 星巴克/沃尔玛/中国移动),识别不出给空串",'
                  '"note":"品项摘要或发票内容(如 拿铁咖啡/苹果2个/住宿服务),不含商家名,识别不出给空串"} '
                  '金额识别不出时给 0。'},

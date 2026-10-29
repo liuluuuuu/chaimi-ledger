@@ -656,8 +656,22 @@ function txSelSyncUI(){
   const p = txSelHost === "#dayList" ? "daySel" : "txSel";   // 两套工具条 id 前缀：主列表 / 明细弹窗
   $("#" + p + "Count").textContent = `已选 ${txSelSet.size} 笔`;
   $("#" + p + "ModBtn").disabled = !txSelSet.size;
+  $("#" + p + "DelBtn").disabled = !txSelSet.size;
   const pageIds = txSelPageIds();
   $("#" + p + "All").checked = pageIds.length > 0 && pageIds.every(id => txSelSet.has(id));
+}
+async function txSelDelete(){
+  if(!txSelSet.size) return;
+  if(!await uiConfirm(`确定删除已选 ${txSelSet.size} 笔流水？删除原消费会自动解除其退款关联`, "删除")) return;
+  try{
+    const r = await apiSend(`/api/transactions/batch_delete?ledger=${lid()}`, "POST", {ids:[...txSelSet]});
+    txSelSet.forEach(id => aiPurgeTxCard(id));   // 聊天区旧卡清理（已删笔不再回查）
+    msg(`已删除 ${r.deleted} 笔`);
+    txSelExit(false);   // 数据已变：afterTxWrite 全局刷新（内含选择集已删笔清洗）
+    afterTxWrite();
+  }catch(e){
+    msg("批量删除失败：" + e.message, false);
+  }
 }
 function txSelCloseModal(){ $("#txSelMask").classList.remove("on"); }
 function txSelOpenModal(){

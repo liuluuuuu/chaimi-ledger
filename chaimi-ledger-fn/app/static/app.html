@@ -37,6 +37,8 @@
     <div class="spacer"></div>
     <button class="nav-item" data-p="io" title="导入和导出"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><use href="#ic-dl"/></svg><span class="lbl">导入和导出</span></button>
     <button class="nav-item" data-p="settings" title="设置"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span class="lbl">设置</span></button>
+    <!-- 飞牛用户身份徽标：菜单底部（spacer 之下），loadMe 拉到身份后填充 -->
+    <div id="meBadge" class="sub" style="display:none;font-size:11px;padding:10px 16px 2px;border-top:1px solid var(--border);margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
   </nav>
 
   <div class="main">
@@ -134,12 +136,13 @@
             <input id="q_text" type="text" name="tx-search" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="搜索：名称 / 备注 / 金额 / 商户 / 分类 / 流水归属 / 订单号">
             <button class="icon-btn" id="q_clear" style="display:none;border:none;width:26px;height:26px" title="清空"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
           </div>
-          <!-- 选择态工具条：左=全选+已选数，右=修改/完成 -->
+          <!-- 选择态工具条：左=全选+已选数，右=修改/删除/完成 -->
           <div class="tx-selbar" id="txSelBar" style="display:none">
             <label class="tx-sel-all"><input type="checkbox" id="txSelAll" onchange="txSelToggleAll(this.checked)"><span>全选</span></label>
             <span class="sub" id="txSelCount">已选 0 笔</span>
             <span class="spacer"></span>
             <button class="btn btn-pri" id="txSelModBtn" onclick="txSelOpenModal()" disabled>修改</button>
+            <button class="btn btn-ghost" id="txSelDelBtn" onclick="txSelDelete()" disabled>删除</button>
             <button class="btn btn-ghost" onclick="txSelExit()">完成</button>
           </div>
         </div>
@@ -205,6 +208,7 @@
           <span class="sub" id="daySelCount">已选 0 笔</span>
           <span class="spacer"></span>
           <button class="btn btn-pri" id="daySelModBtn" onclick="txSelOpenModal()" disabled>修改</button>
+          <button class="btn btn-ghost" id="daySelDelBtn" onclick="txSelDelete()" disabled>删除</button>
           <button class="btn btn-ghost" onclick="txSelExit()">完成</button>
         </div>
         <div class="modal-body" style="padding:18px 20px 20px">
@@ -421,7 +425,7 @@
             </div>
             <label>API Key</label><input id="llm_key" type="password" placeholder="sk-...">
             <div class="row" style="margin-top:10px">
-              <div><label>视觉模型（图片记账用；DeepSeek 暂无，留空则图片记账不可用）</label><input id="vl_model"></div>
+              <div><label>视觉模型（图片记账用；留空则图片记账不可用）</label><input id="vl_model"></div>
             </div>
             <div class="row" id="vlApiRow" style="margin-top:10px;display:none">
               <div><label>视觉 Base URL（留空=与上方共用）</label><input id="vl_url" placeholder="留空共用文本模型地址"></div>
@@ -452,12 +456,13 @@
         <div class="sub" style="margin-top:8px">原始归属由账单导入自动产生（不可删除）；删除用户后，导入流水的归属回落原始归属、手动选择的清空（未指定）；用户改名会同步更新相关流水。</div>
       </div>
       <div class="card" style="margin-top:14px"><h2 class="st-h2">账本设置</h2>
-        <table id="ledgerTable"><thead><tr><th>名称</th><th style="width:130px">币种</th><th style="width:70px"></th></tr></thead><tbody></tbody></table>
+        <table id="ledgerTable"><thead><tr><th>名称</th><th>币种</th><th></th><th>共享</th></tr></thead><tbody></tbody></table>
         <div class="lg-addrow" style="margin-top:10px">
           <input id="lg_name" placeholder="新账本名（旅行/装修）">
           <select id="lg_cur"></select>
           <button class="btn btn-ghost" onclick="addLedger()">添加</button>
         </div>
+        <div class="sub" style="margin-top:8px">每个飞牛用户看到自己的账本；「共享」把账本共享给其他飞牛用户，同账本多人记账互见，对方记账默认归属对方。</div>
       </div>
       <div class="card" style="margin-top:14px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:10px;flex-wrap:wrap">
@@ -520,14 +525,14 @@
       <div class="card"><h2 class="st-h2">微信机器人</h2>
         <!-- ① 模式(总开关,驱动下方区块显隐) -->
         <div class="row" style="margin-bottom:10px;align-items:end;flex-wrap:wrap;gap:10px">
-          <div><label>模式</label>
+          <div id="bot_mode_box"><label>模式</label>
             <select id="bot_mode" onchange="botGwVis()">
               <option value="off">关闭</option>
-              <option value="direct">直连（推荐）</option>
-              <option value="gateway">网关（OpenClaw 等）</option>
+              <option value="direct">微信扫码（推荐）</option>
             </select></div>
+          <span class="sub" id="bot_mode_ro" style="display:none"></span>
           <span class="sub" id="bot_sum"></span>
-          <button class="btn btn-pri" style="flex:0 0 auto" onclick="saveBotCfg()">保存</button>
+          <button class="btn btn-pri" id="bot_save" style="flex:0 0 auto" onclick="saveBotCfg()">保存</button>
         </div>
         <!-- ② 账本与成员(直连模式) -->
         <div id="bot_dir" style="display:none">
@@ -543,31 +548,13 @@
           </div>
           <table id="bot_members" style="margin-top:10px"><thead><tr>
             <th>账本</th><th>成员</th><th>状态</th><th></th></tr></thead><tbody></tbody></table>
-          <div style="margin-top:10px"><label>白名单（微信ID；扫码自动加入，此处可补充）</label>
+          <div id="bot_users_row" style="margin-top:10px"><label>白名单（微信ID；扫码自动加入，此处可补充）</label>
             <textarea id="bot_users" rows="2" style="width:100%"></textarea></div>
         </div>
-        <!-- 网关模式(MCP/REST 对接信息) -->
-        <div id="bot_gw" style="margin-top:12px;display:none">
-          <div class="sub" style="margin-bottom:6px">网关模式：微信通道由 OpenClaw/Hermes 持有，记账经下方接口进本应用（柴米不碰微信协议）。</div>
-          <div class="row" style="align-items:end;gap:8px;flex-wrap:wrap">
-            <div style="flex:1;min-width:220px"><label>API Token</label><input id="bot_token" readonly placeholder="未生成"></div>
-            <button class="btn btn-ghost" style="flex:0 0 auto" onclick="genBotToken()">生成 / 重置</button>
-          </div>
-          <div style="margin-top:10px;border:1px solid var(--border);border-radius:8px;padding:10px">
-            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">
-              <span style="font-size:13px;font-weight:600">MCP Server 需要的配置（填到 OpenClaw）</span>
-              <button class="btn btn-ghost" style="flex:0 0 auto" onclick="copyMcpCfg()">复制</button>
-            </div>
-            <pre id="bot_mcp_cfg" style="white-space:pre-wrap;margin:0 0 8px;font-size:12px;line-height:1.7"></pre>
-            <div class="sub">复制前先点「生成 / 重置」——Token 行会自动填入完整值；下方白名单里的 <b>gateway</b> 是 MCP 固定调用标识，请勿删除（删掉后网关调用会被拒）。</div>
-          </div>
-          <div style="margin-top:10px"><label>网关白名单（网关标识；MCP 固定传 gateway，默认已含）</label>
-            <textarea id="bot_gw_users" rows="2" style="width:100%"></textarea></div>
-        </div>
-        <!-- ④ 测试对话(常驻) -->
+        <!-- ③ 测试对话(常驻) -->
         <div class="card" style="margin-top:12px;padding:10px;background:var(--bg-2)">
           <div class="row" style="align-items:end;gap:8px;flex-wrap:wrap">
-            <div style="flex:1;min-width:180px"><label>测试对话（走完整机器人链路，不经过微信）</label><input id="bot_test_in" placeholder="如：午饭25"></div>
+            <div style="flex:1;min-width:180px"><label>测试对话（按首条绑定走完整机器人链路，不经过微信）</label><input id="bot_test_in" placeholder="如：午饭25"></div>
             <button class="btn btn-pri" style="flex:0 0 auto" onclick="botTest()">发送</button>
           </div>
           <pre id="bot_test_out" style="display:none;white-space:pre-wrap;margin-top:8px;font-size:12px"></pre>
@@ -587,6 +574,23 @@
 <script src="static/settings.js"></script>
 <script>loadAll();</script>
 
+<!-- 账本共享（多用户）：成员列表 + 添加/移除，仅 owner（服务端 _owner_or_403 同口径）。
+     置于 cfmMask/prmMask 之前——modal-mask 统一 z-index:90 靠 DOM 顺序分层，
+     确认/输入框须叠在共享弹窗之上（移除成员的确认框曾因此被共享弹窗挡住） -->
+<div class="modal-mask" id="shareMask" onclick="if(event.target===this)shareClose()" style="display:none">
+  <div class="modal" style="max-width:400px;padding:0">
+    <div class="modal-head"><b id="shareTitle">共享账本</b>
+      <button class="icon-btn" onclick="shareClose()" title="关闭">✕</button></div>
+    <div style="padding:14px 20px 18px">
+      <div class="sub" style="margin-bottom:10px;line-height:1.7">共享后对方登录飞牛打开应用即可看到这本账，同账本多人记账互见；对方不能删除账本、改币种或管理共享。列表里没有的人，请对方先登录飞牛打开一次柴米记账。</div>
+      <div class="row" style="gap:8px;align-items:center">
+        <select id="shareUserSel" style="flex:1"></select>
+        <button class="btn btn-pri" style="flex:0 0 auto" onclick="shareAdd()">共享</button>
+      </div>
+      <table id="shareTable" style="margin-top:12px"><thead><tr><th>已共享给</th><th style="width:70px"></th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+</div>
 <div class="modal-mask" id="cfmMask" onclick="if(event.target===this)cfmClose(false)" style="display:none">
   <div class="modal" style="max-width:340px;padding:20px">
     <div id="cfmText" style="margin-bottom:16px;line-height:1.6"></div>

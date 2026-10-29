@@ -116,19 +116,9 @@ def resolve_name(values, cfg: dict) -> str:
             return n
     return ""
 
-def wx_name(product: str, merchant: str) -> str:
-    """微信名称回填（resolve_name 的微信参数化，保留供测试引用）。"""
-    return resolve_name([product, merchant], {"generic_set": pt.WX_GENERIC_NAMES})
-
 def _join_note(*parts) -> str:
     """备注拼接：商户/对方 + 备注列，非空部分空格连接。"""
     return " ".join(p for p in (normalize(x) for x in parts) if p)
-
-def _hash_fields(get, keys: list[str], amt_key: str, amt_cents: int | None = None) -> list:
-    """构造 hash 字段列表：金额列(amt_key)规范化为整数分字符串
-    （amt_cents 已给出则直接用，如京东拆括号后的原金额），其余列原样。"""
-    return [(str(amt_cents if amt_cents is not None else to_cents(get(k)))
-             if k == amt_key else get(k)) for k in keys]
 
 def split_bracket_amount(raw: str):
     """金额列括号三态（京东）：

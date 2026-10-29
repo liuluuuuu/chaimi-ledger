@@ -108,7 +108,7 @@ let LEDGER = 0, LNAME = "", USERS = [], SAVED = 0, LEDGERS = [];
 async function boot(){
   try{
     const ls = await api("api/ledgers");
-    if(!ls.length){ location.replace("."); return; }
+    if(!ls.length){ render(newLedgerHtml()); return; }   // 无账本（新飞牛用户/全新安装）：先建账本，不再跳回主应用（会成环）
     LEDGERS = ls;
     const qp = +new URLSearchParams(location.search).get("ledger") || 0;
     const cur = ls.find(l => l.id === qp) || ls[0];
@@ -137,6 +137,25 @@ function render(html){
   $("#lgPanel").innerHTML = html;
 }
 function head(){ return `<div class="lg-mhead"><img src="images/icon-256.png" alt=""></div>`; }
+/* 状态 C：一本账本都没有（新飞牛用户/全新安装）——先建账本再进建用户流程 */
+function newLedgerHtml(){
+  return `${head()}
+    <div class="lg-h1">欢迎使用 👋</div>
+    <div class="lg-sub">还没有账本，先建一本——日常 / 旅行 / 装修都可以，之后在设置页还能继续添加。</div>
+    <div class="lg-label"><span>账本名</span></div>
+    <input id="lg_ledger_name" class="lg-input" placeholder="如：日常" oninput="this.classList.remove('lg-err')">
+    <button class="lg-go" onclick="createLedger()">创建账本 →</button>
+    <div class="lg-foot">创建后设置第一个记账用户</div>`;
+}
+async function createLedger(){
+  try{
+    const name = ($("#lg_ledger_name").value || "").trim() || "日常";
+    const r = await apiSend("api/ledgers", "POST", {name, currency: "CNY"});
+    try{ localStorage.setItem("chaimi_ledger", String(r.id)); }catch(_){}
+    LEDGER = r.id; LNAME = name; LEDGERS = [{id: r.id, name, icon: ""}];
+    render(setupHtml(false));   // 建完账本接着走「设置第一个用户」
+  }catch(e){ msg(e.message); }
+}
 let lgAvatar = "f";
 let lgFromList = false;
 function setupHtml(fromList){   // 状态 A：设置用户名（必填）+ 头像；fromList=从选择页「＋新建用户」进入

@@ -1,6 +1,6 @@
 """微信机器人大脑（DESIGN 十章）：通道无关，文本进 / 文本出。
 
-A 通道（bot_ilink，P2）与 B 通道（/api/bot/*）都只调 handle()；
+A 通道（bot_ilink iLink 直连）与设置页测试按钮都只调 handle()；
 CLI：python bot_core.py 直接交互联调（bypass_auth），不依赖任何外部通道。
 会话三态（per user，内存，TTL 30 分钟）：draft 草稿 / query 最近查询列表 /
 del_pending 两步删除确认——指令用词互不冲突，可与草稿态共存。
@@ -49,7 +49,7 @@ _lock = threading.Lock()
 _user_locks: dict[str, threading.Lock] = {}
 
 def _ulock(user: str) -> threading.Lock:
-    """per-user 串行锁：同一 user 的并发消息（A 轮询线程 × B 网关/面板线程）不交错
+    """per-user 串行锁：同一 user 的并发消息（A 轮询线程 × 设置页测试线程）不交错
     读写会话状态——否则两个线程都能通过「有草稿」检查并各自确认入库（重复记账）。
     锁表注册由 _lock 保护（短临界区）；锁本身覆盖整个 handle（LLM 慢调用也无妨，
     同一人的消息本就应按序处理，不同用户互不影响）。"""
@@ -81,15 +81,17 @@ def _today() -> str:
 def _cfg() -> dict:
     return config.load().get("bot") or {}
 
-def _ledger(cfg: dict, ledger_id: int | None = None) -> int:
-    """解析目标账本：显式指定(A 通道各 bot 绑定的账本) > default_ledger(B/CLI/面板)
-    > 第一个账本兜底;指定的账本不存在时同样回落。"""
-    lid = ledger_id or cfg.get("default_ledger") or 1
-    c = dbm.connect()
-    if c.execute("SELECT id FROM ledgers WHERE id=?", (lid,)).fetchone():
-        return lid
-    row = c.execute("SELECT id FROM ledgers ORDER BY sort, id LIMIT 1").fetchone()
-    return row["id"] if row else 1
+def _ledger(ledger_id: int | None) -> int | None:
+    """解析目标账本：仅认显式指定（A 通道各 bot 绑定 / 测试按钮首条绑定）；
+    未指定或账本已被删返回 None——调用方回复重绑提示。不做任何默认兜底：
+    多用户同一库后"第一个账本/全局默认"都会落到他人账本（B 通道网关模式已下线）。"""
+    if not ledger_id:
+        return None
+    row = dbm.connect().execute("SELECT id FROM ledgers WHERE id=?", (ledger_id,)).fetchone()
+    return ledger_id if row else None
+
+_BOT_NO_LEDGER = ("机器人未绑定有效账本（账本可能已被删除）："
+                  "请到 App 设置→微信机器人重新扫码绑定。")
 
 def _match_top_cat(rows: list, name: str, tx_type=None):
     """一级分类两段式匹配：先（按 type）精确名，再双向包含。
@@ -249,22 +251,21 @@ def handle(text: str, user: str, image_path: str | None = None,
            bypass_auth: bool = False, ledger_id: int | None = None,
            attribution: str = "") -> str:
     """消息统一入口：返回回复文本。A 通道在轮询线程调用后 POST 送出(带该 bot 绑定的
-    ledger_id 与用户名——绑定谁,记的账自动带谁的归属);B 通道直接作为 HTTP 响应返回
-    (走 default_ledger,无归属)。bypass_auth 供 CLI / 设置页测试按钮使用。
+    ledger_id 与用户名——绑定谁,记的账自动带谁的归属)。bypass_auth 供 CLI / 设置页测试按钮使用。
     并发口径：白名单校验先行(陌生 id 不注册 per-user 锁,防锁表被撑大——能发消息的
     微信用户 id 不可枚举)，授权用户全程持 per-user 锁串行（见 _ulock）。"""
     cfg = _cfg()
-    # 白名单双域:A=allowed_users(微信扫码人) B=gateway_users(网关标识,旧配置缺省放行 gateway)
-    if not bypass_auth and user not in (cfg.get("allowed_users") or []) \
-            + (cfg.get("gateway_users") or ["gateway"]):
-        return (f"未绑定：你的 ID 是「{user}」，请到 App 设置→微信机器人→对应模式的白名单添加后重试。")
+    if not bypass_auth and user not in (cfg.get("allowed_users") or []):
+        return (f"未绑定：你的 ID 是「{user}」，请到 App 设置→微信机器人→白名单添加后重试。")
     with _ulock(user):
         return _handle(text, user, image_path, ledger_id, attribution, cfg)
 
 def _handle(text: str, user: str, image_path: str | None,
             ledger_id: int | None, attribution: str, cfg: dict) -> str:
     text = (text or "").strip()
-    ledger = _ledger(cfg, ledger_id)
+    ledger = _ledger(ledger_id)
+    if ledger is None:
+        return _BOT_NO_LEDGER
     s = _session(user)
 
     # 1) 草稿指令（DRAFT_PENDING）
@@ -542,10 +543,6 @@ def _fetch_rows(ledger: int, q: dict, limit: int | None = None) -> list:
     """按缓存查询条件取流水（dbm.fetch_tx_rows 公共口径），时间倒序。limit=None 取全部。"""
     return dbm.fetch_tx_rows(dbm.connect(), ledger, **_q(q), limit=limit)
 
-def _count_rows(ledger: int, q: dict) -> int:
-    """缓存查询的总笔数（与 _fetch_rows 同 WHERE）。"""
-    return dbm.count_tx_rows(dbm.connect(), ledger, **_q(q))
-
 def _q_title(q: dict) -> str:
     """缓存查询标题：分类（有则）· 区间（无界=全部流水）。"""
     rng = f"{q.get('dfrom')}~{q.get('dto')}" if q.get("dfrom") and q.get("dto") else "全部流水"
@@ -569,7 +566,7 @@ def _list_view(s: dict, ledger: int, limit: int) -> str | None:
     s["query_ts"] = _now()
     if not rows:
         return None
-    total = _count_rows(ledger, q)
+    total = dbm.count_tx_rows(dbm.connect(), ledger, **_q(q))   # 与 _fetch_rows 同 WHERE
     if limit > LIST_MAX:   # 展开视图：标题带总数，more 复位；超 ALL_MAX 只提示去 App
         q["more"] = False
         head, tail = f"【{_q_title(q)} · 共{total}笔】", \
@@ -680,22 +677,16 @@ def _monthly(ledger: int, month: str) -> str:
         return f"⚠️ {out['error']}"
     return f"📊 {month} 月报：\n{out['text']}".strip()
 
-# ---------- 面板 / MCP 查询接口 ----------
-
-def status(user: str = "gateway") -> dict:
-    cfg = _cfg()
-    s = _session(user)
-    return {"mode": cfg.get("mode", "off"), "draft_active": bool(s.get("draft")),
-            "default_ledger": cfg.get("default_ledger", 1),
-            "allowed_users": cfg.get("allowed_users") or [],
-            "gateway_users": cfg.get("gateway_users") or ["gateway"]}
-
 # ---------- CLI 冒烟（python bot_core.py；不依赖任何通道） ----------
 
 if __name__ == "__main__":
     applog.setup()   # CLI 独立进程也走统一日志
     dbm.init_db()
-    print("柴米微信机器人大脑 CLI —— 直接输入对话；img <路径> 发小票；q 退出")
+    # _ledger 只认显式指定（无默认兜底）：CLI 取库中首个账本充任绑定，恢复免通道联调
+    row = dbm.connect().execute("SELECT id FROM ledgers ORDER BY sort, id LIMIT 1").fetchone()
+    lg = row["id"] if row else None
+    print("柴米微信机器人大脑 CLI —— 直接输入对话；img <路径> 发小票；q 退出"
+          + ("" if lg else "\n（库中无账本，先建账再联调）"))
     while True:
         try:
             line = input("你> ").strip()
@@ -709,7 +700,8 @@ if __name__ == "__main__":
         if line.lower().startswith("img "):
             img, line = line[4:].strip(), ""
         try:
-            print("bot> " + handle(line, user="cli", image_path=img, bypass_auth=True))
+            print("bot> " + handle(line, user="cli", image_path=img, bypass_auth=True,
+                                  ledger_id=lg))
         except Exception as e:   # CLI 联调不吞栈，直接暴露问题
             import traceback
             traceback.print_exc()

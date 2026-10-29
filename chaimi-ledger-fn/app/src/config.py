@@ -27,16 +27,12 @@ DEFAULTS: dict = {
         "keep_months": 3,
         "keep_years": 3,
     },
-    # gateway B 网关（OpenClaw 等经 /api/bot/* 调用）。allowed_users：A=微信ID白名单
-    # （扫码自动加入）；gateway_users：B=网关标识白名单（MCP 固定传 gateway，默认自带）；
-    # api_token 仅 gateway 模式生效；ilink 为 A 通道扫码凭证（P2 使用）
+    # 微信机器人（仅 A 通道 iLink 直连；B 通道网关/MCP 已下线）。allowed_users=微信ID
+    # 白名单（扫码自动加入）；ilink 为 A 通道扫码凭证（一账本一用户一机器人）
     "bot": {
         "mode": "off",
-        "default_ledger": 1,
         "allowed_users": [],
-        "gateway_users": ["gateway"],
-        "api_token": "",
-        "ilink": {"account_id": "", "token": "", "base_url": ""},
+        "ilink": {"account_id": "", "token": "", "base_url": ""}
     },
     "theme": "light",
     # 自定义导入模板（向导写入/内置模板复制；import_bill.user_templates 消费，路由优先于内置）
@@ -62,9 +58,7 @@ def conf_path() -> Path:
 def db_path() -> Path:
     if os.environ.get("CHAIMI_DB"):
         return Path(os.environ["CHAIMI_DB"])
-    if TRIM_PKGVAR:
-        return Path(TRIM_PKGVAR) / "chaimi.db"
-    return Path(__file__).resolve().parent.parent / "data" / "chaimi.db"
+    return _pkgvar_or_data("chaimi.db")
 
 
 def _pkgvar_or_data(rel: str) -> Path:
