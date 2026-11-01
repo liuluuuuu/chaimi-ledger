@@ -26,8 +26,9 @@ function curSym(){
 }
 // 日历单元专用：整数 + 千分位（如 "1,234"），不显示小数——缩小占用避免溢出；详情弹窗仍走 fmt 完整精度
 const fmtI = c => { const n = Math.round(c/100); return n.toLocaleString("en-US"); };
-const today = () => new Date().toISOString().slice(0,10);
-const thisMonth = () => new Date().toISOString().slice(0,7);
+// 本地时区取今日/本月（toISOString 是 UTC：东八区早 8 点前会差一天，新记账默认日期/今日卡片/月份选择器全受影响）
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; };
+const thisMonth = () => today().slice(0,7);
 /* 退款对「吸收」过滤：已被退款行引用的原交易 id 集合（流水/详情共用） */
 function absorbedIds(items){ return new Set(items.filter(x=>x.refund_for).map(x=>x.refund_for)); }
 /* AI 是否已配置；接口异常时按已配置处理（与各调用点原逻辑一致：失败不阻断） */

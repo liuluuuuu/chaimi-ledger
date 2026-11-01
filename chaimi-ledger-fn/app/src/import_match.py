@@ -1,4 +1,4 @@
-"""账本快照 + 退款匹配链 + 跨源/手动配对（今日真机调准的行为，只平移不改写）。"""
+"""账本快照 + 退款匹配链（统一 90 天回看窗）+ 跨源/手动配对。"""
 from __future__ import annotations
 
 import json
@@ -35,19 +35,25 @@ class _LedgerSnapshot:
         return [r for r in self.by_type_amount.get((p["type"], p["amount"]), ())
                 if r["source"] in sources and d_from <= (r["date"] or "")[:10] <= d_to]
 
-def _common_prefix_ratio(a: str, b: str) -> float:
-    """最长公共前缀 / 较短串长（京东改写标题的模糊度量，7.7 ② v1.2）。"""
-    a, b = a[:60], b[:60]
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i / max(min(len(a), len(b)), 1)
+def _fuzzy_ratio(bases: list, name: str) -> float:
+    """模糊兜底相似度（京东改写标题容错，7.7 ② v1.2）：最长公共前缀 / 较短串长
+    （各取前 60 字）；公共前缀 <2 字记 0——「京斯坦…」对 2 字泛化名「京东」的 1 字
+    前缀比值恰踩 0.5 线，单字证据不算（与 _MIN_NAME_LEN 同口径）。"""
+    name = (name or "")[:60]
+    best = 0.0
+    for b in bases:
+        b = b[:60]
+        i = 0
+        while i < min(len(b), len(name)) and b[i] == name[i]:
+            i += 1
+        if i >= _MIN_NAME_LEN:
+            best = max(best, i / max(min(len(b), len(name)), 1))
+    return best
 
-# 退款匹配窗口（天）：name=前缀/商户类（退款周期+价保）；packet=红包/占位名（几乎即时）；heuristic=兜底。
-# 高置信（免确认入库）三门槛：候选唯一 + 窗口内 + 前缀≥2 字（_MIN_NAME_LEN）——单字前缀的等额
-# 碰撞过常见，不作 high 证据。任一不满足 → 降 low 进待确认，宁低勿错（方案 A 收紧）。
-REFUND_WINDOWS = {"name": 180, "packet": 30, "heuristic": 90}
+# 退款匹配统一回看窗（天）：_match_refund / rescan 入口一次收窄（日期 ≤ 退款日 且窗内），
+# 窗外不猜——未命中的退款进待确认队列人工指定原消费。高置信（免确认入库）三门槛：
+# 候选唯一 + 窗口内 + 前缀≥2 字；任一不满足降 low，宁低勿错。
+REFUND_WINDOW_DAYS = 90
 _MIN_NAME_LEN = 2
 
 def _day_window(date_str: str, days: int) -> tuple[str, str]:
@@ -169,8 +175,8 @@ def _refund_pool(conn: sqlite3.Connection, ledger_id: int, previews: list,
     return out
 
 def _match_order(pool: list, p: dict):
-    """① 订单号精确 → high；同单号多行（平台退款行带原单号/商家单号拆单共用）时
-    优先等额那行；等额也歧义则让位后续层（②金额+名称 / ③启发式）裁决。
+    """① 订单号精确 → high（pool 已收窗，隔季旧单不参与）；同单号多行（平台退款行
+    带原单号/商家单号拆单共用）时优先等额那行；等额也歧义则让位后续层（②/③）裁决。
     同单号唯一时不校验金额——同订单部分退款（100 退 35）是合法场景。"""
     if not p.get("order_no"):
         return None
@@ -185,8 +191,21 @@ def _match_order(pool: list, p: dict):
     return None   # 同单号多行且无等额：单号证据不足以定行，交给金额证据
 
 def _in_window(pool: list, date: str, days: int) -> list:
-    """池中落在目标日期 [0, days] 天窗内的候选（各匹配层共用）。"""
-    return [e for e in pool if _within_days(e["date"], date, days)]
+    """池中落在退款日 [0, days] 天窗内的候选（0=当日；日期晚于退款日或解析失败 → 排除）。
+    各匹配层共用：_match_refund / rescan 入口一次收窄，层内不再重复过滤。"""
+    try:
+        ref = datetime.strptime((date or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return []
+    out = []
+    for e in pool:
+        try:
+            d = datetime.strptime((e["date"] or "")[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if 0 <= (ref - d).days <= days:
+            out.append(e)
+    return out
 
 def _pick_recent(hits: list):
     """命中挑选（「宁低勿错」统一收口）：唯一 → (候选, 高置信)；
@@ -200,76 +219,66 @@ def _strong_bases(bases: list) -> list:
     return [b for b in bases if len(b) >= _MIN_NAME_LEN]
 
 def _name_hits(pool: list, p: dict, bases: list) -> list:
-    """② 的命中集：等额 + 名称前缀（前缀≥2 字）+ 180 天窗。
+    """② 的命中集：等额 + 名称前缀（前缀≥2 字）；pool 为已收窗候选。
     主匹配据此判 high/low（_pick_recent），rescan 取池序首个（最近）——单一口径。"""
     strong = _strong_bases(bases)
     if not strong:
         return []
     return [e for e in pool if e["amount"] == p["amount"]
-            and any(e["name"].startswith(b) for b in strong)
-            and _within_days(e["date"], p["date"], REFUND_WINDOWS["name"])]
+            and any(e["name"].startswith(b) for b in strong)]
 
 def _match_name(pool: list, p: dict, bases: list):
-    """② 金额+名称前缀：窗内唯一命中（前缀≥2 字）→ high；多命中取最近 / 窗外命中 → 降 low；
-    模糊最长公共前缀比 ≥0.5（京东改写标题容错）→ low，同额候选优先于高相似度
-    （真机案例：9.9 退款与同店 12.9/9.9 两笔模糊打平，误链时间更晚的 12.9）。
-    high 三门槛缺一降级——宁低勿错。"""
+    """② 金额+名称：等额+前缀唯一（前缀≥2 字）→ high；多命中取最近降 low（优先于
+    模糊兜底）；无等额命中 → 模糊最长公共前缀比 ≥0.5（京东改写标题容错，前缀≥2 字）
+    → low，同额候选优先于高相似度（真机案例：9.9 退款与同店 12.9/9.9 两笔模糊打平，
+    误链时间更晚的 12.9）。high 三门槛缺一降级——宁低勿错。"""
     pick = _pick_recent(_name_hits(pool, p, bases))
-    if pick and not pick[1]:
-        return pick                      # 唯一命中：高置信直连
+    if pick:
+        return pick                      # 唯一命中 high / 多命中取最近降 low
     best, best_key = None, None
-    for e in pool:
+    for e in pool:                       # pool 已收窗：模糊只在窗内找相似
         if e["amount"] < p["amount"]:
             continue
-        r = max((_common_prefix_ratio(b, e["name"]) for b in bases), default=0.0)
+        r = _fuzzy_ratio(bases, e["name"])
         if r < 0.5:
             continue
         key = (e["amount"] == p["amount"], r)   # 同额 > 相似度 > 池序（倒序=最近）
         if best is None or key > best_key:
             best, best_key = e, key
-    return pick or ((best, True) if best else None)   # 多命中取最近降 low 优先于模糊兜底
+    return (best, True) if best else None
 
 def _match_wechat(pool: list, p: dict, flow: dict):
-    """②' 微信：商户+金额唯一 → high（多命中取最近降 low）；红包/转账无名称信息 →
-    30 天窗内最近等额 → low（窗外不猜——红包退款几乎即时）。
-    同额多候选时优先交易对方相同的那笔（退款行带交易对方：退给谁=原转账给谁，
-    真机案例：35 转账退款被链到最近一笔别人的 35 转账）。"""
+    """②' 微信（pool 已收窗）：商户+金额唯一 → high（多命中取最近降 low）；红包/转账
+    无名称信息 → 最近等额 → low。同额多候选时优先交易对方相同的那笔（退款行带交易
+    对方：退给谁=原转账给谁，真机案例：35 转账退款被链到最近一笔别人的 35 转账）。"""
     rows = [e for e in pool if e["amount"] == p["amount"] and e["source"] not in ("manual", "app")]
     if flow.get("wechat_type") in ("微信红包", "转账"):
-        near = _in_window(rows, p["date"], REFUND_WINDOWS["packet"])
-        if not near:
+        if not rows:
             return None
-        same = [e for e in near if p.get("merchant") and e["merchant"] == p["merchant"]]
-        return (same or near)[0], True
+        same = [e for e in rows if p.get("merchant") and e["merchant"] == p["merchant"]]
+        return (same or rows)[0], True
     return _pick_recent([e for e in rows if e["merchant"] and e["merchant"] == p["merchant"]])
 
 def _match_bracket(pool: list, p: dict):
     """②'' 括号退款额（京东新导出）：退款额 == 原消费行括号标注的退款额
     （(已退款26.72)；(已全额退款)=全额）——子件部分退款单号/名称都对不上时的唯一线索。
     金额单证据：唯一命中也只给 low（进待确认）；同额歧义放弃。"""
-    hits = [e for e in pool
-            if e.get("bracket_refund") == p["amount"]
-            and _within_days(e["date"], p["date"], REFUND_WINDOWS["heuristic"])]
+    hits = [e for e in pool if e.get("bracket_refund") == p["amount"]]
     return (hits[0], True) if len(hits) == 1 else None
 
 def _match_heuristic(pool: list, p: dict):
-    """③ 启发式：金额 ≥ 退款额 + 窗内唯一候选 → low；多候选但恰有一笔同额 → 优先同额（low，
+    """③ 启发式：金额 ≥ 退款额 + 唯一候选 → low；多候选但恰有一笔同额 → 优先同额（low，
     仍进待确认）。同额也歧义（多笔等额）则放弃——宁低勿错。"""
-    cands = [e for e in _in_window(pool, p["date"], REFUND_WINDOWS["heuristic"])
-             if e["amount"] >= p["amount"]]
+    cands = [e for e in pool if e["amount"] >= p["amount"]]
     if len(cands) == 1:
         return cands[0], True
     eq = [e for e in cands if e["amount"] == p["amount"]]
     return (eq[0], True) if len(eq) == 1 else None
 
-def _candidates_upto(pool: list, p: dict) -> list:
-    """候选日期 ≤ 退款日（退款不早于原消费）——主匹配链与 rescan 共用。"""
-    return [e for e in pool if (e["date"] or "")[:10] <= (p["date"] or "")[:10]]
-
 def _match_refund(pool_all: list, p: dict, flow: dict):
-    """单条退款行的匹配链：①订单号 → ②名称 → ②'微信专属 → ③启发式。
-    返回 (候选, 低置信) 或 None。"""
-    pool = _candidates_upto(pool_all, p)
+    """单条退款行的匹配链：候选一次收窄到统一 90 天窗（含日期 ≤ 退款日），再走
+    ①订单号 → ②名称 → ②'微信专属 → ②''括号 → ③启发式。返回 (候选, 低置信) 或 None。"""
+    pool = _in_window(pool_all, p["date"], REFUND_WINDOW_DAYS)
     bases = _refund_name_candidates(p["name"])
     return (_match_order(pool, p)
             or _match_name(pool, p, bases)
@@ -278,7 +287,7 @@ def _match_refund(pool_all: list, p: dict, flow: dict):
             or _match_heuristic(pool, p))
 
 def _match_refunds(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
-                   flows: list[RawFlow], snap: _LedgerSnapshot | None = None) -> None:
+                   flows: list, snap: _LedgerSnapshot | None = None) -> None:
     """退款分层匹配（组装）：逐条走 _match_refund；低置信/未命中 → need_confirm 人工裁决。"""
     pool_all = _refund_pool(conn, ledger_id, previews, snap)
     for p, f in zip(previews, flows):
@@ -298,12 +307,4 @@ def _match_refunds(conn: sqlite3.Connection, ledger_id: int, previews: list[dict
             p["need_confirm"] = True
             p["refund_confidence"] = "unmatched"
             _log.info(f"退款匹配 [{p.get('platform')}] {p.get('name')} {p['amount']}分 → 无候选（待确认队列）")
-
-def _within_days(d1: str, d2: str, days: int) -> bool:
-    try:
-        a = datetime.strptime(d1[:19], "%Y-%m-%d %H:%M:%S")
-        b = datetime.strptime(d2[:19], "%Y-%m-%d %H:%M:%S")
-        return 0 <= (b - a).days <= days
-    except ValueError:
-        return False
 

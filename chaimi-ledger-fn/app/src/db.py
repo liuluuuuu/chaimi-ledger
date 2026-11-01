@@ -308,15 +308,23 @@ def seed_default_mappings(conn: sqlite3.Connection, ledger_id: int) -> None:
                 "INSERT OR IGNORE INTO category_mappings(ledger_id, flow_type, source, category_id) "
                 "VALUES(?,?,?,?)", (ledger_id, flow, source, cid))
 
+def create_ledger(c: sqlite3.Connection, name: str, icon: str = "", currency: str = "CNY",
+                  owner_uid: int | None = None) -> int:
+    """建账本 + 播种默认分类/账户/映射（首建 seed 与 POST /api/ledgers 单源，
+    存在即跳过、只增不删；v6 起映射为账本级，新账本必须显式种）。返回新账本 id。"""
+    cur = c.execute(
+        "INSERT INTO ledgers(name, icon, currency, owner_uid) VALUES(?,?,?,?)",
+        (name, icon, currency, owner_uid))
+    ledger_id = cur.lastrowid
+    seed_ledger_defaults(c, ledger_id)
+    seed_default_mappings(c, ledger_id)
+    return ledger_id
+
 def seed() -> None:
-    """首次初始化：默认账本 + 支出/收入分类 + 全局映射 + 默认账户。"""
+    """首次初始化：默认账本「日常」+ 默认分类/账户/映射（空库时由 init_db 调用）。"""
     conn = connect()
     with conn:
-        cur = conn.execute(
-            "INSERT INTO ledgers(name, icon, sort) VALUES('日常', '🏠', 0)")
-        ledger_id = cur.lastrowid
-        seed_ledger_defaults(conn, ledger_id)
-        seed_default_mappings(conn, ledger_id)
+        create_ledger(conn, "日常", "🏠")
 
 # ---------- 一次性库迁移（app_meta 键值打标） ----------
 

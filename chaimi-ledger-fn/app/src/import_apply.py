@@ -6,9 +6,9 @@ import sqlite3
 import db as dbm
 
 from import_common import _chunks, _is_placeholder_name, _is_new_row
-from import_match import (_LedgerSnapshot, REFUND_WINDOWS, _match_order,
-                          _candidates_upto, _strong_bases,
-                          _refund_name_candidates, _name_hits, _in_window)
+from import_match import (_LedgerSnapshot, REFUND_WINDOW_DAYS, _match_order,
+                          _strong_bases, _refund_name_candidates,
+                          _name_hits, _in_window)
 
 # ---------- 入库 ----------
 
@@ -92,9 +92,9 @@ def apply_import(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
 
 def _rescan_unmatched_refunds(conn: sqlite3.Connection, ledger_id: int) -> None:
     """反向补关联（7.7 匹配时机②）：本批新 expense 可能是此前未匹配退款行的原消费。
-    口径与主匹配同源（_refund_name_candidates / _name_hits / REFUND_WINDOWS）：订单号精确；
+    口径与主匹配同源（_refund_name_candidates / _name_hits / REFUND_WINDOW_DAYS）：订单号精确；
     名称前缀须等额+窗内（旧版无金额约束，30 元退款曾静默链上 300 元同名消费，名称层
-    无命中即放弃，不退占位分支）；占位名/过短名走等额+30 天窗。
+    无命中即放弃，不退占位分支）；占位名/过短名走等额+统一 90 天窗。
     候选池=快照支出、日期倒序——多候选取最近（旧 SQL 分支无 ORDER BY，取哪条随机）。
     关联一律写低置信并保持 need_confirm——由待确认队列人工转正（resolve → _link_refund），不静默 UPDATE。"""
     refunds = conn.execute(
@@ -108,21 +108,19 @@ def _rescan_unmatched_refunds(conn: sqlite3.Connection, ledger_id: int) -> None:
     for r in refunds:
         p = {"name": r["name"] or "", "amount": r["amount"], "order_no": r["order_no"] or "",
              "date": r["date"], "merchant": ""}
-        upto = _candidates_upto(pool, p)
+        near = _in_window(pool, p["date"], REFUND_WINDOW_DAYS)
         bases = _refund_name_candidates(p["name"])
         hit = None
         if p["order_no"]:
-            m = _match_order(upto, p)               # 同主匹配口径：等额优先/唯一/歧义让位
+            m = _match_order(near, p)               # 同主匹配口径：等额优先/唯一/歧义让位
             hit = m[0] if m else None
         if hit is None:
-            hits = _name_hits(upto, p, bases)
+            hits = _name_hits(near, p, bases)
             if hits:
                 hit = hits[0]                       # 名称层无命中即放弃，不退占位分支
             elif not _strong_bases(bases):
-                # 占位名/过短名：等额 + 30 天窗内最近
-                near = [e for e in _in_window(upto, p["date"], REFUND_WINDOWS["packet"])
-                        if e["amount"] == p["amount"]]
-                hit = near[0] if near else None
+                eq = [e for e in near if e["amount"] == p["amount"]]   # 占位名/过短名：等额最近
+                hit = eq[0] if eq else None
         if hit:
             status = "partial" if hit["amount"] > p["amount"] else "full"
             conn.execute("UPDATE transactions SET refund_for=?, refund_status=?, refund_confidence='low' "

@@ -9,6 +9,7 @@ import base64
 import datetime
 import json
 import re
+from pathlib import Path
 from typing import Iterator
 
 from openai import OpenAI
@@ -18,7 +19,7 @@ import config
 import db as dbm
 
 # 记账规则版本：随 ai.py 变更升级，启动日志打印，用于核对线上跑的是不是新代码
-RULES_VERSION = "1.1.7"
+RULES_VERSION = "1.1.8"
 applog.get("ai").info(f"booking rules v{RULES_VERSION} loaded")
 
 
@@ -769,7 +770,10 @@ def _run_tool(ledger_id: int, args: dict) -> tuple[str, dict | None]:
     conn = dbm.connect()
     def ret(data):
         return json.dumps(_yuan(data), ensure_ascii=False)
-    rng = args.get("range") or "month"
+    kind = args["kind"]
+    # 人情缺省全量（与统计页 /api/stats/renqing 同口径：人名的往来是历史概念）——
+    # 模型忘传 range=all 时按当月取会漏旧账，缺省在后端兜住
+    rng = args.get("range") or ("all" if kind == "renqing" else "month")
     month = args.get("month") or datetime.date.today().strftime("%Y-%m")
     label = ""
     if rng == "all":
@@ -792,7 +796,6 @@ def _run_tool(ledger_id: int, args: dict) -> tuple[str, dict | None]:
         dfrom, dto = dbm.month_range(month)
         label = month
     ft = args.get("type") or "expense"   # 支出/收入侧（问收入必须传 income）
-    kind = args["kind"]
     if kind == "attribution":
         return _attribution_tool(conn, ledger_id, dfrom, dto, label, ft)
     if kind == "trend":
@@ -970,7 +973,7 @@ def parse_receipt(path: str) -> dict:
     if not model:
         return {"error": "当前平台未配置视觉模型，图片记账不可用（设置页填写视觉模型）"}
     try:
-        b64 = base64.b64encode(open(path, "rb").read()).decode()
+        b64 = base64.b64encode(Path(path).read_bytes()).decode()
         resp = client.chat.completions.create(
             model=model, temperature=0,
             messages=[{"role": "user", "content": [

@@ -361,13 +361,7 @@ def list_ledgers(all: bool = False):
 @app.post("/api/ledgers")
 def create_ledger(body: LedgerIn):
     with conn() as c:
-        cur = c.execute("INSERT INTO ledgers(name, icon, currency, owner_uid) VALUES(?,?,?,?)",
-                        (body.name, body.icon, body.currency, _uid()))
-        lid = cur.lastrowid
-        # 新账本同样播种分类/账户（与首建 seed 共用，存在即跳过）
-        dbm.seed_ledger_defaults(c, lid)
-        # v6 起映射为账本级，新账本需显式种默认映射
-        dbm.seed_default_mappings(c, lid)
+        lid = dbm.create_ledger(c, body.name, body.icon, body.currency, _uid())
     _bump_lrev()   # 各端账本下拉即时出现新账本
     return {"id": lid}
 
@@ -775,7 +769,9 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
             cents = int(Decimal(q.strip()) * 100)
             or_conds.append("t.amount=?")
             or_args.append(cents)
-        except InvalidOperation:
+        except (InvalidOperation, ValueError, OverflowError):
+            # InvalidOperation=普通非数字；ValueError/OverflowError="nan"/"inf"
+            # （Decimal 可解析但 int() 换算溢出，漏捕曾让搜索框输 nan 直接 500）
             pass
         sql.append("AND (" + " OR ".join(or_conds) + ")")
         args += or_args
@@ -1279,6 +1275,10 @@ def save_import_template(body: dict):
             re.compile(owner_re)
         except re.error:
             raise HTTPException(400, "owner_re 不是合法正则")
+    try:
+        skip_n = int(body.get("skip_first_n") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "skip_first_n 必须是数字")
     cfg = config.load()
     tpls = [t for t in (cfg.get("import_templates") or []) if t.get("name") != name]
     t = {"id": "custom", "name": name, "headers": [str(h) for h in headers], "col": col,
@@ -1287,7 +1287,7 @@ def save_import_template(body: dict):
          "refund_type": str(body.get("refund_type") or "").strip(),
          "name_strip": [str(s) for s in (body.get("name_strip") or []) if s],
          "owner": str(body.get("owner") or "").strip(),
-         "skip_first_n": int(body.get("skip_first_n") or 0)}
+         "skip_first_n": skip_n}
     if rules is not None:
         t["refund_rules"] = rules
     if ttypes is not None:
