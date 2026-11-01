@@ -6,6 +6,8 @@
   --fg:#1F2433;          /* 主文字——深蓝灰，4.7:1 对比度 */
   --muted:#6E7686;
   --border:#E8EBF3;      /* 通用边框 */
+  --win:#F3F3F3;         /* 窗口灰（官方应用同款）：侧栏底色，桌面端兼作窗口底色 */
+  --panel:var(--card);   /* 内容面板底：浅色=白（官方一致），卡片/顶栏/筛选/翻页条共用 */
   --chip:#F1F3F8;        /* 标签/小元素底 */
   --hover:#F4F6FB;       /* hover 高亮 */
   --mask:rgba(31,36,51,.45);   /* 弹窗遮罩（modal-mask 与退款下拉共用） */
@@ -22,6 +24,7 @@
   --radius:18px;          /* 卡片 */
   --radius-lg:22px;        /* 容器/弹窗 */
   --radius-sm:12px;        /* 按钮/输入框 */
+  --radius-panel:16px;     /* 桌面内容面板外框（卡片/顶栏/翻页条共用） */
   --radius-pill:999px;     /* chip/avatar 全圆 */
 
   /* ===== 马卡龙 8 色系（每个功能模块一个独立色相）=====
@@ -62,8 +65,10 @@
   --cal-amt-e3:#7A1F2B; --cal-amt-i3:#0B3D27;
 }
 [data-theme="dark"]{
-  --bg:#0F172A; --bg-2:#1E293B; --card:#1A2236; --fg:#E8ECF4; --muted:#8A93A8;
+  --bg:#0F172A; --bg-2:#1E293B; --card:#26272B; --fg:#E8ECF4; --muted:#8A93A8;
   --border:rgba(255,255,255,.04); --hover:rgba(255,255,255,.05);
+  --win:#0C0C0D;         /* 窗口/菜单底：官方深色实测近黑（与浅色 #F3F3F3 同位——窗口层最暗） */
+  --panel:#1F2021;       /* 内容面板底：官方深色实测值，亮窗口一档（明暗方向与浅色一致） */
   --chip:#252C40; --pending-bg:rgba(217,162,80,.16);
   /* 滚动条：深底上用低透明度白，弱化存在感，hover 才提亮 */
   --sb-thumb:rgba(255,255,255,.16); --sb-thumb-hover:rgba(255,255,255,.32);
@@ -128,7 +133,9 @@ label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
 body{overflow:hidden}
 .shell{display:flex;height:100vh}
 @supports (height:100dvh){.shell{height:100dvh}}
-.sidebar{width:200px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:4px;padding:12px 8px;background:var(--card);position:sticky;top:0;height:100vh;overflow-x:hidden;overflow-y:auto;white-space:nowrap;flex-shrink:0}
+/* 侧栏 = 窗口灰（--win）；灰底上原 --hover(#F4F6FB) 不可见，作用域内换提亮式 hover */
+.sidebar{--hover:rgba(255,255,255,.6);width:200px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:4px;padding:12px 8px;background:var(--win);position:sticky;top:0;height:100vh;overflow-x:hidden;overflow-y:auto;white-space:nowrap;flex-shrink:0}
+[data-theme="dark"] .sidebar{--hover:rgba(255,255,255,.06)}
 /* 手机弹输入法时布局视口压矮,flex 纵列默认会压缩子项——菜单项定高不缩,放不下改滚动 */
 .sidebar>*{flex-shrink:0}
 .nav-item{height:44px;border-radius:10px;display:flex;align-items:center;justify-content:flex-start;gap:12px;padding:0 10px;color:var(--muted);border:none;background:none;transition:background .18s,color .18s;position:relative;font-size:14px}
@@ -386,3 +393,16 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
   .ledger-box{padding:8px 8px 10px}
 }
 @media (prefers-reduced-motion: reduce){*{transition:none!important}}
+
+/* ===== 内容区卡片（桌面）：官方应用布局——菜单贴边不吃圆角，主内容区收进
+   描边圆角卡片（上/右/下 10px、左缘贴菜单）；fixed 元素让位与补偿见 views.css 同名块。
+   手机端全屏不套卡片。 */
+@media(min-width:769px){
+  body{background:var(--win)}
+  .sidebar{border-right:none}   /* 分隔线交给卡片左边线 */
+  .main{height:calc(100vh - 20px);margin:10px 10px 10px 0;
+    border:1px solid var(--border);border-radius:var(--radius-panel);background:var(--panel)}
+  @supports (height:100dvh){.main{height:calc(100dvh - 20px)}}
+  /* 顶栏是 fixed、不受卡片圆角裁切：自带重合描边+上圆角，否则方角背景盖住卡片圆角 */
+  .gbar{top:10px;right:10px;border:1px solid var(--border);border-radius:var(--radius-panel) var(--radius-panel) 0 0;background:var(--panel)}
+}

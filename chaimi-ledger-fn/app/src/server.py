@@ -1808,9 +1808,25 @@ def ai_chat(ledger: int, q: str):
 
 # ---------- 静态资源（小票图） ----------
 
+def _receipt_ledger_gate(name: str) -> None:
+    """小票文件级 ACL（get_receipt/crop_receipt 共用）：被流水引用即按所属账本
+    收口（与 _ledger_access 同口径）。比对按 basename——库内 receipt_path 有
+    裸名 / receipts/名 两种形态（bot 入库前已归一，见 bot_core 草稿构造），
+    basename 口径顺带防住异常路径数据。未被引用的在途图不拦（App 先预览后
+    确认、机器人草稿期）：随机文件名 + 24h 兜底清理已足够。"""
+    uid = _uid()
+    if uid is None:
+        return
+    lids = {r["ledger_id"] for r in conn().execute(
+        "SELECT ledger_id, receipt_path FROM transactions WHERE receipt_path!=''")
+        if Path(r["receipt_path"]).name == name}
+    if lids and not lids & _my_ledger_ids(uid):
+        raise HTTPException(403, "无权访问该小票")
+
 @app.get("/receipts/{name}")
 def get_receipt(name: str):
     _safe_name(name)
+    _receipt_ledger_gate(name)
     p = config.receipts_dir() / name
     if not p.exists():
         raise HTTPException(404)
@@ -1827,6 +1843,7 @@ def crop_receipt(path: str = Query(...), body: dict = None):
     name = Path(path or "").name
     if not name:
         raise HTTPException(400, "无效路径")   # Path("..").name == "" 已拦截穿越
+    _receipt_ledger_gate(name)
     p = config.receipts_dir() / name
     if not p.is_file():
         raise HTTPException(404, "小票不存在")

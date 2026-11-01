@@ -109,7 +109,7 @@ PRAGMA journal_mode=WAL; busy_timeout=5000; foreign_keys=ON;
 
 **迁移**：`PRAGMA user_version` 记录版本，启动按序执行（只增不删列）；对已发布表加列走 `_ensure_column`（PRAGMA table_info 查缺 → 幂等 ALTER），老库升级/新库建表共用同一路径。
 
-**多用户与账本 ACL（v1.0.4，方案详见 MULTIUSER-PLAN.md）**：单库不拆文件，隔离靠账本级授权——飞牛统一网关注入 `X-Trim-Userid/Username/Isadmin` 请求头（应用只监听网关 UDS + 本地开发入口，头不可被外部伪造），中间件解析为请求级 ContextVar；访问判定收敛在 `_ledger_access`（owner 或 `ledger_members` 成员放行，系统上下文=机器人/本地开发全放行），所有按资源 id 操作的端点先经 `_row_ledger` 反查所属账本再判定。无头请求/无主账本的兜底：升级后首个 admin 打开应用认领全部 `owner_uid IS NULL` 的账本；`known_users` 由 `/api/whoami` 落档（fnOS 无用户列表 API，共享选人器数据源）。应用级操作（配置写/备份恢复/扫码总开关）走 `_admin_or_403`；账本级设置（分类/映射/账户/归属分组/预算）owner 与共享成员均可写，账本名/币种/删除/共享管理仅 owner（预算为独立端点 `PUT /api/ledgers/{id}/budget`）。
+**多用户与账本 ACL（v1.0.4，方案详见 MULTIUSER-PLAN.md）**：单库不拆文件，隔离靠账本级授权——飞牛统一网关注入 `X-Trim-Userid/Username/Isadmin` 请求头（应用只监听网关 UDS + 本地开发入口，头不可被外部伪造），中间件解析为请求级 ContextVar；访问判定收敛在 `_ledger_access`（owner 或 `ledger_members` 成员放行，系统上下文=机器人/本地开发全放行），所有按资源 id 操作的端点先经 `_row_ledger` 反查所属账本再判定。无头请求/无主账本的兜底：升级后首个 admin 打开应用认领全部 `owner_uid IS NULL` 的账本；`known_users` 由 `/api/whoami` 落档（fnOS 无用户列表 API，共享选人器数据源）。应用级操作（配置写/备份恢复/扫码总开关）走 `_admin_or_403`；账本级设置（分类/映射/账户/归属分组/预算）owner 与共享成员均可写，账本名/币种/删除/共享管理仅 owner（预算为独立端点 `PUT /api/ledgers/{id}/budget`）。小票图 `GET /receipts/{name}` 与手动裁剪 `POST /api/receipts/crop` 走 `_receipt_ledger_gate`（v1.0.6）：按 basename 反查引用流水的账本后同口径判权；未被流水引用的在途图（App 先预览后确认、机器人草稿期）放行——随机文件名 + 24h 兜底清理兜底。
 
 ***
 
@@ -342,6 +342,7 @@ cmd/main：系统 python3 + PYTHONPATH=site-packages 直跑；启动时依赖双
 6. **传输与大脑分离**：bot_core 通道无关，新通道可插；当前仅 A 通道直连，off↔direct 配置热切换（B 通道 v1.0.4 下线）
 7. **导入上传安全**：大小/白名单/魔数/行数四重校验，防伪装与解压炸弹
 8. **身份复用飞牛账号**：无自建账号体系——网关注入头即身份，账本级 ACL 隔离（v1.0.4 多用户）；「用户」（归属分组）是账本内的记账人维度
+9. **官方应用同款布局（v1.0.6）**：桌面端按官方截图逐像素校准的三层几何——`--win` 窗口灰（浅 #F3F3F3 / 暗 #0C0C0D）统一侧栏与窗口底色，菜单贴窗口边缘不吃圆角；主内容区收进 1px `--border` 描边 + `--radius-panel`（16px）圆角卡片（上/右/下 10px、左缘贴菜单），面板底 `--panel`（浅白 / 暗 #1F2021，卡片/顶栏/筛选/翻页条共用）；fixed 的顶栏/翻页条不受卡片圆角裁切，自带重合描边圆角补偿，钉顶筛选区让位、AI hero 高度同口径扣除；暗色 `--card` 提亮至 #26272B 保住卡片层次（官方「窗口→面板→卡片」逐级提亮梯度）；手机端全屏不套卡片（抽屉/钉顶条按视口定位零改动）
 
 ***
 

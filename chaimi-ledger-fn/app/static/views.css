@@ -523,3 +523,12 @@ th{color:var(--muted);font-weight:500;font-size:12px}
   font-size:13px;padding:9px 12px;border-radius:8px;cursor:pointer;transition:background .15s}
 .dd-c:hover{background:var(--hover)}
 .dd-c.sel{color:var(--primary-fg);background:var(--primary-bg);font-weight:600}
+
+/* ===== 桌面内容卡片适配：fixed 的筛选区/翻页条让出卡片边距（left:200px 沿用
+   各自的原有规则，此处只补 top/bottom/right）；AI hero 高度同口径扣除外框 */
+@media(min-width:769px){
+  #txPager{bottom:10px;right:10px;border:1px solid var(--border);border-radius:0 0 var(--radius-panel) var(--radius-panel);background:var(--panel)}
+  #tab-list .tx-filter{top:calc(var(--gbar-h,96px) + 2px);right:10px;background:var(--panel)}
+  .ai-hero{height:calc(100vh - var(--gbar-h,96px) - 22px)}
+  @supports (height:100dvh){.ai-hero{height:calc(100dvh - var(--gbar-h,96px) - 22px)}}
+}
