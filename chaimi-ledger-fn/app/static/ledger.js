@@ -14,7 +14,9 @@ function bindSearch(box, clearBtn, apply, delay){
 bindSearch($("#q_text"), $("#q_clear"), ()=>{ txPageNo = 1; loadTx(); });
 // 待确认流水不满一页时直接落空显示「暂无流水」（搜索/清空一直有重置页码，类型筛选没有）
 function setTypeFilter(b){ curTypeFilter=b.dataset.ft; txPageNo=1; document.querySelectorAll("#tab-list .fchip[data-ft]").forEach(x=>x.classList.toggle("on",x===b)); loadTx(); }
+let _loadTxSeq = 0;   // 请求代数：快速切月份/范围/账本时，迟到的旧响应整包丢弃（不回填 DOM/txCache）
 async function loadTx(){
+  const seq = ++_loadTxSeq;
   $("#ftBase").textContent = txRecentDefault ? "最近" : "全部";
   const q = new URLSearchParams({ledger:lid(), page:txPageNo, page_size: txRecentDefault ? 20 : 50});
   const qt = $("#q_text").value.trim();
@@ -41,12 +43,14 @@ async function loadTx(){
     }
   }
   let r = await api("/api/transactions?"+q);
+  if(seq !== _loadTxSeq) return;   // 期间又发起了新 loadTx（切月/范围/账本）：本响应已过期
   // 会停在不存在的页上，指示器出现「N 笔 · 第 X 页」却列空——回拉到末页重查一次
   let pages = Math.max(1, Math.ceil(r.total / (r.page_size || 50)));
   if(txPageNo > pages){
     txPageNo = pages;
     q.set("page", txPageNo);
     r = await api("/api/transactions?"+q);
+    if(seq !== _loadTxSeq) return;
   }
   txPages = pages;
   $("#txPage").textContent = `${r.total} 笔 · 第 ${r.page} 页`;
@@ -54,7 +58,8 @@ async function loadTx(){
   const groups = {};
   r.items.forEach(t=>{ const d=(t.date||"").slice(0,10); (groups[d]=groups[d]||[]).push(t); });
   // 退款对：已被退款「吸收」的原交易不再单独渲染（在退款行的双卡片里展示）。
-  // 必须全局构建（跨日场景：原交易在 A 日、退款在 B 日，按日分组后 B 日看不到原交易，
+  // absorbedIds 必须在按日分组前全局构建（跨日场景：原交易在 A 日、退款在 B 日，
+  // 分组后 B 日组里看不到 A 日的原交易，逐组判定会漏吸收）。
   const absorbed = absorbedIds(r.items);
   $("#txList").innerHTML = Object.entries(groups).map(([d,items])=>{
     return `
@@ -299,9 +304,9 @@ async function showCategoryDetail(catName, range, type, refresh){
   const top = categories.find(c=>c.name===catName && !c.parent_id && c.type===flow)
            || categories.find(c=>c.name===catName && !c.parent_id);
   if(!top){ $("#dayList").innerHTML = '<div class="sub">暂无流水</div>'; dayEditVis(); return; }
-  // to 语义与 showTxDetail 一致：toExclusive / 月/年/全部（下一周期排他界）→ to_exclusive=1 裸日期；
+  // to 语义与 showTxDetail 一致（rangeExcl 单源）：排他 → to_exclusive=1 裸日期；
   // 仅自定义区间的 to 是含当天的结束日 → 裸日期交服务端膨胀 23:59:59
-  const excl = rg.toExclusive || appScope() !== "custom";
+  const excl = rangeExcl(rg);
   await fillDayDetail(()=>api(`/api/transactions?ledger=${lid()}&from=${rg.from}&to=${encodeURIComponent(rg.to)}`
     + `${excl ? "&to_exclusive=1" : ""}&category=${top.id}&page=1&page_size=500`), refresh);
 }
@@ -393,8 +398,8 @@ window.addEventListener("resize", ()=>{
   // 旧版此处无条件 closeRefundDD 会把聚焦中的搜索框 display:none 夺焦、输入法立即收起
   positionRefundDD();
   txFilterPad();   // 宽度变化 chips 可能换行，筛选区（fixed）高度变了要重算列表留白
-  // 窗口变宽回到常驻侧栏布局时，清掉抽屉推挤状态（matchMedia 与 CSS 同口径，见 toggleSidebar 注释）
-  if(matchMedia("(min-width:769px)").matches){ $("#sidebar").classList.remove("open"); $("#sideMask").classList.remove("on"); $(".main").classList.remove("pushed"); }
+  // 窗口变宽回到常驻侧栏布局时，清掉抽屉推挤状态（断点复用 core.js 的 mobileMQ，与 CSS 同口径）
+  if(!mobileMQ.matches){ $("#sidebar").classList.remove("open"); $("#sideMask").classList.remove("on"); $(".main").classList.remove("pushed"); }
 });
 if(window.visualViewport) visualViewport.addEventListener("resize", positionRefundDD);   // iOS：输入法只动 visualViewport，不触发 window resize
 function closeRefundDD(){ $("#e_refund_dd") && $("#e_refund_dd").classList.remove("open"); }
@@ -415,7 +420,7 @@ function renderRefundSelf(){   // 弹窗顶卡=本笔退款交易：编辑/确�
     const item = document.querySelector("#txItems .txf-item");
     if(item){
       name = (item.querySelector(".txf-name").value || "").trim() || "退款";
-      amount = Math.round(parseFloat(item.querySelector(".txf-amt").value || "0") * 100);
+      amount = toCents(item.querySelector(".txf-amt").value);
       sub = [(item.querySelector(".txf-date").value || "").replace("T", " "),
              (item.querySelector(".txf-note").value || "").trim(),
              (item.querySelector(".txf-order").value || "").trim()];
@@ -564,7 +569,7 @@ function renderRenqing(){
   }).join("");
   $("#renqingEmpty").style.display = rq.length ? "none" : "block";
   $("#renqingTable").style.display = rq.length ? "" : "none";
-  $("#renqingEmpty").textContent = rqList.length ? `没有匹配「${esc(q)}」的名称` : "暂无人情记录：分类为「人情往来」的流水会按名称显示在这里";
+  $("#renqingEmpty").textContent = rqList.length ? `没有匹配「${q}」的名称` : "暂无人情记录：分类为「人情往来」的流水会按名称显示在这里";   // textContent 不解析 HTML，无需 esc（套上会显示 &amp; 等实体）
 }
 bindSearch($("#rq_q"), $("#rq_q_clear"), renderRenqing);
 async function showPersonDetail(person, refresh){

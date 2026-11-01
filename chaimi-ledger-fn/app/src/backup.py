@@ -15,8 +15,11 @@ import time
 import zipfile
 from datetime import datetime
 
+import applog
 import config
 import db
+
+_log = applog.get("backup")
 
 _SIDE_SUFFIXES = (".conf.json", ".receipts.zip")
 
@@ -106,9 +109,11 @@ def restore_backup(name: str) -> None:
     conf_backup = src_file.with_suffix(".conf.json")
     if conf_backup.exists():
         try:
-            config.conf_path().write_bytes(conf_backup.read_bytes())
-        except OSError:
-            pass
+            # 原子写（tmp+os.replace）：并发 load() 不会读到半截 JSON 而静默回退默认值；
+            # 配置缓存按文件签名自动失效，无需额外处理
+            config.write_raw(conf_backup.read_bytes())
+        except OSError as e:
+            _log.warning(f"配置恢复失败(忽略): {conf_backup.name}: {e}")
     receipts_backup = config.backup_dir() / (src_file.stem + ".receipts.zip")
     if receipts_backup.exists():
         try:
@@ -118,8 +123,10 @@ def restore_backup(name: str) -> None:
                 for n in z.namelist():
                     if "/" not in n and ".." not in n:   # 只收平铺文件名，防路径逃逸
                         z.extract(n, rdir)
-        except OSError:
-            pass
+        # 与 conf 恢复同款 best-effort：BadZipFile 不是 OSError 子类，漏捕会让恢复在
+        # db/conf 已生效后裸抛 500（部分恢复）；坏 zip 记 warning 后继续
+        except (OSError, zipfile.BadZipFile) as e:
+            _log.warning(f"小票恢复失败(忽略): {receipts_backup.name}: {e}")
 
 def delete_backup(name: str) -> None:
     """删除备份（.db 与同名副文件一起删）。"""
@@ -154,7 +161,7 @@ def _is_last_day_of_month(now: datetime) -> bool:
 class AutoBackup:
     """自动备份：到配置 hour 点检查——年末(12-31)优先生成年备并跳过月备；
     其余月末生成本月月备。保留按月数/年数分层清理，只清周期文件。
-    每轮重读配置，设置页改参数即时生效。"""
+    每轮重读配置，设置页改参数即时生效；备份成功才记当日已备（失败下一轮重试）。"""
 
     def __init__(self):
         self._last_date = ""
@@ -165,22 +172,30 @@ class AutoBackup:
 
     def _loop(self) -> None:
         while True:
-            cfg = config.load().get("backup", {})
-            try:
-                now = datetime.now()
-                today = now.strftime("%Y-%m-%d")
-                if (cfg.get("enabled") and int(cfg.get("hour", 3)) == now.hour
-                        and self._last_date != today
-                        and _is_last_day_of_month(now)):
-                    self._last_date = today
-                    if now.month == 12 and now.day == 31:
-                        # 12-31 年备优先（年备已覆盖当月），跳过月备
-                        if int(cfg.get("keep_years", 3)) > 0:
-                            self.last_result = create_backup("yearly")
-                            _cleanup_old(int(cfg.get("keep_years", 3)), now, yearly=True)
-                    elif int(cfg.get("keep_months", 3)) > 0:
-                        self.last_result = create_backup("monthly")
-                        _cleanup_old(int(cfg.get("keep_months", 3)), now, yearly=False)
-            except Exception as e:  # 备份失败不中断循环
-                self.last_result = {"error": str(e)[:300]}
+            self._check(datetime.now())
             time.sleep(60)
+
+    def _check(self, now: datetime) -> None:
+        """到点检查一轮（_loop 每分钟调一次，每轮重读配置，设置页改参数即时生效）：
+        enabled 且 hour 点且今天未备过且月末 → 年末优先生成年备，否则生成本月月备。
+        备份成功才置 _last_date：瞬时失败（如撞库锁）本轮记 error，下一分钟重试，
+        不会整月丢月备；_last_date 在 create_backup 之后、_cleanup_old 之前置位，
+        清理失败也不会同一天重复备份（周期文件名同戳，重复执行即整份重写）。"""
+        cfg = config.load().get("backup", {})
+        try:
+            today = now.strftime("%Y-%m-%d")
+            if (cfg.get("enabled") and int(cfg.get("hour", 3)) == now.hour
+                    and self._last_date != today
+                    and _is_last_day_of_month(now)):
+                if now.month == 12 and now.day == 31:
+                    # 12-31 年备优先（年备已覆盖当月），跳过月备
+                    if int(cfg.get("keep_years", 3)) > 0:
+                        self.last_result = create_backup("yearly")
+                        self._last_date = today
+                        _cleanup_old(int(cfg.get("keep_years", 3)), now, yearly=True)
+                elif int(cfg.get("keep_months", 3)) > 0:
+                    self.last_result = create_backup("monthly")
+                    self._last_date = today
+                    _cleanup_old(int(cfg.get("keep_months", 3)), now, yearly=False)
+        except Exception as e:  # 备份失败不中断循环
+            self.last_result = {"error": str(e)[:300]}

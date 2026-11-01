@@ -1,5 +1,8 @@
 const $ = s => document.querySelector(s);
-const fmt = c => (c/100).toFixed(2);
+const fmt = c => (c/100).toFixed(2);            // 分 → 元字符串
+const toCents = y => Math.round(parseFloat(y || "0") * 100);   // 元输入 → 分（记账/预算共用）
+const MAX_UPLOAD_B = 20*1024*1024;              // 上传上限（与后端 server.py MAX_UPLOAD 同值，改需同步）
+const mobileMQ = matchMedia("(max-width:768px)");   // 抽屉断点，与 views.css @media 同阈值（769 起为桌面）；ledger.js 复用 !mobileMQ.matches
 
 /* 当前飞牛用户（/api/whoami 一次拉取；uid=null=本地开发无网关身份）：
    身份徽标/共享标记/默认归属选中/设置页 admin 门共用 */
@@ -107,6 +110,14 @@ function msg(t, ok=true, type){
   clearTimeout(_msgTimer);
   _msgTimer = setTimeout(() => m.classList.remove("on"), 3000);
 }
+/* 全局兜底：onclick 直调 async 函数（tplDel/undoBatch/deleteEditTx/delAcc/catMgrDel/addAccount/delLedger/doBackup…）
+   失败时是未处理的 Promise rejection——此前完全静默。这里统一 toast 出 e.reason 的错误信息；
+   只处理未被捕获的 rejection（有本地 catch 的路径不会进到这里，不会重复提示）。 */
+window.addEventListener("unhandledrejection", e => {
+  const r = e.reason;
+  const m = r && r.message ? r.message : (typeof r === "string" && r ? r : "");
+  if(m) msg(m, false);
+});
 
 let _cfmRes = null;
 function uiConfirm(text, okLabel){
@@ -160,8 +171,9 @@ async function getCfg(force){
 const curLedger = () => getLedgers().then(ls => ls.find(l => l.id === lid()));   // 当前账本对象（预算/币种/导出文件名共用）
 function toggleSidebar(){
   const open = $("#sidebar").classList.toggle("open");
-  // 判定抽屉态、JS 却判桌面态），遮罩/推挤与菜单项自动收起会在平板上失灵
-  const mobile = matchMedia("(max-width:768px)").matches;
+  // 遮罩/推挤按「当前视口 + 展开态」联动判定：CSS 按 <768px 判定抽屉态，这里用同阈值，
+  // 否则平板（CSS 抽屉、JS 误判桌面）时遮罩不出现、收起逻辑失灵
+  const mobile = mobileMQ.matches;
   $("#sideMask").classList.toggle("on", open && mobile);
   $(".main").classList.toggle("pushed", open && mobile);
 }
@@ -420,7 +432,8 @@ function txItemHtml(it, i, n, mode){   // 单张条目卡：多笔才有序号+�
         <span style="flex:1"></span>
         <button class="icon-btn txf-rm" style="border:none;width:26px;height:26px" title="移除此笔" onclick="txRemoveItem(this)">✕</button>
       </div>` : "";
-  //（否则两个 chip 都不选中、分类还被禁用，成死卡），改为只读标注后仍按 transfer 入库
+  // 编辑已有转账行不显示收支切换（否则改成 expense/income 后两个 chip 都不选中、
+  // 分类还被禁用，成死卡），改为只读标注后仍按 transfer 入库
   const typeRow = !showTypes ? ""
     : (transfer && mode === "create") ? `<div class="txf-ro txf-types">转账</div>`
     : `<div class="filters txf-types">${transfer   // 编辑/确认的转账：给「转账 · 不计收支」chip 可切回
@@ -437,7 +450,7 @@ function txItemHtml(it, i, n, mode){   // 单张条目卡：多笔才有序号+�
         <div><label>备注</label><input class="txf-note" value="${esc(it.note)}" placeholder="商家/地点（可空），如：肯德基"></div>
       </div>
       <div class="grid3">
-        <div><label>金额(元)</label><input class="txf-amt" type="number" step="0.01" min="0" inputmode="decimal" style="font-size:20px" value="${it.amount ? (it.amount/100).toFixed(2) : ""}"></div>
+        <div><label>金额(元)</label><input class="txf-amt" type="number" step="0.01" min="0" inputmode="decimal" style="font-size:20px" value="${it.amount ? fmt(it.amount) : ""}"></div>
         <div><label>分类 <button class="btn btn-ghost txf-newcat" style="padding:2px 8px;font-size:11px;margin-left:4px;${transfer?"display:none":""}" onclick="txItemAddCat(this)" title="新建自定义分类">＋新建</button></label><select class="txf-cat" onchange="txItemCatChange(this)">${catHtml}</select></div>
         <div><label>流水归属 <button class="btn btn-ghost" style="padding:2px 8px;font-size:11px;margin-left:4px" onclick="txItemAddAttr(this)" title="新建用户">＋新建</button></label><select class="txf-attr">${txAttrOptionsHtml(attrCur)}</select></div>
       </div>
@@ -533,7 +546,7 @@ function txCollect(root){   // 读条目 DOM → 条目数组（金额转分）�
   const host = root || $("#txItems");
   return [...host.querySelectorAll(".txf-item")].map(el=>({
     type: el.dataset.type || "expense",
-    amount: Math.round(parseFloat(el.querySelector(".txf-amt").value||"0")*100),
+    amount: toCents(el.querySelector(".txf-amt").value),
     category_id: +el.querySelector(".txf-cat").value || null,
     account_id: +el.querySelector(".txf-acc").value || null,
     date: (el.querySelector(".txf-date").value || today()).replace("T", " "),   // 16 位 YYYY-MM-DD HH:MM，秒由服务端补
@@ -553,7 +566,7 @@ async function txPostItems(items, meta){   // 逐笔 POST；失败时抛错并�
       const tags = Object.assign({}, it.tags);
       if(it.attr) tags.attribution = it.attr; else delete tags.attribution;
       it.tags = tags;   // 供确认卡回显归属
-      // date 原样 10 位：服务端 _norm_date 补「记账时刻」，不再固定 12:00:00
+      // date 原样 10 位：服务端 db.norm_date 补「记账时刻」，不再固定 12:00:00
       const r = await apiSend(`/api/transactions?ledger=${lid()}`, "POST", {
         type:it.type, amount:it.amount, category_id:it.category_id, account_id:it.account_id,
         name:it.name, note:it.note, date:it.date, tags, order_no:it.order_no || null,
@@ -611,11 +624,16 @@ function editRcpSync(){   // 同步小票缩略图与「移除」按钮显隐
 }
 async function editRcpUpload(){
   const f = $("#e_rcp_file").files[0]; if(!f) return;
+  if(f.size > MAX_UPLOAD_B){   // 客户端预检（后端同上限）：免上传 20MB 后才被拒
+    $("#e_rcp_file").value = "";
+    return msg(`图片超过 ${MAX_UPLOAD_B/1048576}MB 上限`, false);
+  }
   const fd = new FormData(); fd.append("file", f);
   try{
     const r = await api(`/api/ai/receipt?ledger=${lid()}`, {method:"POST", body:fd});
     if(r.error){ msg(r.error, false); $("#e_rcp_file").value=""; return; }
     eRcp = r.receipt_path;
+    $("#e_rcp_file").value="";   // 成功也清空（错误路径已清）：否则换回同一文件不触发 change
     editRcpSync();
     msg("已上传新图，保存后生效");
   }catch(e){ msg("上传失败: "+e.message, false); $("#e_rcp_file").value=""; }

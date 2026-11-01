@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextvars
 import json
 from contextlib import asynccontextmanager
@@ -28,7 +29,7 @@ from decimal import Decimal, InvalidOperation
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 from pydantic import BaseModel
 
 import ai
@@ -40,6 +41,7 @@ import config
 import db as dbm
 import import_bill as ib
 import import_classify as ic
+import platform_templates as pt
 
 applog.setup()   # 进程内首个初始化点：后续 get() 的子 logger 统一走双 handler
 log = applog.get("server")
@@ -60,6 +62,8 @@ async def lifespan(app: FastAPI):
     share = config.app_share_dir()
     log.info(f"应用文件夹: {share or '未找到（备份回退 @appdata/backups）'}")
     log.info(f"chaimi-ledger v{_app_version()}")   # 版本留痕:确认线上跑的是哪个包
+    log.info(f"booking rules v{ai.RULES_VERSION}")  # 记账规则版本留痕（ai.py 模块级打印早于
+    # applog.setup 不落盘，故由这里补打；见 ai.py RULES_VERSION 注释）
     # 模型自检走后台线程:服务商下线旧模型(如百炼一代 qwen-vl-*)时自动换新,不阻塞启动
     def _model_check():
         try:
@@ -309,11 +313,22 @@ def _row_ledger(table: str, rid: int) -> int:
 
 @app.get("/", include_in_schema=False)
 def index():
+    """应用入口。飞牛用户先落身份档再判账本：一个可见账本都没有（全新安装家人首开 /
+    未被共享的新用户）直接 302 到 home 建账选人——此前先渲染主应用、再由前端 loadAll
+    发现无账本跳走，用户会先看到应用界面闪一下。系统上下文（机器人/本地开发）照常出应用。
+    302 前必须 _touch_fn_user：admin 认领无主账本要先于判定（否则升级后首开会被误判
+    无账本），家人「打开过一次应用」的共享选人前提也不能因直达 home 而丢档。"""
+    u = _user()
+    if u:
+        _touch_fn_user(u)
+        if not _my_ledger_ids(u["uid"]):
+            return RedirectResponse(f"{PREFIX}/static/home.html", status_code=302,
+                                    headers={"Cache-Control": "no-store"})
     return _page("app.html")
 
 @app.get("/home", include_in_schema=False)
 def home():
-    """登录/用户选择页：主应用检测到无当前用户（首次/缓存失效）时跳转至此。"""
+    """登录/用户选择页：服务端入口（无账本用户）/主应用（无当前用户）跳转至此。"""
     return _page("home.html")
 
 def _no_cache_file(base: Path, name: str) -> FileResponse:
@@ -407,25 +422,49 @@ def delete_ledger(lid: int):
 
 @app.get("/api/whoami")
 def whoami():
-    """当前飞牛用户（网关头解析结果）。顺带 UPSERT known_users（共享选人器数据源，
-    fnOS 无用户列表 API）；admin 打开时把升级前的无主账本一次性归属自己（MULTIUSER-PLAN
-    §3.5 定案：旧数据固定给 admin）。"""
+    """当前飞牛用户（网关头解析结果），顺带落打开记录（_touch_fn_user）。"""
     u = _user()
     if not u:
         return {"uid": None, "username": "", "isadmin": False}
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with conn() as c:
-        c.execute(
-            "INSERT INTO known_users(uid, username, isadmin, first_seen, last_seen) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(uid) DO UPDATE SET username=excluded.username, "
-            "isadmin=excluded.isadmin, last_seen=excluded.last_seen",
-            (u["uid"], u["username"], 1 if u["isadmin"] else 0, now, now))
-        if u["isadmin"]:
-            n = c.execute("UPDATE ledgers SET owner_uid=? WHERE owner_uid IS NULL",
-                          (u["uid"],)).rowcount
-            if n:
-                log.info(f"多用户迁移：{n} 个无主账本归属 admin「{u['username']}」(uid={u['uid']})")
+    _touch_fn_user(u)
     return {"uid": u["uid"], "username": u["username"], "isadmin": u["isadmin"]}
+
+# 落档节流（进程内）：同一用户身份 5 分钟内重复打开不再写库（GET / + whoami 每次整页
+# 加载各落一次档，多标签/高频刷新即是写放大；admin 认领每进程只执行一次）
+_TOUCH_THROTTLE_S = 300
+_touch_state: dict = {}          # uid -> (username, isadmin, 上次写库 time.time())
+_admin_claimed = False
+
+def _touch_fn_user(u: dict) -> None:
+    """打开应用落档（whoami 与入口 / 共用）：known_users UPSERT（共享选人器数据源，
+    fnOS 无用户列表 API）；admin 打开时把升级前的无主账本一次性归属自己
+    （MULTIUSER-PLAN §3.5 定案：旧数据固定给 admin）。
+    落档失败（如 DB 被长写事务锁住）静默放行：入口判定不因此 500，下次打开再落。"""
+    global _admin_claimed
+    ts = time.time()
+    prev = _touch_state.get(u["uid"])
+    unchanged = (prev and prev[0] == u["username"] and prev[1] == bool(u["isadmin"])
+                 and ts - prev[2] < _TOUCH_THROTTLE_S)
+    if unchanged and (_admin_claimed or not u["isadmin"]):
+        return
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with conn() as c:
+            if not unchanged:
+                c.execute(
+                    "INSERT INTO known_users(uid, username, isadmin, first_seen, last_seen) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(uid) DO UPDATE SET username=excluded.username, "
+                    "isadmin=excluded.isadmin, last_seen=excluded.last_seen",
+                    (u["uid"], u["username"], 1 if u["isadmin"] else 0, now, now))
+            if u["isadmin"] and not _admin_claimed:
+                n = c.execute("UPDATE ledgers SET owner_uid=? WHERE owner_uid IS NULL",
+                              (u["uid"],)).rowcount
+                if n:
+                    log.info(f"多用户迁移：{n} 个无主账本归属 admin「{u['username']}」(uid={u['uid']})")
+                _admin_claimed = True   # 0 行也算完成：无主账本只在升级后首开出现
+        _touch_state[u["uid"]] = (u["username"], bool(u["isadmin"]), ts)
+    except Exception:
+        pass
 
 @app.get("/api/users")
 def list_users():
@@ -507,9 +546,14 @@ def delete_category(cid: int):
     待确认队列重新归类）——但留审计日志，静默大面积改数据必须可追溯。"""
     _row_ledger("categories", cid)
     with conn() as c:
-        n = c.execute("UPDATE transactions SET category_id=NULL, need_confirm=1 WHERE category_id=?",
-                      (cid,)).rowcount
-        c.execute("DELETE FROM category_mappings WHERE category_id=?", (cid,))
+        # 连子分类流水一并回炉：只回父分类会留下指向已删子分类的悬空 category_id
+        # （无 FK，INNER JOIN 下静默失类）；映射也按同集清理
+        kids = [r[0] for r in c.execute("SELECT id FROM categories WHERE parent_id=?", (cid,))]
+        ids = (cid, *kids)
+        marks = ",".join("?" * len(ids))
+        n = c.execute(f"UPDATE transactions SET category_id=NULL, need_confirm=1 "
+                      f"WHERE category_id IN ({marks})", ids).rowcount
+        c.execute(f"DELETE FROM category_mappings WHERE category_id IN ({marks})", ids)
         c.execute("DELETE FROM categories WHERE parent_id=?", (cid,))
         c.execute("DELETE FROM categories WHERE id=?", (cid,))
     if n:
@@ -729,10 +773,6 @@ class TxIn(BaseModel):
     need_confirm: bool = False
     refund_for: Optional[int] = None
 
-# 人情往来取数口径：唯一实现在 db.py（stats_renqing 与人情明细过滤共用），此处别名保持引用不变
-RENQING_NAME_SQL = dbm.RENQING_NAME_SQL
-RENQING_CAT_SQL = dbm.RENQING_CAT_SQL
-
 @app.get("/api/transactions")
 def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str = "", type: str = "",
                       category: int = 0, need_confirm: bool = False, q: str = "",
@@ -757,7 +797,7 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
            "WHERE t.ledger_id=?"]
     args: list = [ledger]
     if q.strip():
-        # （交易对方下线）；归属按显示口径匹配（组名优先，_ATTR_RESOLVE 已 JOIN）；
+        # 关键词命中 name/note/订单号/交易对方；归属按显示口径匹配（组名优先，_ATTR_RESOLVE 已 JOIN）；
         # 金额单独走精确匹配——LIKE 无法表达小数点，输入可解析为数字时按「分」比对。
         # 退款对只看主行（t），原交易由 ro_* 提供
         kw = f"%{q.strip()}%"
@@ -792,7 +832,7 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
             sql.append("AND t.type=?")
             args.append(type)
     if category:
-        # （退款行 type=transfer 且 category_id 常不落本分类，不连带取会丢失退款双卡片）
+        # 连带取「退款行指向本分类消费」的对（退款行 type=transfer 且 category_id 常不落本分类，不连带取会丢失退款双卡片）
         cat_sql = "SELECT id FROM categories WHERE ledger_id=? AND (id=? OR parent_id=?)"
         sql.append(f"AND (t.category_id IN ({cat_sql}) "
                    f"OR t.refund_for IN (SELECT id FROM transactions WHERE ledger_id=? AND category_id IN ({cat_sql})))")
@@ -801,15 +841,15 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
         sql.append("AND t.need_confirm=1")
     if renqing_name:
         # 人情明细：分类=人情往来 + 名称精确匹配（与 /api/stats/renqing 的分组键同一表达式）
-        sql.append(f"AND {RENQING_CAT_SQL}")
-        sql.append(f"AND {RENQING_NAME_SQL} = ?")
+        sql.append(f"AND {dbm.RENQING_CAT_SQL}")
+        sql.append(f"AND {dbm.RENQING_NAME_SQL} = ?")
         args += [ledger, renqing_name]
     if attribution:
         # 归属下钻（统计页蝴蝶图条形）：与 /api/stats/attribution 同口径。
         # 分组行传组名（_ATTR_EXPR 双路径：名单映射/直名建组）；未分组行传
         # 「归属名·平台」统计键，剥后缀反解回 source 一并过滤
         base, _, plat = attribution.rpartition("·")
-        src = {"支付宝": "alipay", "微信": "wechat", "京东": "jd", "美团": "meituan"}.get(plat)
+        src = {cn: s for s, cn in dbm.PLATFORM_CN.items()}.get(plat)
         if not src:
             base = attribution
         sql.append(f"AND {_ATTR_EXPR}=?")
@@ -841,10 +881,17 @@ def list_transactions(ledger: int, _from: str = Query("", alias="from"), to: str
         items.append(d)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
+def _tx_date(raw: str, old: str = "") -> str:
+    """TxIn 日期 → 入库口径（db.norm_date）；认不出/日历非法给 400 而非 500。"""
+    try:
+        return dbm.norm_date(raw, old=old)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 def _insert_tx(c, ledger: int, t: TxIn):
     return dbm.insert_tx(
         c, ledger, type=t.type, amount=t.amount, category_id=t.category_id,
-        account_id=t.account_id, to_account_id=t.to_account_id, date=t.date,
+        account_id=t.account_id, to_account_id=t.to_account_id, date=_tx_date(t.date),
         name=t.name, merchant=t.merchant, note=t.note, tags=t.tags,
         receipt_path=t.receipt_path or None, source=t.source, ai_meta=t.ai_meta,
         order_no=t.order_no, need_confirm=t.need_confirm,
@@ -885,7 +932,7 @@ def update_transaction(tid: int, body: TxIn):
                manual_cat=CASE WHEN ? IS NOT ? THEN 1 ELSE manual_cat END
                WHERE id=?""",
             (body.type, body.amount, body.category_id, body.account_id, body.to_account_id,
-             dbm.norm_date(body.date, old=old["date"]), body.name, body.merchant, body.order_no,
+             _tx_date(body.date, old=old["date"]), body.name, body.merchant, body.order_no,
              body.note, dbm._j(body.tags), body.receipt_path, body.receipt_path,
              1 if body.need_confirm else 0,
              body.category_id, old["category_id"], tid))
@@ -916,15 +963,14 @@ def _link_refund(c, tid: int, refund_for: int, amount: int, *, confidence: str |
     if not row:
         raise HTTPException(404, "流水不存在")
     if refund_for == 0:
-        c.execute("UPDATE transactions SET refund_for=NULL, refund_status='none', refund_confidence=NULL "
-                  "WHERE id=?", (tid,))
+        c.execute(f"UPDATE transactions SET {dbm.UNLINK_REFUND_SET} WHERE id=?", (tid,))
         return
     o = c.execute("SELECT ledger_id, type, amount, date FROM transactions WHERE id=?", (refund_for,)).fetchone()
     if not o or o["ledger_id"] != row["ledger_id"] or o["type"] != "expense":
         raise HTTPException(400, "退款只能关联本账本的支出流水")
     if refund_for != row["refund_for"]:
         _reject_late_origin(o["date"], row["date"])
-    status = "full" if o["amount"] == amount else "partial"
+    status = dbm.refund_status(o["amount"], amount)
     c.execute("UPDATE transactions SET refund_for=?, refund_status=?, refund_confidence=?, type='transfer' "
               "WHERE id=?", (refund_for, status, confidence, tid))
 
@@ -1036,7 +1082,8 @@ def resolve_pending(tid: int, body: ResolveIn):
     with c:
         if body.category_id is not None:
             # 待确认里选分类=用户手选 → 打 manual_cat 标，数据修复不再翻动
-            c.execute("UPDATE transactions SET category_id=?, need_confirm=0, manual_cat=1 WHERE id=?",
+            #（need_confirm 由下方无条件 UPDATE 统一清零）
+            c.execute("UPDATE transactions SET category_id=?, manual_cat=1 WHERE id=?",
                       (body.category_id, tid))
         if body.account_id is not None:
             c.execute("UPDATE transactions SET account_id=? WHERE id=?", (body.account_id, tid))
@@ -1078,31 +1125,34 @@ def stats_yearly(ledger: int):
     _ledger_access(ledger)
     return dbm.stats_yearly(conn(), ledger)
 
+def _span(_from: str, to: str) -> tuple[str, str]:
+    """统计区间（from 含端、to 排他上界）：任一端传空即不限该端，与导出/流水列表口径一致。"""
+    return _from or "0000-01-01", to or "9999-12-31"
+
 @app.get("/api/stats/trend")
-def stats_trend_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
+def stats_trend_range(ledger: int, _from: str = Query("", alias="from"), to: str = ""):
     """任意区间的按月趋势。"""
     _ledger_access(ledger)
-    return dbm.stats_trend(conn(), ledger, _from, to)
+    return dbm.stats_trend(conn(), ledger, *_span(_from, to))
 
 @app.get("/api/stats/range")
-def stats_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
+def stats_range(ledger: int, _from: str = Query("", alias="from"), to: str = ""):
     _ledger_access(ledger)
-    return dbm.stats_summary_range(conn(), ledger, _from, to)
+    return dbm.stats_summary_range(conn(), ledger, *_span(_from, to))
 
 @app.get("/api/stats/category-range")
-def stats_category_range(ledger: int, _from: str = Query(..., alias="from"), to: str = ...,
+def stats_category_range(ledger: int, _from: str = Query("", alias="from"), to: str = "",
                          type: str = "expense"):
     _ledger_access(ledger)
-    return dbm.stats_category_range(conn(), ledger, _from, to, type)
+    return dbm.stats_category_range(conn(), ledger, *_span(_from, to), type)
 
 def _attribution_rows(ledger: int, _from: str, to: str) -> list[dict]:
     """归属汇总：db.attribution_rows 唯一实现（统计页 /api/stats/attribution、导出 xlsx
-    「归属统计」sheet、AI 对话查账 kind=attribution 共用）。
-    _from/to 传空串表示不限制该端（宽区间等价实现）。"""
-    return dbm.attribution_rows(conn(), ledger, _from or "0000-01-01", to or "9999-12-31")
+    「归属统计」sheet、AI 对话查账 kind=attribution 共用）。"""
+    return dbm.attribution_rows(conn(), ledger, *_span(_from, to))
 
 @app.get("/api/stats/attribution")
-def stats_attribution(ledger: int, _from: str = Query(..., alias="from"), to: str = ...):
+def stats_attribution(ledger: int, _from: str = Query("", alias="from"), to: str = ""):
     _ledger_access(ledger)
     return _attribution_rows(ledger, _from, to)
 
@@ -1115,17 +1165,25 @@ def stats_renqing(ledger: int):
 
 # ---------- 导入 / 导出 ----------
 
-MAX_UPLOAD = 20 * 1024 * 1024
+MAX_UPLOAD = 20 * 1024 * 1024   # 导入/小票上传统一上限；读取用 file.read(MAX_UPLOAD + 1)，超限判定不必整文件进内存
+_PREVIEW_LOCK = threading.Lock()   # 导入预览串行（见 import_parse）
 ALLOWED_EXT = (".csv", ".xlsx")
 
+async def _read_upload(file: UploadFile) -> bytes:
+    """有界读取上传体（三个上传口共用）：多读 1 字节判超限即 400，不必整文件进内存。
+    报错文案从 MAX_UPLOAD 派生——改上限只动常量一处。"""
+    data = await file.read(MAX_UPLOAD + 1)
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(400, f"文件超过 {MAX_UPLOAD // 1048576}MB 上限")
+    return data
+
 def _upload_guard(filename: str | None, data: bytes) -> None:
-    """导入上传安全闸（防恶意文件）：扩展名白名单 + 大小上限 + xlsx 魔数校验。
+    """导入上传安全闸（防恶意文件）：扩展名白名单 + xlsx 魔数校验
+    （大小上限由 _read_upload 的有界读取把关）。
     行数熔断由 import_bill._capped（解析期）与本函数调用后的 len 校验（权威上限）接力。"""
     fn = (filename or "").lower()
     if not fn.endswith(ALLOWED_EXT):
         raise HTTPException(400, "仅支持 .csv / .xlsx 文件")
-    if len(data) > MAX_UPLOAD:
-        raise HTTPException(400, "文件超过 20MB 上限")
     if fn.endswith(".xlsx") and data[:2] != b"PK":
         raise HTTPException(400, "文件内容不是有效 xlsx")
 
@@ -1133,26 +1191,36 @@ def _upload_guard(filename: str | None, data: bytes) -> None:
 async def import_parse(ledger: int, file: UploadFile = File(...), use_ai: bool = True,
                        template: str = Form("")):
     _ledger_access(ledger)
-    data = await file.read()
+    data = await _read_upload(file)
     _upload_guard(file.filename, data)
-    try:
+    def _parse():
         if template:
             # 向导"试解析"：未保存的临时模板直接解析（保存后走 parse_bill 自动分流）
             tpl = json.loads(template)
             if not (isinstance(tpl, dict) and tpl.get("headers") and tpl.get("col")):
                 raise ValueError("模板格式不完整")
-            text = ib.text_from_upload(data, file.filename)
-            flows = ib.parse_generic(text, tpl)
-        else:
-            flows = ib.parse_bill(data, file.filename)
+            return ib.parse_generic(ib.text_from_upload(data, file.filename), tpl)
+        return ib.parse_bill(data, file.filename)
+
+    # 解码（xlsx 解 zip+XML）与逐行引擎是 CPU 密集（20MB/5 万行级），挪线程池防卡事件循环
+    try:
+        flows = await asyncio.to_thread(_parse)
     except Exception as e:
         raise HTTPException(400, f"解析失败: {e}")
     if len(flows) > ib.MAX_PARSE_ROWS:
-        raise HTTPException(400, "行数超过上限 5 万行")
-    previews = ib.build_previews(conn(), ledger, flows)
+        raise HTTPException(400, f"行数超过上限 {ib.MAX_PARSE_ROWS // 10000} 万行")
+    # build_previews 逐行查/写库，同样挪线程；conn() 必须在 worker 内取（线程本地连接
+    # 禁止跨线程传）。持 _PREVIEW_LOCK 串行：预览期 _ensure_account 是 check-then-insert，
+    # 并发导入同一账本会建出同名账户
+    def _previews():
+        with _PREVIEW_LOCK:
+            return ib.build_previews(conn(), ledger, flows)
+    previews = await asyncio.to_thread(_previews)
     if use_ai:
-        ai.resolve_subcategories_batch(previews, ledger)
-        ai.resolve_names_batch(previews)
+        # 同步 LLM 兜底挪线程池（async 里直接调卡死事件循环）；保序串行不 gather——
+        # 分类兜底读 name 与名称兜底写 name 并行会交错，且各自内部已 6 路并发
+        await asyncio.to_thread(ai.resolve_subcategories_batch, previews, ledger)
+        await asyncio.to_thread(ai.resolve_names_batch, previews)
     n_dup = sum(1 for p in previews if p.get("duplicate"))
     n_xdup = sum(1 for p in previews if p.get("pay_dupe"))
     n_new = sum(1 for p in previews if ib._is_new_row(p))
@@ -1195,10 +1263,9 @@ def undo_import(batch_id: int):
     _bump_rev()
     return {"deleted": n}
 
-# ---------- 数据修复（原导入自愈的确认版） ----------
-# 旧版 /api/import/parse 在预览阶段静默执行 _purge_bad_learned_mappings +
-# auto_fix_transactions 直接改写已有数据——用户手动整理的分类会在下一次预览
-# （哪怕最终取消导入）被翻回词典结果。现改为只读预览 + 显式应用（1.0.1）。
+# ---------- 数据修复（原导入自愈的确认版，1.0.1） ----------
+# 旧版在预览阶段静默改写已有数据（用户手动整理的分类会在下一次预览被翻回词典结果），
+# 现改为只读预览 + 显式应用。
 
 @app.get("/api/repair/preview")
 def repair_preview(ledger: int):
@@ -1217,12 +1284,19 @@ def repair_apply(ledger: int):
 @app.post("/api/import/sniff")
 async def import_sniff(file: UploadFile = File(...)):
     """向导嗅探：表头定位 + 样例 + 列映射猜测（"无法识别"的文件从这里进入模板向导）。"""
-    data = await file.read()
+    data = await _read_upload(file)
     _upload_guard(file.filename, data)
-    text = ib.text_from_upload(data, file.filename)
-    return ib.sniff_template(text)
+    # 同步 CPU 解析（xlsx 解 zip+XML，20MB 内百 ms 级）挪线程池，防卡事件循环；
+    # 坏文件统一 400（与 import_parse 口径一致，而非 500）
+    try:
+        text = await asyncio.to_thread(ib.text_from_upload, data, file.filename)
+    except Exception as e:
+        raise HTTPException(400, f"解析失败: {e}")
+    return await asyncio.to_thread(ib.sniff_template, text)
 
-_TPL_FIELDS = ("date", "type", "name", "flow", "pay", "amount", "order", "merchant", "note")
+# 保存白名单从引擎常量派生（引擎新增 col 键即自动放行，不再两处手抄）；
+# 引擎顶层 schema（_TPL_ALLOWED_KEYS）仍由 import_bill 单独维护
+_TPL_FIELDS = tuple(sorted(set(ib._STANDARD_COL_KEYS) | {"origin_source", "export_id", "export_ref"}))
 
 @app.get("/api/import/templates")
 def list_import_templates():
@@ -1232,13 +1306,12 @@ def list_import_templates():
 def save_import_template(body: dict):
     """新建/更新模板（按 name 覆盖）。最小校验 + 字段白名单（import_bill.user_templates 消费）。
     白名单覆盖引擎全 schema：复制内置模板改列名/状态词存为自定义即接管路由（覆盖机制）。"""
+    _admin_or_403()   # 写应用级配置（chaimi.conf），与 put_config 同门
     name = str(body.get("name") or "").strip()
     headers, col = body.get("headers"), body.get("col") or {}
     if not name or not isinstance(headers, list) or not headers or not col:
         raise HTTPException(400, "模板需要名称、表头列与列映射")
-    col = {k: v for k, v in col.items()
-           if k in set(_TPL_FIELDS) | {"to_account_name", "origin_source", "export_id", "export_ref"}
-           and v}
+    col = {k: v for k, v in col.items() if k in _TPL_FIELDS and v}
     if "date" not in col or "amount" not in col:
         raise HTTPException(400, "交易时间与金额两列必须映射")
     rules = body.get("refund_rules")
@@ -1313,6 +1386,7 @@ def save_import_template(body: dict):
 
 @app.delete("/api/import/templates/{name}")
 def delete_import_template(name: str):
+    _admin_or_403()   # 写应用级配置（chaimi.conf），与 save_import_template 同门
     cfg = config.load()
     cfg["import_templates"] = [t for t in (cfg.get("import_templates") or []) if t.get("name") != name]
     config.save(cfg)
@@ -1334,7 +1408,7 @@ def _neut(v) -> str:
     return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
 def _export_table(rows, ledger_id: int) -> list:
-    """导出表（CSV/xlsx 共用）：14 列全量格式，流水卡片上的数据全列出。
+    """导出表（CSV/xlsx 共用）：15 列全量格式，流水卡片上的数据全列出。
     金额保留分→元的换算由调用方格式化；交易名称=name（回落备注/分类，与卡片标题同口径）；
     流水归属=解析后名字（有组显组名）；转账两端账户分「支付账户/收款账户」两列；
     流水ID/退款关联——导出回环：导入时按 ID 直连退款对，无需重新匹配。
@@ -1342,9 +1416,10 @@ def _export_table(rows, ledger_id: int) -> list:
     type_map = {"expense": "支出", "income": "收入", "transfer": "不计收支"}
     cur_row = conn().execute("SELECT currency FROM ledgers WHERE id=?", (ledger_id,)).fetchone()
     cur_code = (cur_row["currency"] if cur_row else None) or "CNY"
-    return [["交易时间", "交易名称", "交易金额", "币种", "流水类型", "支出类型/收入类型",
-             "支付账户", "收款账户", "小票", "流水归属", "备注", "订单号", "来源",
-             "流水ID", "退款关联"]] + [
+    C = pt.EXPORT_COLUMNS   # 列名与 export 模板单源（platform_templates），改列名只动一处
+    return [[C["date"], C["name"], C["amount"], "币种", C["flow"], C["type"],
+             C["pay"], C["to_account"], "小票", C["attribution"], C["note"], C["order"],
+             C["origin_source"], C["export_id"], C["export_ref"]]] + [
         [r["date"], _neut(r["name"] or r["note"] or r["category"] or ""), r["amount"] / 100, cur_code,
          type_map[r["type"]], _neut(r["category"] or ""), _neut(r["account"] or ""), _neut(r["to_account"] or ""),
          "", _neut(r["attr_display"] or ""), _neut(r["note"] or ""), _neut(r["order_no"] or ""), _neut(r["source"] or ""),
@@ -1595,7 +1670,9 @@ def get_config():
     _mask(cfg.get("web_auth") or {}, "password")
     return cfg
 
-_LLM_KEYS = ("base_url", "model", "vl_model", "api_key", "vl_base_url", "vl_api_key")
+# LLM 配置键白名单从 DEFAULTS 派生（config.py 是 schema 唯一来源）：漏加键的失败形态是
+# 设置页"看似保存成功、值被静默丢弃"，最难排查——派生后加配置项只改 config.DEFAULTS 一处
+_LLM_KEYS = tuple(config.DEFAULTS["llm"].keys())
 
 def _cfg_int(b: dict, old: dict, key: str, lo: int, hi: int) -> int:
     """配置数字字段钳制（备份计划用）：越界截断，非数字 400。"""
@@ -1647,7 +1724,7 @@ def ai_parse(ledger: int, body: AiParseIn):
 async def _save_receipt(file: UploadFile) -> tuple[Path, str]:
     """上传小票落盘（/api/ai/receipt 用）：魔数校验 + 裁剪压缩 + 时间戳随机名。
     process_receipt 原地覆写：裁掉桌面留白 + 缩至 1080px + JPEG 85（典型 3MB→200KB）。"""
-    data = await file.read()
+    data = await _read_upload(file)
     if not bot_core.is_image(data):
         raise HTTPException(400, "小票仅支持 JPG / PNG / WEBP 图片")
     d = config.receipts_dir()
@@ -1655,14 +1732,14 @@ async def _save_receipt(file: UploadFile) -> tuple[Path, str]:
     fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}.jpg"
     p = d / fname
     p.write_bytes(data)
-    bot_core.process_receipt(p)   # 裁剪+压缩（失败保留原图，不阻断）
+    await asyncio.to_thread(bot_core.process_receipt, p)   # PIL 压缩 CPU 密集，挪线程池（失败保留原图）
     return p, f"receipts/{fname}"
 
 @app.post("/api/ai/receipt")
 async def ai_receipt(ledger: int, file: UploadFile = File(...)):
     _ledger_access(ledger)
     path, rp = await _save_receipt(file)
-    result = ai.parse_receipt(str(path))
+    result = await asyncio.to_thread(ai.parse_receipt, str(path))   # 视觉 OCR 秒级网络调用，挪线程池
     if result.get("error"):
         path.unlink(missing_ok=True)   # 识别失败：前端只显错误不保留图片，删文件防孤儿
         return result
@@ -1790,9 +1867,13 @@ def bot_test(body: BotTestIn):
     if not entries:
         return {"reply": "尚无直连绑定：请先在上方选账本和用户生成二维码、扫码绑定后再测试"}
     e = entries[0]
-    return {"reply": bot_core.handle(body.text, "_panel", bypass_auth=True,
-                                     ledger_id=int(e.get("ledger") or 0),
-                                     attribution=str(e.get("label") or ""))}
+    try:
+        reply = bot_core.handle(body.text, "_panel", bypass_auth=True,
+                                ledger_id=int(e.get("ledger") or 0),
+                                attribution=str(e.get("label") or ""))
+    except Exception as ex:   # 链路内意外异常（如 LLM 返回脏 patch）给 400 可读信息，而非 500
+        raise HTTPException(400, f"机器人链路异常: {type(ex).__name__}: {ex}"[:200])
+    return {"reply": reply}
 
 @app.get("/api/rev/wait")
 def rev_wait(since: int = -1, lsince: int = -1, hold: int = 25):
@@ -1890,7 +1971,6 @@ def bot_ilink_qrimg():
     """二维码图片：qrcode_img_content 是「待编码的跳转 URL」
     （https://liteapp.weixin.qq.com/q/...?qrcode=...&bot_type=3）——
     服务端用 segno 把 URL 生成 PNG（同源回图，无混合内容/防盗链问题）。"""
-    import io
     img = _ilink.qr_img()
     if not img:
         raise HTTPException(404, "尚未发起扫码登录")

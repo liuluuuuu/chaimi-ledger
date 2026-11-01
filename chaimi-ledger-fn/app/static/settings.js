@@ -266,7 +266,9 @@ function accScopeInfo(){
   if(sc === "all") return {from: "", to: "", label: "全部", months: 0};
   const r = curStatRange();
   const label = sc === "month" ? r.label.replace(/^(\d{4})-(\d{2})$/, "$1年$2月") : r.label;   // 裸 YYYY-MM 润色
-  return {from: r.from, to: r.to, label, months: sc === "year" ? 12 : 1};
+  // /api/accounts 后端按 date < to 排他：月/年的 to 本就是下一周期首日（排他界）；
+  // 仅自定义区间的 to 是含当天的裸截止日——转次日作排他上界，否则截止日当天消费漏计
+  return {from: r.from, to: sc === "custom" ? nextDayStr(r.to) : r.to, label, months: sc === "year" ? 12 : 1};
 }
 
 function mkEditToggle(btnId, rerender){
@@ -292,7 +294,7 @@ async function stAccs(){
   // 避免与账户维度的 spend 合计因口径差异对不上；「全部」范围无该字段时回落账户合计
   const cur = await curLedger();
   const hasBudget = !!(cur && cur.budget);
-  if(cur && !bdgDirty) $("#bdg_amt").value = cur.budget ? (cur.budget / 100).toFixed(2) : "";   // 未编辑时跟随最新预算（含他端改动与清零），编辑中不覆盖
+  if(cur && !bdgDirty) $("#bdg_amt").value = cur.budget ? fmt(cur.budget) : "";   // 未编辑时跟随最新预算（含他端改动与清零），编辑中不覆盖
   const spend = as[0] && as[0].net_expense !== undefined ? as[0].net_expense : spendSum;
   if(hasBudget && r.months){
     const budget = cur.budget * r.months;
@@ -306,7 +308,7 @@ async function stAccs(){
 async function saveBudget(){
   // 预算是账本级共享设置：独立端点，共享成员也可改（名称/币种仍 owner-only）
   await apiSend(`/api/ledgers/${lid()}/budget`, "PUT",
-    {budget: Math.round(parseFloat($("#bdg_amt").value || "0") * 100)});
+    {budget: toCents($("#bdg_amt").value)});
   await getLedgers(true);   // 强刷缓存：不刷则 stAccs 仍读到旧预算,统计行不更新
   bdgDirty = false;   // 已保存成最新值：回到跟随模式（他端后续改动/切账本可回填）
   msg("预算已保存 ✅"); stAccs();

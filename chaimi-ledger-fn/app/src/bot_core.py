@@ -8,7 +8,6 @@ del_pending 两步删除确认——指令用词互不冲突，可与草稿态�
 from __future__ import annotations
 
 import datetime
-import json
 import re
 import threading
 from pathlib import Path
@@ -131,10 +130,7 @@ def _date_show(it: dict) -> str:
         return d[:10]
     meta = _rowget(it, "ai_meta")
     if isinstance(meta, str):
-        try:
-            meta = json.loads(meta) if meta else {}
-        except (json.JSONDecodeError, ValueError):
-            meta = {}
+        meta = dbm.jloads(meta, default={})   # 容错解析（坏 JSON/空串回 {}），与 db 层同实现
     if isinstance(meta, dict) and meta.get("time_source") == "none":
         return d[:10]
     return d[:16]
@@ -289,7 +285,8 @@ def _handle(text: str, user: str, image_path: str | None,
             return "已取消删除"
     if s.get("query") and _RE_PAGE.match(text):
         return _page(s, ledger, text)
-    #      直接问「餐饮明细」会被系统提示的「没提时间默认当月」带偏——本地路由与「更多」同思路不过模型）
+    # 3) 分类明细翻页（本地路由不过模型——直接问「餐饮明细」会被系统提示的
+    #    「没提时间默认当月」带偏，与「更多」同一思路）
     m = _RE_CAT_PAGE.match(text)
     if m and s.get("query"):
         return _cat_page(s, ledger, m.group(1).strip())
@@ -380,7 +377,9 @@ def _undo(ledger: int, attribution: str = "") -> str:
         cond, args = " AND COALESCE(json_extract(tags,'$.attribution'),'')=''", ()
     row = dbm.connect().execute(
         f"SELECT id, name, amount FROM transactions WHERE ledger_id=? AND source='bot' "
-        f"AND created>=datetime('now','localtime','-1 day'){cond} ORDER BY id DESC LIMIT 1",
+        # created 默认值 datetime('now') 存 UTC：比较须同为 UTC（'localtime' 在 UTC+8 下
+        # 阈值比 UTC 早 8h，有效窗口从 24h 缩到 16h）
+        f"AND created>=datetime('now','-1 day'){cond} ORDER BY id DESC LIMIT 1",
         (ledger, *args)).fetchone()
     if not row:
         return "最近 24 小时没有你经机器人记的流水。"
@@ -655,19 +654,29 @@ def _apply_patch(ledger: int, tid: int, patch: dict) -> str:
         aid = ai._resolve_account(ledger, str(patch["account"]))
         if aid:
             fields["account_id"] = aid
+    bad_date = None
     if patch.get("date"):
-        fields["date"] = str(patch["date"])[:16]
+        # iso_date_ok 只归一格式（10 位保持 10 位，补原时刻留给 patch_tx(old=)）；
+        # 认不出跳过该字段其余照改——透传会让 ValueError 穿透 handle()
+        d = dbm.iso_date_ok(str(patch["date"])[:16])
+        if d:
+            fields["date"] = d
+        else:
+            bad_date = str(patch["date"])[:16]
     for k in ("name", "note", "merchant"):
         if patch.get(k) is not None:
             fields[k] = str(patch[k])[:60]
     if not fields:
+        if bad_date:
+            return f"日期「{bad_date}」没听懂，请说完整日期（如「改成11月1号」）。"
         return "没有识别到要修改的字段，请说得更明确些（如「第2笔改成86.5」）。"
     c = dbm.connect()
     with c:
         dbm.patch_tx(c, tid, fields)
     new = _tx_row(tid, ledger)
     _bump()
-    return "✏️ 已改：" + _fmt_item(0, row) + "\n     → " + _fmt_item(0, new)
+    tip = f"\n⚠️ 日期「{bad_date}」没听懂未修改，请说完整日期（如 11月1号）。" if bad_date else ""
+    return "✏️ 已改：" + _fmt_item(0, row) + "\n     → " + _fmt_item(0, new) + tip
 
 # ---------- 月报 ----------
 

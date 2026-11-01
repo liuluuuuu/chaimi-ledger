@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
+import time
 from pathlib import Path
 
 DEFAULTS: dict = {
@@ -103,9 +106,13 @@ def backup_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "backups"
 
 
-def load() -> dict:
+# load() 结果按文件签名缓存：鉴权中间件每请求、批处理 worker 每批都会 load()，免重复读盘
+# 解析。签名含 inode——save() 的 os.replace 必然换签名，外部手改也会变 mtime/size
+_cache: dict[str, tuple] = {}
+
+
+def _read(p: Path) -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
-    p = conf_path()
     if p.exists():
         try:
             saved = json.loads(p.read_text(encoding="utf-8"))
@@ -114,12 +121,46 @@ def load() -> dict:
                     cfg[k].update(v)
                 else:
                     cfg[k] = v
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            # 结果按文件签名缓存，每个坏版本只告警一次；此时在设置页保存会用默认值覆盖原配置
+            logging.getLogger("chaimi.config").warning(f"配置文件读取失败，按默认值运行：{e}")
     return cfg
 
 
-def save(cfg: dict) -> None:
+def load() -> dict:
+    p = conf_path()
+    try:
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        sig = None
+    hit = _cache.get(str(p))
+    if hit is None or hit[0] != sig:
+        hit = _cache[str(p)] = (sig, _read(p))
+    return json.loads(json.dumps(hit[1]))   # 调用方会就地改写再 save()，必须给副本
+
+
+_save_lock = threading.Lock()
+
+
+def write_raw(data: bytes) -> None:
+    """原子写配置文件（save / 备份恢复共用）：tmp + os.replace，并发 load() 不会读到半截
+    JSON 而静默回退 DEFAULTS。Windows 上目标正被读句柄占用时 os.replace 抛 PermissionError
+    （读句柄无 FILE_SHARE_DELETE），短重试；仍失败则直写兜底（非原子，但不丢这次保存）。"""
     p = conf_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _save_lock:
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        for i in range(10):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                time.sleep(0.02 * (i + 1))
+        tmp.unlink(missing_ok=True)
+        p.write_bytes(data)
+
+
+def save(cfg: dict) -> None:
+    write_raw(json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"))

@@ -5,7 +5,7 @@ function dupHintText(dh){
   if(!dh || !dh.kind) return "";
   if(dh.kind === "batch") return `与本批第 ${dh.no} 笔重复`;
   const o = dh.of || {};
-  return `同日同额已有：${o.name || "（未命名）"} ¥${((o.amount || 0) / 100).toFixed(2)}${o.source ? `（来源 ${o.source}）` : ""}`;
+  return `同日同额已有：${o.name || "（未命名）"} ¥${fmt(o.amount || 0)}${o.source ? `（来源 ${o.source}）` : ""}`;
 }
 function aiItems(list, noteText){   // AI 结果 → 弹窗条目：分类名/账户名映射为 id，摘要挂第一笔备注
   return list.map((it, i)=>{
@@ -85,6 +85,10 @@ async function aiToday(){
 }
 async function aiReceipt(){
   const f = $("#rcp_file").files[0]; if(!f) return;
+  if(f.size > MAX_UPLOAD_B){   // 客户端预检（后端同上限）：免上传 20MB 后才被 413 拒
+    $("#rcp_file").value = "";
+    return msg(`图片超过 ${MAX_UPLOAD_B/1048576}MB 上限`, false);
+  }
   $("#rcp_file").value = "";
   if(!await aiConfigured()) return msg("未配置 AI：请先在设置页填写 LLM API Key", false);
   aiChatOn();
@@ -96,7 +100,7 @@ async function aiReceipt(){
     const r = await api(`/api/ai/receipt?ledger=${lid()}`, {method:"POST", body:fd});
     aiWaitStop(waiting); waiting.remove();
     if(r.error){ addBubble("ai", `[${r.error}]`); return; }
-    const items = aiItems([{type:r.type, amount:Math.round((r.amount||0)*100), category_name:r.category_name,
+    const items = aiItems([{type:r.type, amount:Math.round((r.amount||0)*100), category_name:r.category_name,   // 元→分（receipt 返回元）
       date:r.date, name:r.name||""}], r.note || "");
     aiBookingCard(items, {title:"小票识别结果，请确认", receipt:r.receipt_path});
   }catch(e){ aiWaitStop(waiting); waiting.remove(); addBubble("ai", `[${e.message}]`); }
@@ -192,7 +196,7 @@ function txRow(t, mode){
   else if(pv && t.skip && t._pvSkip) tags.push(`<button class="tag dup-hint" onclick="impSkipRow(${t._pvIdx})">已跳过 · 点此恢复</button>`);
   else if(pv && t.dup_hint) tags.push(`<button class="tag dup-hint" title="${esc(dupHintText(t.dup_hint))}" onclick="impSkipRow(${t._pvIdx})">疑似重复 点击跳过</button>`);
   tags.push(...confTags(t));
-  const srcTag = t.source && t.source!=="manual" ? `<span class="tag plain tx-src">${t.source}</span>` : "";
+  const srcTag = t.source && t.source!=="manual" ? `<span class="tag plain tx-src">${t.source}</span>` : "";   // manual=历史/测试口径，不显示来源标签
   const rcpTag = t.receipt_path ? `<span class="tag plain tx-src" title="查看小票" onclick="event.stopPropagation();viewReceipt('${qEsc(t.receipt_path)}')">🧾</span>` : "";
   // 源栈：jd 在上、小票在下；只有其中一个时单独显示
   const srcStack = (srcTag || rcpTag) ? `<div class="tx-src-stack">${srcTag}${rcpTag}</div>` : "";
@@ -200,15 +204,16 @@ function txRow(t, mode){
   let catHtml;
   if(pv){
     catHtml = t.type === "transfer"
-      ? `<span class="tag plain">转账 · ${esc(t.category_name || "账户转账")}</span>`
+      ? `<span class="tag plain">转账 · ${esc(t.category_name || "账户转账")}</span>`   // 兜底子类与后端 db.DEFAULT_TRANSFER_SUB 同值
       : `<select data-pv-idx="${t._pvIdx}" onchange="impSetCat(this)">${pvCatOptions(t.parent_category)}<option value="__new__">＋新建分类…</option></select>`;
   } else {
-    catHtml = t.category_name || TYPE_CN[t.type] || "";
+    catHtml = esc(t.category_name || TYPE_CN[t.type] || "");   // 流水态：原始分类名裸拼进 innerHTML 会注入，必须转义
   }
   function makeRow(td, opts){
     const cc2 = td.type==="expense"?"var(--expense)":td.type==="income"?"var(--income)":"var(--transfer)";
     const sign2 = td.type==="expense"?"−":td.type==="income"?"+":"";
-    /* 流水行字段全部来自账单/AI 文本，一律 esc() 转义防注入（catHtml 为预构建 HTML 除外） */
+    /* 流水行字段全部来自账单/AI 文本，一律 esc() 转义防注入（catHtml 仅供确需传预构建安全 HTML
+       的调用方：预览态 select/转账标签/本函数转义后的分类名——其余字段无此通道） */
     const head2 = esc((td.name || td.note || "（未命名）").slice(0,40));
     const l22 = [
       (td.date||"").slice(0,16),
@@ -231,8 +236,8 @@ function txRow(t, mode){
   if(pv || !t.refund_origin){
     // 分类依据悬浮：预览行上直接看出这行分到当前分类的来源（词典/映射/同名/AI/兜底/手动）
     const viaTip = pv && t.classified_via
-      ? ` title="分类依据：${({keyword:"关键词词典", mapping:"学习映射", "direct-name":"同名直连",
-          ai:"AI 兜底", transfer:"转账子类", manual:"手动指定", raw:"兜底（待确认）"})[t.classified_via] || t.classified_via}"`
+      ? ` title="分类依据：${esc(({keyword:"关键词词典", mapping:"学习映射", "direct-name":"同名直连",
+          ai:"AI 兜底", transfer:"转账子类", manual:"手动指定", raw:"兜底（待确认）"})[t.classified_via] || t.classified_via)}"`
       : "";
     const cardAttr = pv
       ? ` data-pv-idx="${t._pvIdx}"${(t.duplicate || t.skip) ? ' style="opacity:.45"' : ''} data-cat="${esc(catSlug)}"${viaTip}`
@@ -256,7 +261,7 @@ function txRow(t, mode){
   const refundRow = makeRow(t, {tags: refundTags, clickAttr: ""});
   const originRow = makeRow(ro, {tags: roTags, clickAttr: ` onclick="event.stopPropagation();openEdit(${ro.id})"`});
   // 两者包进同一 .tx-side wrapper 内部横向排列，整体贴右
-  const sideSrc = t.source && t.source!=="manual"
+  const sideSrc = t.source && t.source!=="manual"   // 同 srcTag：manual 不显示
     ? `<span class="tag plain">${t.source}</span>` : "";
   const sideCells = `<div class="tx-side"><div class="tx-side-net num" style="color:${netColor}" title="${netTitle}">${netSign}${curSym()}${netVal}</div>${sideSrc}</div>`;
   return `<div class="tx-card tx-card-double" onclick="openEdit(${t.id})" data-cat="${esc(catSlug)}"${t.id ? ` data-txid="${t.id}"` : ""}>${refundRow}${originRow}${sideCells}</div>`;

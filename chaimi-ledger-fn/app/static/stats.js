@@ -1,4 +1,5 @@
 /* ===== 统计 & 日历 ===== */
+const fmtYuan = v => (+v||0).toLocaleString("zh-CN",{minimumFractionDigits:2, maximumFractionDigits:2});   // 元+千分位（图例/tooltip 共用）
 let statRange = null;      // 当前统计区间 {from,to,label}，供下钻用
 let curScopeVal = "month";   // 当前范围
 function appScope(){ return curScopeVal; }
@@ -108,8 +109,8 @@ function ddPick(el, v){   // appScope 直接走 setScope；其余（年份）写
 }
 function scopeDD(){
   ddOpen($("#appScope"), [
-    {v:"month", t:"月"}, {v:"year", t:"年"}, {v:"all", t:"全部"},
-    {v:"custom", t:"自定义", hidden: !_scopeHasCustom},
+    ...["month", "year", "all"].map(v => ({v, t: SC_LABEL[v]})),   // 文案与 setScope 回显共用 SC_LABEL
+    {v:"custom", t:SC_LABEL.custom, hidden: !_scopeHasCustom},
   ], curScopeVal);
 }
 function yearDD(){ ddOpen($("#yearSel"), _yearOpts); }
@@ -170,6 +171,11 @@ const nextMonthFirst = ym => { const y=+ym.slice(0,4), m=+ym.slice(5,7); return 
 /* 统计请求的 to 参数（汇总条/统计页/归属三处共用）：仅自定义区间的 to 是含当天的结束日
    （补 23:59:59，后端按 date< 排他）；月/年/全部的 to 已是下一周期排他界，原样传递 */
 const rangeDto = r => appScope() === "custom" ? r.to + " 23:59:59" : r.to;
+/* 区间「to 是否排他上界」判定（汇总条/蝴蝶图/分类日历下钻共用）：仅自定义区间的 to 是含当天的
+   裸截止日 → 不排他（裸日期交服务端膨胀 23:59:59 才不漏截止日）；月/年/全部与 AI 附件 range
+   的 to 本就是下一周期首日/给定排他界 → to_exclusive=1。settings 的账户口径走 nextDayStr
+   （/api/accounts 无 to_exclusive 参数，等效含当天） */
+const rangeExcl = r => !!(r && (r.toExclusive || appScope() !== "custom"));
 function _heatClass(r){ return r>0.66?"h4":r>0.4?"h3":r>0.18?"h2":r>0.02?"h1":""; }
 
 const _sbRanges = {};   // page → {from,to,label,toExclusive}，点击时取回渲染时的区间
@@ -209,13 +215,16 @@ function gbarFit(){
 const _gbarEl = document.getElementById("gbar");
 if(window.ResizeObserver && _gbarEl) new ResizeObserver(gbarFit).observe(_gbarEl);
 
+let _sumbarSeq = 0;   // 请求代数：快速切范围/账本时丢弃迟到旧响应（renderSumbar 只挡页面错位，挡不住旧区间数据）
 async function loadSumbarList(){
   if(!document.getElementById("gsum")) return;
+  const seq = ++_sumbarSeq;
   try{
     const range = curStatRange();
     const s = appScope() === "month"
       ? await api(`/api/stats/summary?ledger=${lid()}&month=${dtGet($("#monthSel")) || thisMonth()}`)
       : await api(`/api/stats/range?ledger=${lid()}&from=${range.from}&to=${encodeURIComponent(rangeDto(range))}`);
+    if(seq !== _sumbarSeq) return;
     renderSumbar("list", s, range);
   }catch(_){}
 }
@@ -231,14 +240,16 @@ async function loadSumbarAi(){
 /* 汇总条各格下钻：与原统计卡 statCardDetail 同口径（支出下钻支出明细，退款行一并展示） */
 function sumbarDetail(page, kind){
   const r = _sbRanges[page] || curStatRange();
-  const excl = r.toExclusive || appScope() !== "custom";
+  const excl = rangeExcl(r);
   const name = {income:"收入", net:"支出", balance:"收支"}[kind] || "收支";
   const type = kind==="income" ? "income" : kind==="balance" ? "" : "expense";
   showTxDetail(`${sbLabel(r)} ${name}明细`,
     {from:r.from, to:r.to, toExclusive:excl, ...(type?{type}:{}),
      ...(kind==="net" ? {with_refunds:true} : {})});   // 支出=净额(毛−退款)，明细带退款行对账
 }
+let _statsSeq = 0;   // 请求代数：快速切范围/账本时丢弃迟到旧响应，防旧数据重渲日历/蝴蝶图/饼图
 async function refreshStats(){
+  const seq = ++_statsSeq;
   const sc = appScope();
   const m = dtGet($("#monthSel")) || thisMonth();
   statRange = curStatRange();
@@ -263,6 +274,7 @@ async function refreshStats(){
           : api(`/api/stats/yearly?ledger=${lid()}`)]);
     trendIsYearly = sc === "all";
   }
+  if(seq !== _statsSeq) return;   // 期间又发起了新 refreshStats：本响应已过期，丢弃
   // 图例与切片统一按金额(净额)从高到低排列
   cats.sort((a,b)=>b.net-a.net);
   catsInc.sort((a,b)=>b.net-a.net);
@@ -272,6 +284,7 @@ async function refreshStats(){
     $("#calTitle").textContent = m.replace("-","年")+"月";
     // 日历
     const cal = await api(`/api/stats/calendar?ledger=${lid()}&month=${m}`);
+    if(seq !== _statsSeq) return;
     const [y,mo] = m.split("-").map(Number);
     const first = new Date(y,mo-1,1), days = new Date(y,mo,0).getDate();
     const byDay = {}; cal.forEach(c=>byDay[+c.day.slice(8)]=c);
@@ -328,13 +341,16 @@ async function refreshStats(){
   try{
     attrs = await api(`/api/stats/attribution?ledger=${lid()}&from=${statRange.from}&to=${encodeURIComponent(rangeDto(statRange))}`);
   }catch(_){}
+  if(seq !== _statsSeq) return;   // 归属请求也可能迟到：过期即不渲蝴蝶图/图例
   $("#attrCard").style.display = attrs.length ? "" : "none";
   if(attrs.length){
     // 蝴蝶图：中心人名，左=支出右=收入；金额在条外（支出左侧/收入右侧）；条色走 CSS 语义色（views.css --expense/--income）
     const maxAmt = Math.max(...attrs.map(a => Math.max(a.expense || 0, a.income || 0)), 1);
     const barW = v => Math.max(2, (v / maxAmt) * 100);
     const amtLabel = v => v > 0 ? `<span class="sub" style="font-size:10px;flex-shrink:0;margin:0 6px">${fmt(v)}</span>` : "<span style='width:8px'></span>";
-    const barClick = (a, dir, type) => `showTxDetail('${qEsc(a.person)} ${dir}明细',{from:'${statRange.from}',to:'${statRange.to}',toExclusive:true,type:'${type}',attribution:'${qEsc(a.person)}'})`;
+    // to 排他口径走 rangeExcl（与 sumbarDetail/showCategoryDetail 单源）
+    const bExcl = rangeExcl(statRange);
+    const barClick = (a, dir, type) => `showTxDetail('${qEsc(a.person)} ${dir}明细',{from:'${statRange.from}',to:'${statRange.to}',toExclusive:${bExcl},type:'${type}',attribution:'${qEsc(a.person)}'})`;
     $("#attrButterfly").innerHTML =
       `<div class="attr-b-axis"><span class="l">← 支出</span><span class="c"></span><span class="r">收入 →</span></div>` +
       attrs.map((a, i) => `
@@ -417,7 +433,7 @@ function renderLegend(legendId, chartId, labels, data){
     return `<div class="lg-item" onclick="lgDrill('${chartId}',${i})">
       <span class="lg-dot" style="background:${pal[i%pal.length]}"></span>
       <span class="lg-name">${esc(l)}</span>
-      <span class="lg-val num">${curSym()}${v.toLocaleString("zh-CN",{minimumFractionDigits:2, maximumFractionDigits:2})}</span>
+      <span class="lg-val num">${curSym()}${fmtYuan(v)}</span>
       <span class="lg-pct num">${pct}%</span></div>`;
   }).join("");
 }
@@ -450,7 +466,7 @@ async function drawChart(id, type, labels, data, data2, onClick, legendId, opts)
           callbacks:{label:(ctx)=>{
             const v = typeof ctx.parsed==="number" ? ctx.parsed : ctx.parsed.y;
             const prefix = ctx.dataset.label || ctx.label || "";
-            return ` ${prefix} ${curSym()}${(+v||0).toLocaleString("zh-CN",{minimumFractionDigits:2, maximumFractionDigits:2})}`;
+            return ` ${prefix} ${curSym()}${fmtYuan(v)}`;
           }}}},
       scales:type==="doughnut"?undefined:{x:{ticks:{color:tc.fg},grid:{color:tc.grid}},y:{ticks:{color:tc.fg},grid:{color:tc.grid}}}}});
   if(onClick) chartDrill[id] = (i)=>onClick(null,[{index:i}]);

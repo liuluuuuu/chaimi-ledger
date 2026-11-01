@@ -282,7 +282,7 @@ class ClassifyCtx:
 def classify_transfer(f: dict, ctx: ClassifyCtx, p: dict, export_tgt_amount=None) -> None:
     """转账行：子类映射（TRANSFER_SUBCLASS；未知子类 → 待确认）+ 导出回环退款对直连
     （负序号走 apply_import 回填，高置信免确认）。就 p 原地更新。"""
-    sub = dbm.TRANSFER_SUBCLASS.get(f.get("source_category", ""), "账户转账")
+    sub = dbm.TRANSFER_SUBCLASS.get(f.get("source_category", ""), dbm.DEFAULT_TRANSFER_SUB)
     if f.get("is_refund") or f.get("export_refund_idx") is not None:
         sub = "退款"
     p["tags"]["transfer_sub"] = sub
@@ -296,7 +296,7 @@ def classify_transfer(f: dict, ctx: ClassifyCtx, p: dict, export_tgt_amount=None
     if f.get("export_refund_idx") is not None:
         p["refund_for"] = f["export_refund_idx"]
         p["refund_confidence"] = "high"
-        p["refund_status"] = "full" if export_tgt_amount == f["amount"] else "partial"
+        p["refund_status"] = dbm.refund_status(export_tgt_amount, f["amount"])
         p["need_confirm"] = False
 
 
@@ -321,10 +321,10 @@ def classify_flow(f: dict, ctx: ClassifyCtx, p: dict) -> None:
     else:
         # ② 映射表（v6 外键直取分类行，结构上无悬空）
         target = _resolve_by_mapping(ctx.conn, ctx.ledger_id, f["type"], raw_cat)
-        direct = export_direct or (ctx.top(raw_cat, f["type"]) if raw_cat else None)
+        direct = ctx.top(raw_cat, f["type"]) if raw_cat else None
         if target and target["type"] == "transfer":
             # 用户显式指定 → 高置信不进待确认；top 设好后走公共尾行（人情复核天然跳过）
-            sub = "退款" if target["name"] == "退款" else dbm.TRANSFER_SUBCLASS.get(raw_cat, "账户转账")
+            sub = "退款" if target["name"] == "退款" else dbm.TRANSFER_SUBCLASS.get(raw_cat, dbm.DEFAULT_TRANSFER_SUB)
             p["type"] = "transfer"
             p["tags"]["transfer_sub"] = sub
             p["need_confirm"] = False

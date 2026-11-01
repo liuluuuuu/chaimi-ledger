@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime
 
 import config
@@ -121,13 +123,10 @@ CREATE TABLE IF NOT EXISTS known_users (
 """
 
 # 支出一级（15 分类体系：转账红包/投资理财迁 transfer，微信交易不留；
-# 2026-09 依据三渠道实测账单补「交通出行」——支付宝原生有该分类，微信商户消费
-# 里滴滴/12306/客运等公共出行原被挤入爱车养车；
-# 2026-09 取消二级分类，并把「加油充电」从爱车养车拆为独立一级——实测加油/充电
-# 是高频独立支出（湖北石油/中石化电子钱包等），与停车保养分开统计更清晰）
-# 2026-09 取消二级分类后改为纯列表（原为 分类→子分类 字典，子类恒空）
-# 2026-10 补「住房物业」——房贷/房租/物业费原挤在充值缴费，房贷是多数家庭
-# 最大单笔固定支出，与水电燃气分开统计更清晰（老库由 init_db 一次性迁移补种）
+# 2026-09 依据三渠道实测账单补「交通出行」（滴滴/12306 等原被挤入爱车养车）、
+# 取消二级分类并把「加油充电」拆为独立一级（高频支出，与停车保养分开统计）；
+# 2026-10 补「住房物业」——房贷/房租/物业费原挤在充值缴费，分开统计更清晰
+# （老库由 init_db 一次性迁移补种））
 EXPENSE_CATEGORIES = [
     "餐饮美食", "日用百货", "数码电器", "服饰装扮",
     "美容美发", "文化休闲", "医疗健康", "教育培训",
@@ -186,7 +185,12 @@ DEFAULT_MAPPINGS = [
     ("income", "红包礼金", "红包礼金"),
 ]
 
+# 导入平台 source → 中文名（attribution_rows 的 _PLAT SQL 与 server 归属下钻反解共用单源；
+# 新增平台改这里一处即可，两边不会漂移）
+PLATFORM_CN = {"alipay": "支付宝", "wechat": "微信", "jd": "京东", "meituan": "美团"}
+
 # transfer 子类（7.6，不计收支；存 tags.transfer_sub）
+DEFAULT_TRANSFER_SUB = "账户转账"   # 无映射时的兜底子类（import_classify 两处 + 前端 import.js/ai.js 展示同款字面量）
 TRANSFER_SUBCLASS = {
     "转账": "账户转账", "转账红包": "账户转账", "微信红包": "账户转账",
     "微信红包（单发）": "账户转账",
@@ -205,8 +209,8 @@ _CONN_GEN = 0
 
 def connect() -> sqlite3.Connection:
     """线程级连接：WAL + busy_timeout（FastAPI 多线程并发写必需）。
-    恢复备份会替换磁盘上的 db 文件，旧线程缓存的连接仍握旧文件句柄（读到陈旧数据）——
-    以代数标记作废，reset_connections() 后各线程下次取连接自动重开新文件。"""
+    恢复备份经 backup API 原地写回同一文件；各线程缓存的连接仍以代数标记作废（防御性），
+    reset_connections() 后各线程下次取连接自动重开。"""
     conn = getattr(_local, "conn", None)
     if conn is None or getattr(_local, "gen", -1) != _CONN_GEN:
         if conn is not None:
@@ -236,7 +240,10 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
     if column not in cols:
         conn.execute(ddl)
 
-# 导入来源（账单里的原始归属是真实数据，删组/删归属的清理永不触碰）；其余 manual/ai_* 为用户侧
+# source 取值域——导入侧（本元组）：账单原始归属是真实数据，删组/删归属的清理永不触碰；
+#   平台 id（alipay/wechat/jd/meituan/export 模板）或 custom（向导/用户模板），导出回环行
+#   会被「来源」列覆写回原始 source；cashbook 为历史库兼容（无现行写入方，仅防老行漏判）。
+#   用户侧：app（App 手动/AI 记一笔默认）/ bot（机器人确认）/ manual（历史/测试写入口径）
 IMPORT_SOURCES = ("alipay", "wechat", "jd", "meituan", "custom", "cashbook", "export")
 
 def init_db() -> None:
@@ -386,6 +393,12 @@ def _refund_sum(conn: sqlite3.Connection, ledger_id: int, dfrom: str, dto: str,
         args.append(category_id)
     return conn.execute(sql, args).fetchone()[0]
 
+def refund_status(origin_cents: int, refund_cents: int) -> str:
+    """退款状态单源判定（手动关联/导出直连/导入匹配/确认入库四路共用）：
+    退款额 ≥ 原消费额 = full——相等即全额退清；多退（订单号唯一命中不校验金额时允许的
+    异常形态）旧实现手动/导入两路已分叉（full vs partial），统一按 full；不足额 = partial。"""
+    return "full" if refund_cents >= origin_cents else "partial"
+
 def stats_summary(conn: sqlite3.Connection, ledger_id: int, month: str) -> dict:
     dfrom, dto = month_range(month)
     return stats_summary_range(conn, ledger_id, dfrom, dto)
@@ -468,12 +481,16 @@ def _stats_by_period(conn: sqlite3.Connection, ledger_id: int, span: int,
         (ledger_id, *([dfrom, dto] if dfrom else ()))).fetchall()
     out = []
     for r in rows:
+        if not re.fullmatch(r"\d{4}-\d{2}" if span == 7 else r"\d{4}", r["p"] or ""):
+            continue   # 遗留坏日期行（norm_date 收紧前入库）不参与分段，免一行拖垮整个接口
         if span == 7:
             seg_from, seg_to = r["p"] + "-01", _next_month(r["p"])
             key, k = r["p"], "month"
         else:
             seg_from, seg_to = f"{r['p']}-01-01", f"{int(r['p']) + 1}-01-01"
             key, k = r["p"], "year"
+        if dfrom:   # 退款段与毛额同口径裁到查询区间：月中起止时整月退款会让 net 失真
+            seg_from, seg_to = max(seg_from, dfrom), min(seg_to, dto)
         refund = _refund_sum(conn, ledger_id, seg_from, seg_to)
         out.append({k: key, "gross": r["gross"], "income": r["income"],
                     "net": r["gross"] - refund})
@@ -492,8 +509,8 @@ def attribution_rows(conn: sqlite3.Connection, ledger_id: int, dfrom: str, dto: 
     有组的归属并成一行（person=组名，members=成员明细），无组按统计键单列；
     统计键 = 归属名[·平台]——app 手动/AI 记账保持纯归属名（同一人手动与平台账单分列），
     导入平台账单带平台后缀。dfrom 含端、dto 排他上界（与其他 stats_* 一致）。"""
-    _PLAT = ("CASE t.source WHEN 'alipay' THEN '支付宝' WHEN 'wechat' THEN '微信' "
-             "WHEN 'jd' THEN '京东' WHEN 'meituan' THEN '美团' ELSE '' END")
+    _PLAT = "CASE t.source " + " ".join(
+        f"WHEN '{s}' THEN '{cn}'" for s, cn in PLATFORM_CN.items()) + " ELSE '' END"
     _person = (f"json_extract(t.tags,'$.attribution') || "
                f"CASE WHEN {_PLAT}='' THEN '' ELSE '·' || {_PLAT} END")
     sql = (f"SELECT COALESCE(g.id, g2.id) AS gid, COALESCE(g.name, g2.name) AS group_name, "
@@ -645,6 +662,7 @@ def count_tx_rows(conn: sqlite3.Connection, ledger_id: int, *, flow: str = "expe
            "LEFT JOIN categories c2 ON c.parent_id=c2.id" + sql)
     return conn.execute(sql, args).fetchone()["n"]
 
+# 人情往来 vs 红包礼金 的拆分口径（is_small_generic_packet / renqing_need_confirm 共用）：
 #   ≤200 元 + 只像通用红包（红包/拼手气/恭喜发财）+ 无强人情词 → 「红包礼金」（小额红包）
 #   其余（大额，或带随礼/份子/结婚等明确人情含义）→ 「人情往来」
 
@@ -698,15 +716,59 @@ def dup_hints(conn: sqlite3.Connection, ledger_id: int, items: list, rows: list 
             seen[key] = i
     return sum(1 for it in items if "dup_hint" in it)
 
+# 宽松日期写法（2026/11/1、2026.11.01、2026年11月1日 20点30、全角数字）：LLM/OCR 常见。
+# 非 ISO 串入库会破坏统计 date>=? AND date<? 的字典序区间比较，流水从统计里消失
+_LOOSE_DATE = re.compile(r"(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*[日号]?"
+                         r"(?:[T\s]*(\d{1,2})\s*[:时点]\s*(?:(\d{1,2})(?:\s*[:分]\s*(\d{1,2}))?)?)?")
+_ISO_DT = re.compile(r"\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}(?::\d{2})?)?")
+_ISO_FMT = {10: "%Y-%m-%d", 16: "%Y-%m-%d %H:%M", 19: "%Y-%m-%d %H:%M:%S"}
+
+def iso_date(s: str) -> str:
+    """日期格式归一（不补位）：宽松写法 → YYYY-MM-DD[ HH:MM[:SS]]（「8点」补 :00）；
+    ISO 输入原样；认不出的原样返回——放不放行由 norm_date 把关。"""
+    s = (s or "").strip()
+    m = _LOOSE_DATE.match(unicodedata.normalize("NFKC", s))   # NFKC：全角数字/符号转半角
+    if not m:
+        return s
+    y, mo, d, hh, mi, ss = m.groups()
+    out = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    if hh is not None:
+        out += f" {int(hh):02d}:{int(mi or 0):02d}" + (f":{int(ss):02d}" if ss else "")
+    return out
+
+def is_valid_date(s: str) -> bool:
+    """ISO（10/16/19 位）且日历/时刻合法——norm_date 的放行口径（ai 草稿/小票同用）。"""
+    if not _ISO_DT.fullmatch(s or ""):
+        return False
+    try:
+        datetime.strptime(s, _ISO_FMT[len(s)])
+        return True
+    except ValueError:
+        return False
+
+def iso_date_ok(s: str) -> str | None:
+    """归一 + 放行一步完成（放行口径与 norm_date 一致）：宽松写法 → ISO；
+    认不出/日历非法返回 None。「不拒用户、按场景兜底」的入口（AI 草稿兜今天、
+    小票兜空、bot 编辑跳字段）共用，替代各处 iso_date+is_valid_date 两行式。"""
+    s = iso_date(s)
+    return s if is_valid_date(s) else None
+
 def norm_date(s: str, *, old: str = "") -> str:
-    """日期统一 19 位：datetime-local 给 16 位(YYYY-MM-DD HH:MM)补秒；
-    10 位（旧调用方/导入）沿用旧记录时刻，无旧记录用当前时刻。"""
-    s = (s or "").strip().replace("T", " ")
+    """日期统一 19 位（所有写库路径的出口）：iso_date 归一后严格校验，认不出或日历非法
+    （2026-13-45）抛 ValueError——坏日期入库会让年报/趋势分段 int() 崩、区间统计漏行。
+    16 位补秒；10 位沿用旧记录时刻，无旧记录用当前时刻。"""
+    s = iso_date(s)
+    if not is_valid_date(s):
+        raise ValueError(f"日期无法识别：{s[:20]!r}")
     if len(s) == 16:
         return s + ":00"
     if len(s) == 10:
-        hm = (old or "")[11:19] or datetime.now().strftime("%H:%M:%S")
-        return f"{s} {hm}"
+        t = (old or "")[11:19]
+        if re.fullmatch(r"\d{2}:\d{2}", t):
+            t += ":00"
+        elif not re.fullmatch(r"\d{2}:\d{2}:\d{2}", t):
+            t = datetime.now().strftime("%H:%M:%S")
+        return f"{s} {t}"
     return s
 
 def insert_tx(c: sqlite3.Connection, ledger_id: int, *, type: str, amount: int,
@@ -748,9 +810,10 @@ def patch_tx(c: sqlite3.Connection, tid: int, fields: dict) -> bool:
     if "account_id" in fields:
         sets.append("account_id=?")
         args.append(fields["account_id"])
-    if fields.get("date"):
+    if fields.get("date"):   # 传旧值：只改日期时保留原时刻（与 App 编辑接口同口径）
+        old = c.execute("SELECT date FROM transactions WHERE id=?", (tid,)).fetchone()
         sets.append("date=?")
-        args.append(norm_date(str(fields["date"])))
+        args.append(norm_date(str(fields["date"]), old=old["date"] if old else ""))
     for col in ("name", "merchant", "note"):
         if fields.get(col) is not None:
             sets.append(f"{col}=?")
@@ -761,10 +824,13 @@ def patch_tx(c: sqlite3.Connection, tid: int, fields: dict) -> bool:
     cur = c.execute(f"UPDATE transactions SET {', '.join(sets)} WHERE id=?", args)
     return cur.rowcount > 0
 
+# 解除退款关联的统一字段清理（delete_tx / server._link_refund 取消分支 / undo_batch 共用）：
+# 三字段必须一起清，漏一列即半清理脏态；将来退款态加列只改这里一处
+UNLINK_REFUND_SET = "refund_for=NULL, refund_status='none', refund_confidence=NULL"
+
 def delete_tx(c: sqlite3.Connection, tid: int) -> str | None:
     """删行 + 解除其他行对本行的退款关联；返回旧小票路径（调用方负责删文件）。"""
     row = c.execute("SELECT receipt_path FROM transactions WHERE id=?", (tid,)).fetchone()
-    c.execute("UPDATE transactions SET refund_for=NULL, refund_status='none', refund_confidence=NULL "
-              "WHERE refund_for=?", (tid,))
+    c.execute(f"UPDATE transactions SET {UNLINK_REFUND_SET} WHERE refund_for=?", (tid,))
     c.execute("DELETE FROM transactions WHERE id=?", (tid,))
     return row["receipt_path"] if row else None

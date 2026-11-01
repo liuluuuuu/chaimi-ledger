@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import applog
+import db as dbm   # refund_status 单源判定
 from import_common import _is_placeholder_name, _is_new_row
 
 _log = applog.get("import")   # 退款匹配决策日志：日志包里可直接看出每笔退款链到谁/置信度
@@ -72,6 +73,12 @@ _PAYMENT_CHANNELS = ("wechat", "alipay", "jd")
 # 手动行无 row_hash，与平台账单的重复（先手记、后导微信）由 _link_payment 末层配对兜住
 _MANUAL_SOURCES = ("app", "bot", "manual")
 
+
+def _sole(cands: list):
+    """唯一候选才返回（空/多候选=歧义返回 None）——退款匹配与跨源配对各层的共同安全
+    门槛：多笔等额=证据不足以定行，不自动链/跳，留待确认队列人工裁决。"""
+    return cands[0] if len(cands) == 1 else None
+
 def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
                   snap: _LedgerSnapshot | None = None) -> None:
     """P2 跨源配对（双向）：同一笔消费在平台账单与支付渠道账单各出现一次 → 后导入的标 pay_dupe 跳过。
@@ -85,6 +92,8 @@ def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
 
     snap = _snap_or_load(conn, ledger_id, snap)
     used_manual: set = set()   # 已被配对消耗的手动行 id（1:1 防一笔手记吸收多笔同额导入）
+    used_cross: set = set()    # 已被跨源配对消耗的库行 id（同款 1:1：一笔渠道流水只吸收
+                               # 一笔平台流水，多笔同日同额真实消费不再被整批吞掉）
     for p in previews:
         if p.get("skip") or p.get("pay_dupe") or p.get("type") not in ("expense", "income"):
             continue
@@ -94,26 +103,32 @@ def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
         d_from, d_to = _day_window(p["date"], 1)
 
         if src in _PLATFORM_DISPLAY:
-            # 正向：导平台账单，查库中支付渠道流水（订单号 → 商户名 → 同日同额）
+            # 正向：导平台账单，查库中支付渠道流水（订单号 → 商户名 → 同日同额）；
+            # 候选剔除已消耗行、命中即消耗（1:1，与末层手动配对同款防线）
             display = _PLATFORM_DISPLAY[src]
-            base = snap.candidates(p, ("wechat", "alipay", "jd"), d_from, d_to)
+            base = [c for c in snap.candidates(p, ("wechat", "alipay", "jd"), d_from, d_to)
+                    if c["id"] not in used_cross]
             if p.get("order_no"):
                 r = next((c for c in base if c["order_no"] == p["order_no"]), None)
                 if r:
-                    mark(p, r, "订单号"); continue
+                    mark(p, r, "订单号"); used_cross.add(r["id"]); continue
             r = next((c for c in base if display in (c["merchant"] or "")
                       or display in (c["name"] or "")), None)
             if r:
-                mark(p, r, "商户名"); continue
+                mark(p, r, "商户名"); used_cross.add(r["id"]); continue
             # ③ 同日+金额+跨来源兜底——须唯一候选（多笔等额=歧义，不自动跳过）
-            if len(base) == 1:
-                mark(p, base[0], "同日同额")
+            r = _sole(base)
+            if r:
+                mark(p, r, "同日同额"); used_cross.add(r["id"])
 
         elif src in _PAYMENT_CHANNELS:
-            # 反向：导微信/支付宝/京东，查库中平台流水（美团等）——同日同额即可
-            r = next(iter(snap.candidates(p, ("meituan", "custom"), d_from, d_to)), None)
+            # 反向：导微信/支付宝/京东，查库中平台流水（美团等）——同日同额且唯一候选
+            # （与正向③层同门槛：库中一笔前日美团 ¥35 不能吞掉无关的微信星巴克 ¥35）
+            cands = [c for c in snap.candidates(p, ("meituan", "custom"), d_from, d_to)
+                     if c["id"] not in used_cross]
+            r = _sole(cands)
             if r:
-                mark(p, r, "跨源（反向）")
+                mark(p, r, "跨源（反向）"); used_cross.add(r["id"])
 
         if not p.get("pay_dupe"):
             # 末层：查手动记账（app/bot）。手动行时间金额是人填的，同额碰撞概率高于渠道
@@ -123,9 +138,10 @@ def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
             # 这里：导出回环里手动行的重导靠这层跳过（手动行无 row_hash，精确去重够不着）。
             cands = [c for c in snap.candidates(p, _MANUAL_SOURCES, d_from, d_to)
                      if c["id"] not in used_manual]
-            if len(cands) == 1:
-                mark(p, cands[0], "手动记账")
-                used_manual.add(cands[0]["id"])
+            r = _sole(cands)
+            if r:
+                mark(p, r, "手动记账")
+                used_manual.add(r["id"])
 
 _REFUND_PREFIXES = ("退款-", "退款·", "【退款】", "退款:")
 
@@ -183,11 +199,12 @@ def _match_order(pool: list, p: dict):
     hits = [e for e in pool if e["order_no"] and e["order_no"] == p["order_no"]]
     if not hits:
         return None
-    eq = [e for e in hits if e["amount"] == p["amount"]]
-    if len(eq) == 1:
-        return eq[0], False
-    if len(hits) == 1:
-        return hits[0], False
+    r = _sole([e for e in hits if e["amount"] == p["amount"]])
+    if r:
+        return r, False
+    r = _sole(hits)
+    if r:
+        return r, False
     return None   # 同单号多行且无等额：单号证据不足以定行，交给金额证据
 
 def _in_window(pool: list, date: str, days: int) -> list:
@@ -251,7 +268,8 @@ def _match_wechat(pool: list, p: dict, flow: dict):
     """②' 微信（pool 已收窗）：商户+金额唯一 → high（多命中取最近降 low）；红包/转账
     无名称信息 → 最近等额 → low。同额多候选时优先交易对方相同的那笔（退款行带交易
     对方：退给谁=原转账给谁，真机案例：35 转账退款被链到最近一笔别人的 35 转账）。"""
-    rows = [e for e in pool if e["amount"] == p["amount"] and e["source"] not in ("manual", "app")]
+    rows = [e for e in pool if e["amount"] == p["amount"]
+            and e["source"] not in _MANUAL_SOURCES]   # 手动行（app/bot/manual）不进微信专属层
     if flow.get("wechat_type") in ("微信红包", "转账"):
         if not rows:
             return None
@@ -264,16 +282,17 @@ def _match_bracket(pool: list, p: dict):
     （(已退款26.72)；(已全额退款)=全额）——子件部分退款单号/名称都对不上时的唯一线索。
     金额单证据：唯一命中也只给 low（进待确认）；同额歧义放弃。"""
     hits = [e for e in pool if e.get("bracket_refund") == p["amount"]]
-    return (hits[0], True) if len(hits) == 1 else None
+    r = _sole(hits)
+    return (r, True) if r else None
 
 def _match_heuristic(pool: list, p: dict):
     """③ 启发式：金额 ≥ 退款额 + 唯一候选 → low；多候选但恰有一笔同额 → 优先同额（low，
     仍进待确认）。同额也歧义（多笔等额）则放弃——宁低勿错。"""
-    cands = [e for e in pool if e["amount"] >= p["amount"]]
-    if len(cands) == 1:
-        return cands[0], True
-    eq = [e for e in cands if e["amount"] == p["amount"]]
-    return (eq[0], True) if len(eq) == 1 else None
+    r = _sole([e for e in pool if e["amount"] >= p["amount"]])
+    if r:
+        return r, True
+    r = _sole([e for e in pool if e["amount"] == p["amount"]])
+    return (r, True) if r else None
 
 def _match_refund(pool_all: list, p: dict, flow: dict):
     """单条退款行的匹配链：候选一次收窄到统一 90 天窗（含日期 ≤ 退款日），再走
@@ -296,7 +315,7 @@ def _match_refunds(conn: sqlite3.Connection, ledger_id: int, previews: list[dict
         cand = _match_refund(pool_all, p, f)
         if cand:
             e, low_conf = cand
-            p["refund_for"], p["refund_status"] = e["id"], ("partial" if e["amount"] > p["amount"] else "full")
+            p["refund_for"], p["refund_status"] = e["id"], dbm.refund_status(e["amount"], p["amount"])
             p["refund_confidence"] = "low" if low_conf else "high"
             _log.info(f"退款匹配 [{p.get('platform')}] {p.get('name')} {p['amount']}分 → "
                       f"#{e['id']} {e['name']} {e['amount']}分（{p['refund_status']}/{p['refund_confidence']}）")

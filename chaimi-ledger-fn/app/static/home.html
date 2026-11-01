@@ -86,8 +86,8 @@ body{display:flex;align-items:center;justify-content:center;background:var(--bg)
   </div>
   <div id="lgToast"></div>
 <script>
-/* 独立登录页：主应用检测到「无当前用户」（首次/缓存失效）时 location.replace 过来，
-   选定/创建用户后写 chaimi_user_{账本id} 并回主应用。无 core.js 依赖，自带最小工具。 */
+/* 独立登录页：服务端入口（GET / 发现无账本）或主应用检测到「无当前用户」（首次/缓存
+   失效）跳过来，选定/创建用户后写 chaimi_user_{账本id} 并回主应用。无 core.js 依赖，自带最小工具。 */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(path, opts){
@@ -207,7 +207,11 @@ const back = () => render(selHtml());
 const newUser = () => render(setupHtml(true));
 function enter(id){
   // 主应用 loadAll 首载读它恢复——修复「新账本建用户，进入后却回到旧账本」
-  try{ localStorage.setItem("chaimi_user_" + LEDGER, String(id)); localStorage.setItem("chaimi_ledger", String(LEDGER)); }catch(_){}
+  try{
+    localStorage.setItem("chaimi_user_" + LEDGER, String(id));
+    localStorage.setItem("chaimi_ledger", String(LEDGER));
+    if(localStorage.getItem("chaimi_user_" + LEDGER) !== String(id)) throw 0;   // 写被拒（禁存储）
+  }catch(_){ msg("本浏览器禁止本地存储，无法记住用户，请更换浏览器或关闭隐私模式"); return; }
   location.replace(".");
 }
 const pick = id => enter(id);

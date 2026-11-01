@@ -47,6 +47,7 @@ POLL_TIMEOUT = 45              # 长轮询挂起 ~35s，客户端超时留余量
 QR_WAIT_TIMEOUT = 180          # 二维码有效期（秒）
 QR_POLL_INTERVAL = 2
 DEDUP_SIZE = 200               # msg_id LRU 去重窗口（DESIGN 10.3）
+MAX_MEDIA_BYTES = 20 * 1024 * 1024   # 媒体下载体积上限 20MB（read 多读 1 字节判超限，内存有界）
 _BACKOFF_MAX = 60
 
 
@@ -359,6 +360,17 @@ class ILinkBot:
                 if not creds["bot_token"]:
                     self._set_state("error", "confirmed 但缺 bot_token")
                     return
+                if self._stop.is_set():
+                    # 扫码半路被取消（模式切走→stop_all / 新扫码顶替 / 停机）不自启轮询
+                    # （server 出口闸拒 adopt 后即无人收编）；凭证仍交回调落盘，
+                    # 切回 direct 后按凭证自动拉起，免重扫
+                    _log.info("扫码确认时登录已被取消，不自启轮询")
+                    if self._on_confirmed:
+                        try:
+                            self._on_confirmed(self, creds)
+                        except Exception as e:
+                            _log.warning(f"on_confirmed 回调异常: {e}")
+                    return
                 self._ctx.clear()
                 self.start(creds)
                 if self._on_confirmed:
@@ -369,6 +381,8 @@ class ILinkBot:
                 return
             if st == "binded_redirect":
                 # 扫的 bot 已绑定本客户端：直接复用本地 token（无需重新确认）
+                if self._stop.is_set():
+                    return
                 if self._local_token:
                     self._ctx.clear()
                     self.start({"bot_token": self._local_token,
@@ -392,12 +406,16 @@ class ILinkBot:
         if not token:
             self._set_state("off", "无凭证，请扫码登录")
             return False
+        # 同实例重启（换凭证）：先尽停旧轮询；join(3s) 超时未退出的部分由 _poll_loop
+        # 的线程身份闸兜底退出（_dead 见下），不会与新轮询并存处理消息
         self.stop()
         self._token = token
         self._base = ((creds.get("baseurl") or creds.get("base_url") or DEFAULT_BASE)
                       .rstrip("/")) or DEFAULT_BASE
         self._bot_id = str(creds.get("ilink_bot_id") or creds.get("account_id") or "")
-        self._stop = threading.Event()
+        # 事件对象 __init__ 只建一次：这里只 clear 不替换——替换会让仍挂在长轮询里的
+        # 旧循环从此读到未 set 的新事件，stop 的停止信号对它永久失效
+        self._stop.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="ilink-poll")
         self._thread.start()
         self._set_state("logged_in", f"base={self._base} bot={self._bot_id[:12]}")
@@ -406,6 +424,8 @@ class ILinkBot:
     def stop(self) -> None:
         if self._thread is not None:
             self._stop.set()
+            # join(3s) 短于长轮询挂起(~45s)：超时线程由 _poll_loop 在请求返回后的停止检查
+            # 兜底退出，退出前不处理/回复任何消息
             self._thread.join(timeout=3)
             self._thread = None
             self._notify("notifystop")
@@ -420,6 +440,7 @@ class ILinkBot:
             _log.warning(f"{path} 失败(忽略): {e}")
 
     def _poll_loop(self) -> None:
+        me = threading.current_thread()
         self._notify("notifystart")
         buf = ""
         backoff = 1
@@ -429,13 +450,19 @@ class ILinkBot:
             time.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
 
+        def _dead() -> bool:
+            """本循环已被告知退出：停止事件已 set，或线程已被 stop()/重启替换/置空。"""
+            return self._stop.is_set() or self._thread is not me
+
         logged_raw = False
-        while not self._stop.is_set():
+        while not _dead():
             try:
                 r = _request("POST", _api(self._base, "getupdates"), self._token,
                              {"get_updates_buf": buf,
                               "base_info": {"channel_version": CHANNEL_VERSION}})
-                if self._stop.is_set():
+                if _dead():
+                    # 长轮询可挂 ~45s 而 stop() 的 join 只等 3s：请求返回后先查停止态，
+                    # 已停（或本线程已被顶替）则不处理/回复任何消息，直接退出
                     return
                 if not logged_raw:
                     _log.info(f"getupdates 首次响应: {json.dumps(_redact(r), ensure_ascii=False)[:400]}")
@@ -453,9 +480,11 @@ class ILinkBot:
                 buf = r.get("get_updates_buf") or data.get("get_updates_buf") or buf
                 self._set_state("logged_in")
                 for m in (r.get("msgs") or data.get("msgs") or []):
+                    if _dead():   # 批内逐条再查：停用后连第一条也不回复
+                        return
                     self._dispatch(m)
             except Exception as e:
-                if self._stop.is_set():
+                if _dead():
                     return
                 self._set_state("error", f"{type(e).__name__}: {e}")
                 _backoff()
@@ -536,9 +565,15 @@ class ILinkBot:
         _log.info(f"媒体下载: {url.split('?', 1)[0]}")   # query 含下载凭证，不入日志（与 _redact 同口径）
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "MicroMessengerClient"})
-            data = urllib.request.build_opener(_MediaRedirectHandler).open(req, timeout=30).read()
+            # 最多读 20MB+1 字节：多出的 1 字节用于超限判定；下载发生在白名单校验之前，
+            # 任何能给机器人发消息的人都可诱导下载，无上限会整读任意大文件进内存
+            with urllib.request.build_opener(_MediaRedirectHandler).open(req, timeout=30) as r:
+                data = r.read(MAX_MEDIA_BYTES + 1)
         except Exception as e:
             _log.warning(f"CDN 下载失败: {type(e).__name__}: {e}")
+            return None
+        if len(data) > MAX_MEDIA_BYTES:
+            _log.warning(f"媒体超过 {MAX_MEDIA_BYTES // (1024 * 1024)}MB 上限,已拒收: {len(data)}B")
             return None
         key = _aes_key(info)
         if key:
@@ -579,10 +614,11 @@ class ILinkBot:
 # ---------- 多实例管理(多人记账:一账本一用户一机器人,DESIGN 10.6) ----------
 
 def ilink_entries(cfg: dict) -> list:
-    """bot.ilink 凭证列表归一化:旧版单 dict 自动包列表;无 token 的条目滤掉。"""
+    """bot.ilink 凭证列表归一化:旧版单 dict 自动包列表;无 token 的条目滤掉
+    （两分支同口径——出厂默认空 dict 不能凭形态豁免成为"幽灵绑定"）。"""
     raw = (cfg.get("bot") or {}).get("ilink")
     if isinstance(raw, dict):
-        return [dict(raw, ledger=raw.get("ledger") or 1)]
+        return [dict(raw, ledger=raw.get("ledger") or 1)] if raw.get("token") else []
     out = []
     for e in raw or []:
         if isinstance(e, dict) and e.get("token"):
@@ -600,10 +636,15 @@ class ILinkManager:
         self._login: ILinkBot | None = None
 
     def begin_login(self, ledger: int, label: str, existing_token: str, on_confirmed) -> dict:
-        if self._login is not None:      # 同一时刻只挂一张码
-            self._login._stop.set()
-        self._login = ILinkBot(ledger=ledger, label=label)
-        return self._login.begin_login(existing_token, on_confirmed)
+        # 注册表读写与持锁的 adopt/stop_all 同锁串行：无锁交错会丢失取消信号
+        # （如 stop_all 清 _login 与此处赋值交错 → 已停用的旧扫码存活）
+        with self._lock:
+            if self._login is not None:      # 同一时刻只挂一张码
+                self._login._stop.set()
+            bot = ILinkBot(ledger=ledger, label=label)
+            self._login = bot
+        # 取二维码是网络调用，放锁外（锁内只做注册表读写，不跨网络持锁）
+        return bot.begin_login(existing_token, on_confirmed)
 
     def adopt(self, bot: ILinkBot) -> None:
         """扫码确认后的登录实例转正(已自启,登记即可,apply 见同 token 会跳过)。"""

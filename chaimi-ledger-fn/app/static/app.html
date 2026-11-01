@@ -148,7 +148,7 @@
         </div>
       </div>
       <div class="card" id="txList" style="padding:6px"></div>
-      <!-- 底部翻页行；「最近」态隐藏（固定10笔无翻页），
+      <!-- 底部翻页行；「最近」态隐藏（固定20笔无翻页），
            仅范围态/搜索时显示（loadTx 同步显隐并补 #tab-list 底部防遮 padding） -->
       <div class="filters" id="txPager">
         <button class="btn btn-ghost" onclick="txPage(-1)">上一页</button>
@@ -688,7 +688,7 @@
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="closePv()">取消</button>
-      <button class="btn btn-pri" onclick="impConfirm()">确认导入</button>
+      <button class="btn btn-pri" onclick="impConfirm(this)">确认导入</button>
     </div>
   </div>
 </div>

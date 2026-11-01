@@ -153,7 +153,7 @@ async function impSetCat(sel){
   const cat = categories.find(c=>c.id === +sel.value);
   if(cat && cat.type === "transfer"){
     p.type = "transfer";
-    p.tags = Object.assign({}, p.tags, {transfer_sub: cat.name === "退款" ? "退款" : "账户转账"});
+    p.tags = Object.assign({}, p.tags, {transfer_sub: cat.name === "退款" ? "退款" : "账户转账"});   // 兜底子类与后端 db.DEFAULT_TRANSFER_SUB 同值（改需同步）
     p.category_name = p.parent_category = p.tags.transfer_sub;
     renderPv();
     return;
@@ -162,16 +162,21 @@ async function impSetCat(sel){
   const row = sel.closest(".tx-row");
   row && row.querySelector(".tag.warn")?.remove();
 }
-async function impConfirm(){
+async function impConfirm(btn){
   if(!impPreviews) return;
-  // 去掉仅前端用的标记（_pvIdx/_pvSkip），避免传给后端
-  const payload = impPreviews.map(({_pvIdx, _pvSkip, ...rest}) => rest);
-  const r = await apiSend(`/api/import/confirm?ledger=${lid()}`, "POST", {previews:payload, ...impMeta});
-  msg(`已导入 ${r.imported} 笔（批次 #${r.batch_id}，可在下方撤销）`);
-  closePv(); $("#imp_summary").textContent="";
-  // 与记一笔/编辑同口径走 afterTxWrite：流水列表、待确认徽标/chip、汇总条、统计全部实时刷新
+  if(btn) btn.disabled = true;   // 提交期间锁按钮防重复导入；失败也要恢复（finally），否则预览弹窗卡死
+  try{
+    // 去掉仅前端用的标记（_pvIdx/_pvSkip），避免传给后端
+    const payload = impPreviews.map(({_pvIdx, _pvSkip, ...rest}) => rest);
+    const r = await apiSend(`/api/import/confirm?ledger=${lid()}`, "POST", {previews:payload, ...impMeta});
+    msg(`已导入 ${r.imported} 笔（批次 #${r.batch_id}，可在下方撤销）`);
+    closePv(); $("#imp_summary").textContent="";
+    // 与记一笔/编辑同口径走 afterTxWrite：流水列表、待确认徽标/chip、汇总条、统计全部实时刷新
 
-  afterTxWrite(); loadBatches(); loadAccs();
+    afterTxWrite(); loadBatches(); loadAccs();
+  }finally{
+    if(btn) btn.disabled = false;   // 失败信息由全局 unhandledrejection 兜底 toast，这里只负责恢复按钮
+  }
 }
 async function loadBatches(){
   loadTpls();
@@ -215,7 +220,7 @@ function repairDetail(){
   const acc = (repairInfo?.account_merges || []).map(g =>
     `<div>· 账户合并：${g.accounts.map(x=>esc(x.name)).join("、")} → <b>${esc(g.key)}</b></div>`).join("");
   const tx = (repairInfo?.tx_fixes || []).slice(0, 100).map(f =>
-    `<div>· ${(f.date || "").slice(0,10)} ${esc(f.name)} ¥${(f.amount/100).toFixed(2)}：${esc(f.current)} → <b>${esc(f.target)}</b></div>`).join("");
+    `<div>· ${(f.date || "").slice(0,10)} ${esc(f.name)} ¥${fmt(f.amount)}：${esc(f.current)} → <b>${esc(f.target)}</b></div>`).join("");
   const mp = (repairInfo?.mapping_resets || []).map(f =>
     `<div>· 映射「${esc(f.source)}」（${esc(f.flow_type)}）：${esc(f.learned)} → 默认 ${esc(f.default)}</div>`).join("");
   det.innerHTML = `<div class="sub" style="border-top:1px dashed var(--line,#ddd);margin-top:4px;padding-top:4px">${acc}${tx}${mp}</div>`;

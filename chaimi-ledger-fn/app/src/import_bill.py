@@ -22,18 +22,23 @@ from datetime import datetime
 
 import db as dbm
 import platform_templates as pt
+# 门面再导出（勿删）：is_meaningless_name / _is_new_row 本文件不用，ai/server/tests 经
+# ib.xxx 访问——与 _top_by_keyword 同理，误删即断链
 from import_common import (_is_new_row, _is_placeholder_name, is_meaningless_name,
                            norm_account_name, normalize)
 from import_classify import _top_by_keyword   # 门面再导出：ai/tests 经 ib._top_by_keyword
                                                # 访问（误删即断链，教训见 02bc9a9）
 from import_classify import ClassifyCtx, classify_transfer, classify_flow
 from import_match import _LedgerSnapshot, _match_refunds, _link_payment
+# 门面再导出（勿删）：undo_batch / _rescan_unmatched_refunds 本文件不用，server/tests
+# 经 ib.xxx 访问
 from import_apply import apply_import, undo_batch, _rescan_unmatched_refunds
 
 # ---------- 基础工具 ----------
 
 #   京东金额列括号（全/半角都认；半角正则会因全角行 float() 抛错）：
-#   ① 含「退款」关键词 → 拆为原消费 + 退款两条（拆分在 expand 分支）
+#   ① 含「退款」关键词 → 原消费一条入列 + 退款额存 bracket_refund 作退款匹配线索
+#      （不拆退款行，见 split_bracket_amount 与京东模板注释）
 #   ② 其他括号内容（已退积分/红包/入账/补偿等）→ 单条 + need_confirm
 #   ③ 无括号 → 原样
 _REFUND_PAREN_RE = re.compile(r"[（(]([^（）()]*退款[^（）()]*)[)）]")
@@ -57,7 +62,10 @@ def _try_cents(s) -> int | None:
         return None
 
 def parse_dt(s: str) -> str:
-    s = normalize(s).replace("/", "-")
+    """日期归一：db.iso_date 宽松写法（2026年1月1日 / 2026.1.1 / 全角数字）→ ISO，
+    再格式化为 19 位。认不出的原样返回——合法性由调用方（parse_template）以
+    db.is_valid_date 把关：非 ISO 串入库会破坏 date>=? AND date<? 的字典序区间比较。"""
+    s = dbm.iso_date(normalize(s).replace("/", "-"))
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
@@ -79,7 +87,7 @@ def _capped(rows):
     余量 200 行给各平台表头前的导出信息块。"""
     for i, row in enumerate(rows):
         if i > MAX_PARSE_ROWS + 200:
-            raise ValueError("行数超过上限 5 万行")
+            raise ValueError(f"行数超过上限 {MAX_PARSE_ROWS // 10000} 万行")
         yield row
 
 # ---------- 原语层（引擎与测试共用；每个原语在抽取时即有调用方，不预建） ----------
@@ -129,7 +137,9 @@ def split_bracket_amount(raw: str):
     if m:
         inner = m.group(1)
         origin = _REFUND_PAREN_RE.sub("", raw)
-        nums = re.findall(r"\d+(?:\.\d+)?", inner)
+        # 去千分位再取数：原额走 to_cents 已去逗号，退款额若不去则 "1,234.56(已退款1,234.56)"
+        # 会被拆成 ["1","234.56"] 而错取末段 234.56
+        nums = re.findall(r"\d+(?:\.\d+)?", inner.replace(",", ""))
         refund = nums[-1] if nums else origin
         return ("split", to_cents(origin), to_cents(refund))
     m2 = _PAREN_RE.search(raw)
@@ -227,7 +237,9 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
     for i, c in enumerate(header):
         idx.setdefault(c, i)          # 重复列名取首现（与 .index 口径一致）
     col = tpl.get("col") or {}
-    flow_map = tpl.get("flow_map") or {}
+    # 缺省 None → decide_type 落 DEFAULT_FLOW_MAP（支出/收入）：模板没写 flow_map 时
+    # （sniff 猜测模板/直连 API），收/支列的常规枚举不该整单判 transfer
+    flow_map = tpl.get("flow_map") or None
     transfer_types = tpl.get("transfer_types") or ()
     note_fallback = bool(tpl.get("note_fallback_last"))
     note_names = ([col["note"]] if isinstance(col.get("note"), str)
@@ -289,6 +301,13 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
         type_val = normalize(g("type"))
         base_type = type_val[:len(type_val) - len(strip)] if strip else type_val
 
+        # 日期归一 + 严校验：归一后仍非法（db.is_valid_date 为假）的行与「金额无法解析」
+        # 同款标 skip——坏日期入库会破坏区间统计的字典序比较
+        date_val = parse_dt(g("date"))
+        if not dbm.is_valid_date(date_val):
+            out.append(RawFlow(skip=f"日期无法解析：{normalize(g('date'))[:20]}"))
+            continue
+
         # 金额三态（expand）/ 宽松-严格两模式
         if tpl.get("expand"):
             raw_amount = str(g("amount") or "").strip().replace("\t", "")
@@ -300,7 +319,8 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
                 out.append(RawFlow(skip=reason))
                 continue
         elif tpl.get("amount_mode") == "lenient":
-            cents = to_cents(g("amount"))
+            # 与 strict 同口径取绝对值：负号是方向冗余（方向由收/支列决定），保留会冲抵统计
+            cents = abs(to_cents(g("amount")))
             reason = tpl.get("skip_zero_reason") or ""
             if reason and cents == 0:
                 out.append(RawFlow(skip=reason))
@@ -322,8 +342,14 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
         for suf in tpl.get("name_strip") or []:
             name = name.replace(suf, "").strip()
 
-        # 备注：占位清理（美团 "/"）后与商户拼接
-        note_val = normalize(cellval(r, note_names[0])) if note_names else ""
+        # 备注：别名链取首个非空（与 getter 同口径，模板文档「值可为别名数组（取首个非空值）」），
+        # 占位清理（美团 "/"）后与商户拼接
+        note_val = ""
+        for nm in note_names:
+            v = normalize(cellval(r, nm))
+            if v:
+                note_val = v
+                break
         for s in tpl.get("note_strip") or []:
             if not note_val.strip(s):
                 note_val = ""
@@ -338,7 +364,7 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
 
         attr = normalize(cellval(r, attribution_col)) if attribution_col else owner
         common = dict(
-            platform=tpl.get("id") or "custom", date=parse_dt(g("date")),
+            platform=tpl.get("id") or "custom", date=date_val,
             merchant=normalize(g("merchant")), name=name, note=note,
             attribution=attr, pay_account=pay, order_no=normalize(g("order")),
         )
@@ -574,9 +600,11 @@ def build_previews(conn: sqlite3.Connection, ledger_id: int, flows: list[RawFlow
                              "name": f.get("name", ""), "amount": 0})
             continue
         h = _row_hash(f["hash_fields"])
+        # 查重键与入库 source 同口径（导出回环「来源」列覆写先于查重），否则带来源列的导出行重导不判重
+        src = f.get("origin_source") or f["platform"]
         p = {"type": f["type"], "amount": f["amount"], "date": f["date"],
              "name": f["name"], "merchant": f.get("merchant", ""), "note": f.get("note", ""),
-             "platform": f["platform"], "source": f["platform"],
+             "platform": f["platform"], "source": src,
              "order_no": f.get("order_no", ""), "row_hash": h,
              "category_id": None, "category_name": "", "parent_category": "",
              "classified_via": "raw", "ai_confidence": None,
@@ -584,14 +612,11 @@ def build_previews(conn: sqlite3.Connection, ledger_id: int, flows: list[RawFlow
              "refund_confidence": None,  # high/low/unmatched，仅 is_refund=True 才有意义
              "duplicate": False, "duplicate_of": None,
              "to_account_id": None, "tags": {}, "ai_meta": {}}
-        dup = existing.get((f["platform"], h))
+        dup = existing.get((src, h))
         if dup:
             p["duplicate"], p["duplicate_of"] = True, dup
             previews.append(p)
             continue
-
-        if f.get("origin_source"):
-            p["source"] = f["origin_source"]
 
         acc_id = _match_account(conn, ledger_id, f.get("platform", ""), f.get("pay_account", ""))
         p["account_id"] = acc_id
@@ -619,7 +644,8 @@ def build_previews(conn: sqlite3.Connection, ledger_id: int, flows: list[RawFlow
     _match_refunds(conn, ledger_id, previews, flows, snap)
     # P2 跨源配对：平台支付行 vs 库中支付渠道流水 → pay_dupe（默认跳过，可恢复）
     _link_payment(conn, ledger_id, previews, snap)
-    # 精确去重）/批内重复 → dup_hint 由前端标「疑似重复」；精确 duplicate 仍自动跳过，互不影响
+    # 疑似重复提示：同额同日（hash 不同）→ dup_hint 由前端标「疑似重复」；
+    # 精确 duplicate（hash 相同）仍自动跳过，两者互不影响
     dbm.dup_hints(conn, ledger_id, [p for p in previews if not p.get("skip")
                                     and not p.get("duplicate") and "amount" in p], rows=snap.rows)
     return previews

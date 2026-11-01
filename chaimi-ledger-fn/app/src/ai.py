@@ -9,6 +9,7 @@ import base64
 import datetime
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
@@ -18,9 +19,11 @@ import applog
 import config
 import db as dbm
 
-# 记账规则版本：随 ai.py 变更升级，启动日志打印，用于核对线上跑的是不是新代码
-RULES_VERSION = "1.1.8"
-applog.get("ai").info(f"booking rules v{RULES_VERSION} loaded")
+_log = applog.get("ai")   # 批处理决策日志：每次兜底的行数/批数/耗时直接可读（日志包排查用）
+
+# 记账规则版本：随 ai.py 变更升级，由 server 启动日志打印（applog.setup 之后），
+# 用于核对线上跑的是不是新代码——模块 import 早于 setup，此处打印只会进 stderr 不落盘
+RULES_VERSION = "1.1.11"
 
 
 _NO_KEY_HINT = ("未配置 LLM Key：请到「设置」页填写 API Key。"
@@ -168,30 +171,30 @@ def list_models_grouped() -> dict:
     if not llm.get("api_key") and not vl_key:
         return {"text": [], "vision": [], "error": "未配置 API Key"}
     errs = []
-    if txt_ids is None:
-        errs.append("文本 API")
+    if not llm.get("api_key"):   # 只配了视觉 Key：文本侧根本没发请求，是「未配置」而非「获取失败」
+        errs.append("文本 API 未配置 Key")
+    elif txt_ids is None:
+        errs.append("文本 API 列表获取失败")
     if vl_url and vl_ids is None:   # 仅独立视觉 API 才单列其失败;共用时归并到文本 API
-        errs.append("视觉独立 API")
+        errs.append("视觉独立 API 列表获取失败")
+    fail = any(e.endswith("获取失败") for e in errs)
     return {"text": text, "vision": vision,
-            "error": "、".join(errs) + " 列表获取失败（Key 无效或服务商不支持 /models）" if errs else ""}
+            "error": "；".join(errs) + ("（Key 无效或服务商不支持 /models）" if fail else "")}
 
 
 def _chat_json(client: OpenAI, prompt: str, system: str = "") -> dict | None:
-    """返回 LLM 响应解析后的 dict；返回 None 表示失败(网络/Key/格式错误统一由上层兜底)
-       抛异常改为返回 None(兼容旧调用,不再静默吞错)。"""
+    """返回 LLM 响应解析后的 dict；失败（网络/Key/超时/LLM 返回非 JSON）统一返回 None，
+    由上层兜底（parse_booking 提示"AI 解析失败"、_batch_llm 丢批）。"""
     try:
         resp = client.chat.completions.create(
             model=config.load()["llm"]["model"],
-            messages=[m for m in ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]],
+            messages=([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}],
             temperature=0,
             response_format={"type": "json_object"},
         )
-        try:
-            return json.loads(resp.choices[0].message.content or "{}")
-        except (json.JSONDecodeError, TypeError):
-            return None   # 响应格式异常——LLM 返回非 JSON
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception:
-        return None   # 网络/Key/超时/服务端错误——parse_booking 统一提示"AI 解析失败"
+        return None
 
 
 def _sse(obj: dict) -> str:
@@ -205,17 +208,24 @@ def sse_stream(events: Iterator[dict]) -> Iterator[str]:
     yield "data: [DONE]\n\n"
 
 
+# 批并发数：批调用纯网络等待（GIL 释放），6 路把大账单兜底耗时除以~6；再高会撞限流
+_BATCH_CONCURRENCY = 6
+
+
 def _batch_llm(client: OpenAI, pending: list, row_fn, prompt_fn) -> Iterator[tuple]:
     """批处理脚手架（分类兜底/名称兜底共用）：50 行/批 → 拼 rows JSON（no=批内序号）
-    → _chat_json → 逐行产出 (行, 模型返回值)。"""
-    for i in range(0, len(pending), 50):
-        chunk = pending[i:i + 50]
-        rows = [{"no": j, **row_fn(p)} for j, p in enumerate(chunk)]
-        out = _chat_json(client, prompt_fn(rows))
-        if not out:
-            continue
-        for j, p in enumerate(chunk):
-            yield p, out.get(str(j))
+    → _chat_json 线程池并发跑批 → 按原批序回放，逐行产出 (行, 模型返回值)。
+    prompt 提交前拼好（worker 只做网络调用，无共享写）；单批失败丢该批不阻断。"""
+    chunks = [pending[i:i + 50] for i in range(0, len(pending), 50)]
+    _log.info(f"AI 批：{len(pending)} 行 / {len(chunks)} 批 × {_BATCH_CONCURRENCY} 并发")
+    prompts = [prompt_fn([{"no": j, **row_fn(p)} for j, p in enumerate(chunk)])
+               for chunk in chunks]
+    with ThreadPoolExecutor(max_workers=_BATCH_CONCURRENCY) as pool:
+        for chunk, out in zip(chunks, pool.map(lambda pr: _chat_json(client, pr), prompts)):
+            if not out:
+                continue
+            for j, p in enumerate(chunk):
+                yield p, out.get(str(j))
 
 
 # ---------- 自然语言记账 ----------
@@ -291,12 +301,7 @@ def _member_roster(conn, ledger_id: int) -> str:
     names += [r["name"] for r in conn.execute(
         "SELECT a.name FROM attributions a WHERE a.ledger_id=? AND a.group_id IS NULL "
         "ORDER BY a.id", (ledger_id,))]
-    seen, out = set(), []
-    for nm in names:
-        if nm not in seen:
-            seen.add(nm)
-            out.append(nm)
-    return "、".join(out)
+    return "、".join(dict.fromkeys(names))   # 去重保序
 
 
 def _resolve_account(ledger_id: int, name) -> int | None:
@@ -329,11 +334,9 @@ def _income_fix(text: str, items: list):
     if len(items) != 1:
         return
     it = items[0]
-    if it.get("type") != "expense":
-        return
-    if not any(c in text for c in _CUE_IN + _CUE_FA):
-        return
-    if "红包" in text and "收到" not in text and "收了" not in text:
+    if (it.get("type") != "expense"
+            or not any(c in text for c in _CUE_IN + _CUE_FA)
+            or ("红包" in text and "收到" not in text and "收了" not in text)):
         return
     it["type"] = "income"
 
@@ -413,8 +416,7 @@ def _kw_fallback_category(it: dict) -> None:
 
 def _booking_items(raw_items, ledger_id: int | None = None, text: str = "") -> list:
     """条目草稿规范化：只保留有金额的 dict，元换算成分（与前端 amount 单位一致）；
-    account 账户名解析成 account_id，解析不到留 None；
-    ：传入原句做礼金人名/时段时刻的规则化收口。"""
+    account 账户名解析成 account_id，解析不到留 None；传入原句做礼金人名/时段时刻的规则化收口。"""
     items = [it for it in (raw_items or []) if isinstance(it, dict) and it.get("amount") is not None]
     for it in items:   # 元 → 分（带单位/货币符号的字符串先清洗："5000元" → 5000）
         try:
@@ -430,7 +432,13 @@ def _booking_items(raw_items, ledger_id: int | None = None, text: str = "") -> l
         # 留给用户在草稿/编辑里补——微信 bot 直连无编辑界面，靠确认后的待确认/编辑弹窗兜底。
         if ledger_id and it["account_id"] is None and not str(it.get("account") or "").strip():
             it["account_id"] = _resolve_account(ledger_id, "现金")
-        _gift_fix(text, it)
+        # 礼金收口仅限单笔句：_gift_fix 按整句判定，多笔句（「小明儿子结婚随了500 午饭15」）
+        # 会把其他笔也改写成人名/事由（与 _income_fix 的多笔守卫同口径）
+        if len(items) == 1:
+            _gift_fix(text, it)
+        # 日期：宽松写法归一 ISO（_time_fix 按 10 位判定，卡片日期框只认 ISO）；认不出/缺省
+        # 按今天——与 App 卡片、bot 确认入库的兜底同口径，同日重复提示（dup_hints）才对得上
+        it["date"] = dbm.iso_date_ok(str(it.get("date") or "")) or datetime.date.today().isoformat()
         _time_fix(text, it)
         _kw_fallback_category(it)
     if items:
@@ -450,20 +458,17 @@ def parse_booking(text: str, ledger_id: int, today: str) -> dict:
     prompt = ("今天是 " + today + "。可用分类：" + cat_list + "。可用账户：" + acc_list + "。" + nl
               + "用户历史记账习惯（备注→分类）：" + nl + few + nl + nl + "用户输入：" + text)
     out = _chat_json(client, prompt, BOOKING_SYSTEM)
-    if not out:
-        return {"error": "AI 解析失败，请稍后重试"}
     # 兼容两种返回：{"items":[...]}（标准）/ 单个对象（LLM 未按格式输出时的兜底）
     raw = out.get("items") if isinstance(out, dict) else None
     if not isinstance(raw, list) or not raw:
         raw = [out] if isinstance(out, dict) and "amount" in out else []
     items = _booking_items(raw, ledger_id, text)
-    if not items:
-        return {"error": "AI 解析失败，请稍后重试"}
-    return {"items": items, "text": text}
+    return {"items": items, "text": text} if items else {"error": "AI 解析失败，请稍后重试"}
 
 
 def resolve_subcategories_batch(previews: list, ledger_id: int | None = None) -> int:
     """AI 兜底分类：对 classified_via=raw 且待确认的行，从一级分类清单里选（50 行/批）。"""
+    t0 = datetime.datetime.now()
     pending = [p for p in previews if not p.get("skip") and not p.get("duplicate")
                and p["type"] != "transfer" and p.get("classified_via") == "raw"
                and p.get("need_confirm")]
@@ -499,8 +504,7 @@ def resolve_subcategories_batch(previews: list, ledger_id: int | None = None) ->
                               + "键必须严格等于各行 no，不要遗漏或新增。")):
             parent = str(item if isinstance(item, str) else (item or {}).get("parent", "")).strip()
             if not (parent and (not names or parent in names)):
-                p["need_confirm"] = True
-                continue
+                continue   # 无效答案整行跳过；行已是待确认态（pending 过滤保证），无需再标
             text = f"{p.get('name','')} {p.get('merchant','')} {p.get('note','')}"
             # 重切「红包礼金」（＜200 的红包/转账红包不应建议人情往来）
             if parent == "人情往来":
@@ -517,6 +521,7 @@ def resolve_subcategories_batch(previews: list, ledger_id: int | None = None) ->
             # 红包礼金带拼手气/群红包字样直接入库，其余小额红包仍待确认
             p["need_confirm"] = (parent == "红包礼金" and dbm.renqing_need_confirm(text))
             n += 1
+    _log.info(f"AI 兜底·分类：{len(pending)} 行命中 {n}，耗时 {(datetime.datetime.now()-t0).total_seconds():.1f}s")
     return n
 
 
@@ -524,6 +529,7 @@ def resolve_names_batch(previews: list) -> int:
     """AI 名称兜底：微信红包/转账行的「商品」列写作 "/"、「微信红包」这类泛化值，
     规则层回填「交易对方」后仍无名称时，让 LLM 从交易类型/对方/备注里提取名称（50 行/批）。"""
     import import_bill as ib
+    t0 = datetime.datetime.now()
     pending = [p for p in previews if not p.get("skip") and not p.get("duplicate")
                and p.get("platform") == "wechat" and ib.is_meaningless_name(p.get("name"))]
     if not pending:
@@ -551,6 +557,7 @@ def resolve_names_batch(previews: list) -> int:
             continue
         p["name"] = nm[:40]
         n += 1
+    _log.info(f"AI 兜底·名称：{len(pending)} 行命中 {n}，耗时 {(datetime.datetime.now()-t0).total_seconds():.1f}s")
     return n
 
 
@@ -742,13 +749,8 @@ def _budget_tool(conn, ledger_id: int, rng: str, month: str,
                           (ledger_id,)).fetchone()["budget"]
     spend = (dbm.stats_summary(conn, ledger_id, month) if rng == "month"
              else dbm.stats_summary_range(conn, ledger_id, dfrom, dto))["net_expense"]
-    if rng == "month":
-        months = 1
-    elif rng == "year":
-        months = 12
-    elif rng == "all":
-        months = 0
-    else:
+    months = {"month": 1, "year": 12, "all": 0}.get(rng)
+    if months is None:   # custom：按区间覆盖的自然月数
         end = datetime.date.fromisoformat(dto) - datetime.timedelta(days=1)   # dto 排他上界
         months = (end.year * 12 + end.month) - (int(dfrom[:4]) * 12 + int(dfrom[5:7])) + 1
     out = {"label": label, "spend": spend, "budget_monthly": budget}
@@ -756,9 +758,9 @@ def _budget_tool(conn, ledger_id: int, rng: str, month: str,
         out["note"] = "未设置月预算（设置页可配置）；spend 为该区间净支出"
         return out
     if months:
-        total = budget * months
+        total = budget * months   # budget/months 均非零（上方已挡），total 恒正
         out.update(budget_total=total, remaining=total - spend,
-                   percent=float(round(spend * 100 / total)) if total else None,
+                   percent=float(round(spend * 100 / total)),
                    note="budget_monthly=月预算，budget_total=月预算×月数；remaining<0 即超支")
     else:
         out["note"] = "「全部」范围不按预算折算（与设置页一致），仅报区间净支出"
@@ -997,8 +999,10 @@ def parse_receipt(path: str) -> dict:
             amount = round(float(str(data.get("amount") or 0).replace(",", "")), 2)
         except ValueError:
             amount = 0.0
+        # 日期归一 ISO；认不出（「11月1日」缺年等）按「识别不出给空」口径给空，由上层兜底
+        d = dbm.iso_date_ok(str(data.get("date") or ""))
         return {"type": "income" if "income" in str(data.get("type") or "") else "expense",
-                "amount": amount, "date": str(data.get("date") or "")[:16],
+                "amount": amount, "date": d[:16] if d else "",
                 "category_name": str(data.get("category_name") or ""),
                 "name": str(data.get("name") or ""),
                 "note": str(data.get("note") or "")}
@@ -1082,9 +1086,8 @@ def chat(query: str, ledger_id: int) -> Iterator[dict]:
     if err and not booked and not text_seen:
         items = fix_local(query)
         if items:
-            # 两行标题:失败原因一行,本地识别一行(微信端各占一行;App 的 HTML 渲染折叠为空格)。
-            # 原因沿用错误事件里的中文提示（无 Key/_zh_error 翻译过的欠费/超时等），
-            # 不再一律写「未配置 LLM Key」——欠费时这句话会误导用户去查 Key
+            # 两行标题（失败原因 + 本地识别说明；微信端两行，App 折叠为空格）。原因沿用
+            # 错误事件的中文提示——欠费时一律写「未配置 Key」会误导用户去查 Key
             title = f"{err_msg}\n本地识别到 {len(items)} 笔，日期为今天，请核对"
             yield {"booking": {"items": items, "text": title}}
 
@@ -1124,8 +1127,8 @@ def fix_local(q: str) -> list:
             ttype = "income"
             if cue in _CUE_FA and "红包" in name:
                 ttype = "expense"          # 发红包=给别人发,支出(与 _TYPE_RULE 同口径)
-            rest = name[len(cue):]
-            if len(rest) >= 2:             # 「发工资8500」→工资 /「收到转账200」→转账;残词太短保留原词
+            rest = name[len(cue):] if name.startswith(cue) else ""
+            if len(rest) >= 2:             # 「发工资8500」→工资；cue 非前缀（「老婆收到转账」）保留原词
                 name = rest
         item = {"type": ttype, "amount": amount, "name": name, "date": today,
                 "category_name": "", "account": "", "account_id": None, "note": ""}

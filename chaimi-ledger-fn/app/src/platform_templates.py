@@ -28,6 +28,15 @@
 """
 from __future__ import annotations
 
+# 「本应用导出」列名单源：server._export_table 表头与 export 模板的 headers/col/hash_fields/
+# attribution_col 全部引用同一份（导出文件须被自家模板命中，tests 有契约断言），改列名只动这里
+EXPORT_COLUMNS = {
+    "date": "交易时间", "name": "交易名称", "amount": "交易金额", "flow": "流水类型",
+    "type": "支出类型/收入类型", "pay": "支付账户", "pay_legacy": "支付方式/收款方式",
+    "to_account": "收款账户", "attribution": "流水归属", "note": "备注", "order": "订单号",
+    "origin_source": "来源", "export_id": "流水ID", "export_ref": "退款关联",
+}
+
 # 微信「商品」列的泛化值：不参与名称匹配（红包/转账行普遍如此），回退到「交易对方」
 WX_GENERIC_NAMES = frozenset({
     "微信红包", "微信红包（单发）", "微信红包（群红包）", "群红包", "红包",
@@ -88,18 +97,24 @@ PLATFORM_TEMPLATES = [
     },
     {
         "id": "export", "name": "本应用导出",
-        # 两代导出格式的列交集（旧代用「支付方式/收款方式」合并列，由 col 别名兼容）
-        "headers": ["交易时间", "交易名称", "交易金额", "流水类型"],
-        "col": {"date": "交易时间", "name": "交易名称", "amount": "交易金额",
-                "flow": "流水类型", "type": "支出类型/收入类型",
-                "pay": ["支付账户", "支付方式/收款方式"],
-                "to_account_name": "收款账户", "order": "订单号", "note": "备注",
-                "origin_source": "来源", "export_id": "流水ID", "export_ref": "退款关联"},
+        # 两代导出格式的列交集（旧代用「支付方式/收款方式」合并列，由 col 别名兼容）；
+        # 列名引用上方 EXPORT_COLUMNS 单源
+        "headers": [EXPORT_COLUMNS["date"], EXPORT_COLUMNS["name"],
+                    EXPORT_COLUMNS["amount"], EXPORT_COLUMNS["flow"]],
+        "col": {"date": EXPORT_COLUMNS["date"], "name": EXPORT_COLUMNS["name"],
+                "amount": EXPORT_COLUMNS["amount"], "flow": EXPORT_COLUMNS["flow"],
+                "type": EXPORT_COLUMNS["type"],
+                "pay": [EXPORT_COLUMNS["pay"], EXPORT_COLUMNS["pay_legacy"]],
+                "to_account_name": EXPORT_COLUMNS["to_account"], "order": EXPORT_COLUMNS["order"],
+                "note": EXPORT_COLUMNS["note"],
+                "origin_source": EXPORT_COLUMNS["origin_source"],
+                "export_id": EXPORT_COLUMNS["export_id"], "export_ref": EXPORT_COLUMNS["export_ref"]},
         "flow_map": {"收入": "income", "支出": "expense"},
-        "hash_fields": ["交易时间", "交易名称", "交易金额", "支出类型/收入类型", "备注"],
+        "hash_fields": [EXPORT_COLUMNS["date"], EXPORT_COLUMNS["name"], EXPORT_COLUMNS["amount"],
+                        EXPORT_COLUMNS["type"], EXPORT_COLUMNS["note"]],
         "two_pass": True,
         "pay_split": " & ",
-        "attribution_col": "流水归属",
+        "attribution_col": EXPORT_COLUMNS["attribution"],
         "amount_mode": "lenient",
     },
     {
