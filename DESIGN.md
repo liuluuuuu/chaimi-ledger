@@ -2,7 +2,7 @@
 
 > 飞牛 NAS（fnOS）原生家庭记账应用。多账本分账 + 账单导入 + 统计看板 + AI 记账 + 微信机器人，数据全在本机 SQLite。
 >
-> 状态：**v1.0.5（2026-11-01）**。本文描述当前实现。
+> 状态：**v1.0.6（2026-11-02）**。本文描述当前实现。
 
 ***
 
@@ -27,14 +27,14 @@
 | platform_templates.py | 内置平台模板声明数据（支付宝/微信/京东/导出/美团，随应用发版） |
 | import_classify.py | 分类瀑布：词典/映射/同名/兜底 + 人情二切与复核 + 自愈（1.0.1 起确认制：/api/repair 预览+应用，不随解析自动改库） |
 | import_match.py | 账本快照、退款匹配链、跨源/手动配对 |
-| import_apply.py | 入库四阶段（增强/批次/插入+learn+批内回填/rescan）与整批撤销 |
+| import_apply.py | 入库五阶段（增强/批次/插入+批内回填/归属名单播种/rescan）与整批撤销 |
 | import_common.py | 导入链路叶子工具（normalize/去重谓词/占位名判定） |
 | ai.py | AI 记账：自然语言/小票/月报/对话 + edit_round 编辑回合 |
-| backup.py | SQLite 文件备份 + 配置副本 |
+| backup.py | SQLite backup API 备份（db 副本 + 配置副本 + 小票包）+ 月备/年备分层自动备份 |
 | bot_core.py | 机器人大脑：白名单、指令路由、草稿会话、回复格式化（通道无关） |
 | bot_ilink.py | 通道 A：iLink 客户端（QR 登录、长轮询、收发、媒体下载解密） |
 
-前端（app/static/）：app.html 主界面 + home.html 登录/选用户页 + core/ledger/stats/settings/ai/import .js 分页逻辑。
+前端（app/static/）：app.html 主界面 + home.html 登录/选用户页 + core/ledger/stats/settings/ai/import .js 分页逻辑 + theme.js（明暗主题三态，ESM，两页共用）。
 
 ***
 
@@ -59,7 +59,7 @@
 - `<base href="/app/chaimi-ledger/">` 注入
 - SSE 流内 15s 心跳注释行保活
 
-**多端实时刷新（长轮询）**：`GET /api/rev/wait?since=N&hold=25` 挂住最多 25s（服务端钳制 1~30s），数据版本 rev 偏离立即返回；前端返回后 300ms 续下一条、出错 2s 退避、单请求 35s 强制 abort 防半开连接；页面回前台（focus/visibilitychange/pageshow）掐掉挂起请求并主动刷一次。任意端记账或改账本级设置，其他端 1s 内刷新。写库侧统一 `_bump_rev`：交易增/改/删、待确认转正、导入应用/撤销、bot 写库、账本级设置（分类/映射/账户/归属分组/预算）写入全部同源；前端唤醒后统一重拉流水/统计与全局下拉数据源（记一笔分类/编辑弹窗账户/顶栏用户），停在设置页时各表同步重画。预算与账本名/币种改动另推 lrev 换血各端账本缓存（预算展示读该缓存）。请求带 `?cv=版本信标`（build 时烘焙 `static/version.txt`，页面注入 `window.CHAIMI_VER`），日志可分辨各客户端前端版本。
+**多端实时刷新（长轮询）**：`GET /api/rev/wait?since=N&hold=25` 挂住最多 25s（服务端钳制 1~30s），数据版本 rev 偏离立即返回；前端返回后 300ms 续下一条、出错 2s 退避、单请求 35s 强制 abort 防半开连接；页面回前台（focus/visibilitychange/pageshow）掐掉挂起请求并主动刷一次。任意端记账或改账本级设置，其他端 1s 内刷新。写库侧统一 `_bump_rev`：交易增/改/删、待确认转正、导入应用/撤销、bot 写库、账本级设置（分类/映射/账户/归属分组/预算）写入全部同源；前端唤醒后统一重拉流水/统计与全局下拉数据源（记一笔分类/编辑弹窗账户/顶栏用户），停在设置页时各表同步重画。预算与账本名/币种改动另推 lrev 换血各端账本缓存（预算展示读该缓存）。请求带 `?cv=版本信标`（build 时烘焙 `static/version.txt`，页面注入 `window.CHAIMI_VER` 与 `window.CHAIMI_MAX_MB` 上传上限——前端 MAX_UPLOAD_B 由注入单源派生），日志可分辨各客户端前端版本。
 
 **SSE 仅用于 AI 流式**（对话/月报）：ai 内部为结构化事件流（生成器产 dict，HTTP 边界 `sse_stream` 统一序列化），bot 通道直接消费同一生成器，不二次解析文本。
 
@@ -95,7 +95,7 @@ chaimi-ledger/
 - **金额一律 INTEGER 存分**（浮点累计会漂移），前端/导入层换算，展示时 ÷100
 - **账户余额不增量维护**：`余额 = initial_balance + Σincome − Σexpense + Σtransfer收 − Σtransfer付`，查询时实时算（撤销导入/删行/退款不需要同步余额）
 - **退款不变式**：凡 `refund_for` 非空的行必为 transfer（只进原消费扣减、不计收支）；原消费行恒为 expense
-- **映射表 v6 架构**：target 为 category_id 外键（悬空映射结构上不可能），全局层取消、默认映射按账本种入（`seed_default_mappings`，数据源 `db.DEFAULT_MAPPINGS`）；分类改名/删除由外键联动；learned=1 的学习映射在整批撤销时级联清理
+- **映射表 v6 架构**：target 为 category_id 外键（悬空映射结构上不可能），全局层取消、默认映射按账本种入（`seed_default_mappings`，数据源 `db.DEFAULT_MAPPINGS`）；分类改名/删除由外键联动；学习映射自 1.0.2 起不再产生（存量 learned 行属历史遗留，映射页可见、修复区可重置，整批撤销不再连带清理）
 - **单账本单币种**：币种是账本属性（`ledgers.currency`），导入校验不一致整批拒绝
 
 **索引与连接**
@@ -107,9 +107,9 @@ idx_tx_order / idx_tx_batch / idx_tx_refund -- 退款匹配 / 整批撤销 / 反
 PRAGMA journal_mode=WAL; busy_timeout=5000; foreign_keys=ON;
 ```
 
-**迁移**：`PRAGMA user_version` 记录版本，启动按序执行（只增不删列）；对已发布表加列走 `_ensure_column`（PRAGMA table_info 查缺 → 幂等 ALTER），老库升级/新库建表共用同一路径。
+**迁移**：`app_meta` 键值表打标的一次性迁移（`db._migrate`，启动按序执行未跑过的迁移并打标；恢复旧版备份自动重跑补齐），只增不删列；对已发布表加列走 `_ensure_column`（PRAGMA table_info 查缺 → 幂等 ALTER），老库升级/新库建表共用同一路径。
 
-**多用户与账本 ACL（v1.0.4，方案详见 MULTIUSER-PLAN.md）**：单库不拆文件，隔离靠账本级授权——飞牛统一网关注入 `X-Trim-Userid/Username/Isadmin` 请求头（应用只监听网关 UDS + 本地开发入口，头不可被外部伪造），中间件解析为请求级 ContextVar；访问判定收敛在 `_ledger_access`（owner 或 `ledger_members` 成员放行，系统上下文=机器人/本地开发全放行），所有按资源 id 操作的端点先经 `_row_ledger` 反查所属账本再判定。无头请求/无主账本的兜底：升级后首个 admin 打开应用认领全部 `owner_uid IS NULL` 的账本；`known_users` 由 `/api/whoami` 落档（fnOS 无用户列表 API，共享选人器数据源）。应用级操作（配置写/备份恢复/扫码总开关）走 `_admin_or_403`；账本级设置（分类/映射/账户/归属分组/预算）owner 与共享成员均可写，账本名/币种/删除/共享管理仅 owner（预算为独立端点 `PUT /api/ledgers/{id}/budget`）。小票图 `GET /receipts/{name}` 与手动裁剪 `POST /api/receipts/crop` 走 `_receipt_ledger_gate`（v1.0.6）：按 basename 反查引用流水的账本后同口径判权；未被流水引用的在途图（App 先预览后确认、机器人草稿期）放行——随机文件名 + 24h 兜底清理兜底。
+**多用户与账本 ACL（v1.0.4，方案详见 MULTIUSER-PLAN.md）**：单库不拆文件，隔离靠账本级授权——飞牛统一网关注入 `X-Trim-Userid/Username/Isadmin` 请求头（应用只监听网关 UDS + 本地开发入口，头不可被外部伪造），中间件解析为请求级 ContextVar；访问判定收敛在 `_ledger_access`（owner 或 `ledger_members` 成员放行，系统上下文=机器人/本地开发全放行），所有按资源 id 操作的端点先经 `_row_ledger` 反查所属账本再判定。无头请求/无主账本的兜底：admin 打开应用时认领全部 `owner_uid IS NULL` 的账本——认领是否完成每次问库（`_admin_claim_done` 查有无无主行，进程不缓存状态，恢复多用户化之前的旧备份后自动重开认领）；`known_users` 由 `/api/whoami` 落档（fnOS 无用户列表 API，共享选人器数据源）。应用级操作（配置写/备份恢复/扫码总开关）走 `_admin_or_403`；账本级设置（分类/映射/账户/归属分组/预算）owner 与共享成员均可写，账本名/币种/删除/共享管理仅 owner（预算为独立端点 `PUT /api/ledgers/{id}/budget`）。小票图 `GET /receipts/{name}` 与手动裁剪 `POST /api/receipts/crop` 走 `_receipt_ledger_gate`（v1.0.6）：按 basename 反查引用流水的账本后同口径判权；未被流水引用的在途图（App 先预览后确认、机器人草稿期）放行——随机文件名 + 24h 兜底清理兜底。
 
 ***
 
@@ -124,10 +124,13 @@ PRAGMA journal_mode=WAL; busy_timeout=5000; foreign_keys=ON;
 共享     GET/PUT/DELETE /api/ledgers/{id}/members（仅 owner；只授权不动账本数据，不自动建记账用户）
 流水     GET /api/transactions?ledger=&from=&to=&type=&category=&page=…
          POST/PUT/DELETE /api/transactions[/{id}]   （PUT 支持 refund_for 关联/取消）
-待确认   GET /api/pending?ledger=&kind=     POST /api/pending/{tx_id}/resolve
+待确认   GET /api/transactions?need_confirm=1（列表徽标/筛选共用流水接口）
+         POST /api/pending/{tx_id}/resolve   （改分类/账户/退款关联 + 转正）
 分类/账户/映射  常规 CRUD（/api/categories /api/accounts /api/mappings，均带 ledger=；共享成员可写，改动经 rev 长轮询同步各端）
-统计     /api/stats/{calendar|summary|category|trend|monthly|attribution}
-导入     POST /api/import/parse（预览不入库）  POST /api/import/confirm（入库+learn 回写）
+统计     /api/stats/{calendar|summary|category|trend|monthly|yearly|attribution|renqing}
+         另有 range 系列（?from=&to= 自定义区间：summary/category/attribution）；month/year
+         参数统一校验非法 400（格式裁判单源 db.month_range）
+导入     POST /api/import/parse（预览不入库）  POST /api/import/confirm（单事务入库+归属名单播种）
          GET /api/import/batches   DELETE /api/import/batches/{id}（整批撤销）
 导出     GET /api/export?format=json|csv      导出 xlsx 含流水/归属统计 sheet
 备份     POST /api/backup  GET /api/backups  POST /api/restore
@@ -189,7 +192,8 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 ```
 上传 → parse_bill 解析(不入库) → 预览页（分类依据悬浮 / duplicate 灰显 / 跨源与手动重复置顶可恢复
      / 疑似重复提示 / 全重复时提示先撤销原批次）
-     → 用户确认（改分类才回写学习映射）→ apply_import 四阶段（增强回填→批次→插入+learn+批内退款回填→rescan）
+     → 用户确认 → apply_import 五阶段（增强回填→批次→插入+批内退款回填→归属名单播种→rescan，
+       单事务原子提交；用户预览中手改分类打 manual_cat 标，不回写映射表）
      → 低置信项照常入库打标，事后在「待确认」队列处理；支持整批撤销
 ```
 
@@ -203,7 +207,7 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 
 **上传安全**：20MB 上限、扩展名白名单、xlsx 魔数校验、5 万行熔断、临时文件即用即删。
 
-**导出回环**：导出 14 列（转账双账户、订单号、流水ID、退款关联），再导入零待确认零重复，退款关联/双账户/归属无损还原（两代列名由列别名兼容）。
+**导出回环**：导出 15 列（转账双账户、订单号、流水ID、退款关联、币种），再导入零待确认零重复，退款关联/双账户/归属无损还原（两代列名由列别名兼容）。
 
 > 模板字段规范与各平台声明以代码为准：`platform_templates.py`、`import_bill.py`（引擎+原语）、`db.DEFAULT_MAPPINGS`。
 
@@ -273,7 +277,7 @@ AI       GET /api/ai/chat（SSE 对话：记账出草稿/查账回统计）  POS
 **对话式草稿**：不落库，全程对话修订，「确认」才批量入库（need_confirm=0, source='bot'）；内存态 TTL 30 分钟，超时/重启即失，丢弃零残留。会话状态 per-user。
 
 **编辑回合**（`ai.edit_round`，草稿与流水列表共用）：输出结构化意图——
-`target=draft,action=revise`（改草稿，复用 `_booking_items` 规范化）/ `target=tx,update`（改已入库流水，patch 字段解析后走 `_update_tx`，与 `PUT /api/transactions` 同一条路）/ `target=tx,delete`（两步确认）/ `target=new`（新记账替换会话）/ `target=none`（与编辑无关，走 ai.chat，草稿保留）。
+`target=draft,action=revise`（改草稿，复用 `_booking_items` 规范化）/ `target=tx,update`（改已入库流水，patch 字段解析后走 `db.patch_tx` 字段级部分更新，与 `PUT /api/transactions` 同口径）/ `target=tx,delete`（两步确认）/ `target=new`（新记账替换会话）/ `target=none`（与编辑无关，走 ai.chat，草稿保留）。
 
 **查询渲染**：明细行「▪ 日期 名称 符号金额」三要素，首屏最多 10 笔（LIST_MAX），「更多」列全部上限 30（防刷屏）；「XX明细」分类下钻本地路由（精确→包含对齐一级），`matched=false` 不编造明细；修改回执明示改前→改后。
 
@@ -323,12 +327,13 @@ chaimi_mcp.py、技能包）整体移除：网关客户端只连一个 MCP，且
 
 ```
 build.bat：读 manifest 版本 → 烘焙 static/version.txt → py_compile 自检 → 单元测试全绿
-          → 清理 app/data 开发残留 → fnpack 打包 → chaimi-ledger.<版本>.fpk
+          → 清理 app/data 开发残留 → src/chaimi.conf（本地开发配置回落）打包期间移开
+          → fnpack 打包 → chaimi-ledger.<版本>.fpk（打包后 conf 原样恢复，杜绝误分发）
 NAS 安装：install_init ─▶ pip --target ${PKGVAR}/site-packages（清华/阿里源兜底）
 cmd/main：系统 python3 + PYTHONPATH=site-packages 直跑；启动时依赖双保险补装
 ```
 
-**备份哲学**：SQLite 开 WAL 后直接拷 .db 会得到不一致快照，必须用 `sqlite3.Connection.backup()` 或 `VACUUM INTO`（backup.py 实现）；备份 = db 副本 + chaimi.conf 副本，建议每日一次、保留 7 日；恢复 = 停写 → 覆盖 → `PRAGMA integrity_check` → 重启。小票图片存 `${TRIM_PKGVAR}/receipts/`，库内只存相对路径。
+**备份哲学**：SQLite 开 WAL 后直接拷 .db 会得到不一致快照，必须用 `sqlite3.Connection.backup()`（backup.py 实现）；备份 = db 副本 + chaimi.conf 副本 + 小票 zip 包。自动备份分层：月末（12-31 除外）生成月备 `chaimi-ledger-YYYYMM.db`，12-31 优先生成年备（年备保留关闭时月备兜底），保留按 keep_months/keep_years 清理，只清周期文件不动手动备份；失败次分钟自动重试。恢复走 backup API **原地写回同一 db 文件**（旧连接立即可见，无临时文件替换的 inode/句柄问题）+ `integrity_check` 前置校验 + conf 原子写 + 直连轮询按备份配置差量对齐。小票图片存 `${TRIM_PKGVAR}/receipts/`，库内只存相对路径。
 
 ***
 
@@ -343,6 +348,7 @@ cmd/main：系统 python3 + PYTHONPATH=site-packages 直跑；启动时依赖双
 7. **导入上传安全**：大小/白名单/魔数/行数四重校验，防伪装与解压炸弹
 8. **身份复用飞牛账号**：无自建账号体系——网关注入头即身份，账本级 ACL 隔离（v1.0.4 多用户）；「用户」（归属分组）是账本内的记账人维度
 9. **官方应用同款布局（v1.0.6）**：桌面端按官方截图逐像素校准的三层几何——`--win` 窗口灰（浅 #F3F3F3 / 暗 #0C0C0D）统一侧栏与窗口底色，菜单贴窗口边缘不吃圆角；主内容区收进 1px `--border` 描边 + `--radius-panel`（16px）圆角卡片（上/右/下 10px、左缘贴菜单），面板底 `--panel`（浅白 / 暗 #1F2021，卡片/顶栏/筛选/翻页条共用）；fixed 的顶栏/翻页条不受卡片圆角裁切，自带重合描边圆角补偿，钉顶筛选区让位、AI hero 高度同口径扣除；暗色 `--card` 提亮至 #26272B 保住卡片层次（官方「窗口→面板→卡片」逐级提亮梯度）；手机端全屏不套卡片（抽屉/钉顶条按视口定位零改动）
+10. **主题三态跟随宿主（v1.0.6）**：浅色/深色/自动三态循环（默认自动、全端记忆），主题逻辑独立 `static/theme.js`（ESM，app/home 两页共用，全事件驱动无定时器）。自动模式优先跟随飞牛宿主——官方 JS SDK `@trimjs/web-app`（内嵌 trim-sdk.js，manifest 声明 `micro_app=true`，需系统 ≥1.2.0401）：桌面 iframe 订阅 `$on('os/theme')` 实时事件，安卓/iOS App 载入读取 + 回前台/系统偏好变化时重读；无桥环境（鸿蒙 ArkWeb/独立浏览器/旧系统）回落浏览器 `prefers-color-scheme`。各页 `<body>` 起始内联脚本按上次解析明暗首帧前落地（刷新/跳登录页不闪色）；明暗实际翻转才重建统计图表（dropCharts），配色单源 themeColors
 
 ***
 
