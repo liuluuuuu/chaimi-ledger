@@ -36,10 +36,10 @@ async function loadTx(){
     if(!txRecentDefault && appScope() !== "all"){
       const r = statRange || curStatRange();
       q.set("from", r.from);
-      // 自定义区间末端含当天（后端膨胀 23:59:59）；月/年的 to 为下一周期排他界，走 to_exclusive=1
-      //（旧版补 " 00:00:00" 会把 10 位纯日期的边界日手工流水多算进来）
+      // 月/年的 to 为下一周期排他界，走 to_exclusive=1；自定义区间末端含当天
+      //（后端膨胀 23:59:59）。旧版补 " 00:00:00" 会把 10 位纯日期的边界日手工流水多算进来
       q.set("to", r.to);
-      if(appScope() !== "custom") q.set("to_exclusive", "1");
+      if(r.toExclusive) q.set("to_exclusive", "1");
     }
   }
   let r = await api("/api/transactions?"+q);

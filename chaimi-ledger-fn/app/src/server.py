@@ -221,9 +221,11 @@ def _page(name: str) -> HTMLResponse:
     text = (_STATIC / name).read_text(encoding="utf-8")
     base = f'<base href="{PREFIX}/">'
     v = _app_version()
-    # 版本号注入:前端在长轮询请求上带 cv 信标,日志一眼可见各客户端跑的哪个版本
+    # 版本号与上传上限注入:版本供前端 cv 信标(日志一眼可见各客户端跑的哪个版本)与
+    # ?v= 缓存换血;上限供前端上传预检(core.js MAX_UPLOAD_B 单源派生,不再手抄同值)
     text = text.replace("<head>",
-                        f'<head><script>window.CHAIMI_VER="{v}"</script>' + base, 1)
+                        f'<head><script>window.CHAIMI_VER="{v}";'
+                        f'window.CHAIMI_MAX_MB={MAX_UPLOAD // 1048576}</script>' + base, 1)
     # 静态引用一律带 ?v=版本:版本一变 URL 即变,任何缓存层(浏览器/fnOS 网关)必取新文件。
     # 单靠 no-cache 不够——网关可能按扩展名缓存 .js,升级后出现"新 HTML 引用旧 JS"
     # (曾出现新 HTML 引用旧 JS 导致按钮无反应),HTML 里的引用链必须随版本整体换血
@@ -430,22 +432,30 @@ def whoami():
     return {"uid": u["uid"], "username": u["username"], "isadmin": u["isadmin"]}
 
 # 落档节流（进程内）：同一用户身份 5 分钟内重复打开不再写库（GET / + whoami 每次整页
-# 加载各落一次档，多标签/高频刷新即是写放大；admin 认领每进程只执行一次）
+# 加载各落一次档，多标签/高频刷新即是写放大）；admin 认领是否还有活干直接问库，不缓存
 _TOUCH_THROTTLE_S = 300
 _touch_state: dict = {}          # uid -> (username, isadmin, 上次写库 time.time())
-_admin_claimed = False
+
+def _admin_claim_done() -> bool:
+    """无主账本是否已认领完毕——真相只在库里，进程不缓存：恢复多用户化之前的旧备份
+    后天然重开认领，不存在需要复位的进程状态。查询失败按未完成处理，下一轮重试。"""
+    try:
+        return not conn().execute(
+            "SELECT 1 FROM ledgers WHERE owner_uid IS NULL LIMIT 1").fetchone()
+    except Exception:
+        return False
 
 def _touch_fn_user(u: dict) -> None:
     """打开应用落档（whoami 与入口 / 共用）：known_users UPSERT（共享选人器数据源，
-    fnOS 无用户列表 API）；admin 打开时把升级前的无主账本一次性归属自己
-    （MULTIUSER-PLAN §3.5 定案：旧数据固定给 admin）。
-    落档失败（如 DB 被长写事务锁住）静默放行：入口判定不因此 500，下次打开再落。"""
-    global _admin_claimed
+    fnOS 无用户列表 API）；admin 打开时把升级前的无主账本归属自己（MULTIUSER-PLAN
+    §3.5 定案：旧数据固定给 admin）。认领是否还有活干每次问库（_admin_claim_done），
+    恢复旧备份后自动重开。落档失败（如 DB 被长写事务锁住）静默放行：入口判定不因此
+    500，下次打开再落。"""
     ts = time.time()
     prev = _touch_state.get(u["uid"])
     unchanged = (prev and prev[0] == u["username"] and prev[1] == bool(u["isadmin"])
                  and ts - prev[2] < _TOUCH_THROTTLE_S)
-    if unchanged and (_admin_claimed or not u["isadmin"]):
+    if unchanged and (not u["isadmin"] or _admin_claim_done()):
         return
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -456,12 +466,13 @@ def _touch_fn_user(u: dict) -> None:
                     "ON CONFLICT(uid) DO UPDATE SET username=excluded.username, "
                     "isadmin=excluded.isadmin, last_seen=excluded.last_seen",
                     (u["uid"], u["username"], 1 if u["isadmin"] else 0, now, now))
-            if u["isadmin"] and not _admin_claimed:
+            # 仍有无主账本才发 UPDATE（常态 0 行零写放大）；完成与否不打标——下次问库
+            if u["isadmin"] and c.execute(
+                    "SELECT 1 FROM ledgers WHERE owner_uid IS NULL LIMIT 1").fetchone():
                 n = c.execute("UPDATE ledgers SET owner_uid=? WHERE owner_uid IS NULL",
                               (u["uid"],)).rowcount
                 if n:
                     log.info(f"多用户迁移：{n} 个无主账本归属 admin「{u['username']}」(uid={u['uid']})")
-                _admin_claimed = True   # 0 行也算完成：无主账本只在升级后首开出现
         _touch_state[u["uid"]] = (u["username"], bool(u["isadmin"]), ts)
     except Exception:
         pass
@@ -1054,19 +1065,6 @@ def delete_transaction(tid: int):
 
 # ---------- 待确认队列 ----------
 
-@app.get("/api/pending")
-def pending(ledger: int, kind: str = ""):
-    _ledger_access(ledger)
-    sql = ("SELECT t.*, c.name AS category_name, " + _ATTR_DISPLAY + " "
-           "FROM transactions t "
-           "LEFT JOIN categories c ON t.category_id=c.id "
-           + _ATTR_RESOLVE +
-           "WHERE t.ledger_id=? AND t.need_confirm=1")
-    args = [ledger]
-    if kind == "refund":
-        sql += " AND t.refund_for IS NULL AND t.type='transfer' AND t.tags LIKE '%退款%'"
-    return [dbm.tx_to_dict(r) for r in conn().execute(sql + " ORDER BY t.date DESC", args)]
-
 class ResolveIn(BaseModel):
     category_id: Optional[int] = None
     account_id: Optional[int] = None
@@ -1096,19 +1094,30 @@ def resolve_pending(tid: int, body: ResolveIn):
 
 # ---------- 统计 ----------
 
+def _month_ok(month: str) -> None:
+    """month 参数校验（summary/calendar/category 三端点共用）：格式裁判在
+    db.month_range 单点实现，这里只把 ValueError 翻译成 400（不再各写一份正则）。"""
+    try:
+        dbm.month_range(month)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @app.get("/api/stats/summary")
 def stats_summary(ledger: int, month: str):
     _ledger_access(ledger)
+    _month_ok(month)
     return dbm.stats_summary(conn(), ledger, month)
 
 @app.get("/api/stats/calendar")
 def stats_calendar(ledger: int, month: str):
     _ledger_access(ledger)
+    _month_ok(month)
     return dbm.stats_calendar(conn(), ledger, month)
 
 @app.get("/api/stats/category")
 def stats_category(ledger: int, month: str, type: str = "expense"):
     _ledger_access(ledger)
+    _month_ok(month)
     return dbm.stats_category(conn(), ledger, month, type)
 
 @app.get("/api/stats/monthly")
@@ -1237,16 +1246,10 @@ class ConfirmIn(BaseModel):
 
 @app.post("/api/import/confirm")
 def import_confirm(ledger: int, body: ConfirmIn):
+    """确认导入：单事务见 ib.apply_import（入库 + 归属名单播种原子提交）。"""
     _ledger_access(ledger)
     batch_id = ib.apply_import(conn(), ledger, body.previews, body.filename, body.source)
     n = conn().execute("SELECT count FROM import_batches WHERE id=?", (batch_id,)).fetchone()[0]
-    with conn() as c:
-        group_names = {r["name"] for r in c.execute(
-            "SELECT name FROM attribution_groups WHERE ledger_id=?", (ledger,))}
-        for p in body.previews:
-            attr = ((p.get("tags") or {}).get("attribution") or "").strip()
-            if attr and attr not in group_names:
-                c.execute("INSERT OR IGNORE INTO attributions(ledger_id, name) VALUES(?,?)", (ledger, attr))
     _bump_rev()
     return {"batch_id": batch_id, "imported": n}
 
@@ -1587,6 +1590,8 @@ def do_restore(body: dict):
     _admin_or_403()   # 恢复整库影响所有用户
     _backup_call(backup.restore_backup, body.get("file", ""))
     dbm.init_db()
+    # 恢复旧备份后无主账本认领自动重开：认领完成与否每次问库（_admin_claim_done），
+    # 无进程状态需要复位
     # chaimi.conf 随备份回滚：直连轮询线程必须按新模式差量对齐，否则旧监听残留
     _bot_apply()
     _bump_rev()    # 整库被替换：各端全量刷新（数据 + 账本列表）
@@ -1799,6 +1804,7 @@ def _sse(gen) -> StreamingResponse:
 @app.get("/api/ai/analyze")
 def ai_analyze(ledger: int, month: str):
     _ledger_access(ledger)
+    _month_ok(month)   # 坏月份若漏进生成器，SSE 会在流中途炸连接（比 500 更难排查）
     return _sse(ai.monthly_analysis(ledger, month))
 
 @app.get("/api/ai/chat")
@@ -1812,8 +1818,9 @@ def _receipt_ledger_gate(name: str) -> None:
     """小票文件级 ACL（get_receipt/crop_receipt 共用）：被流水引用即按所属账本
     收口（与 _ledger_access 同口径）。比对按 basename——库内 receipt_path 有
     裸名 / receipts/名 两种形态（bot 入库前已归一，见 bot_core 草稿构造），
-    basename 口径顺带防住异常路径数据。未被引用的在途图不拦（App 先预览后
-    确认、机器人草稿期）：随机文件名 + 24h 兜底清理已足够。"""
+    basename 口径顺带防住绝对路径等异常数据（test_multiuser 有防御用例锁定）。
+    未被引用的在途图不拦（App 先预览后确认、机器人草稿期）：随机文件名 +
+    24h 兜底清理已足够。"""
     uid = _uid()
     if uid is None:
         return
@@ -1843,15 +1850,20 @@ def crop_receipt(path: str = Query(...), body: dict = None):
     name = Path(path or "").name
     if not name:
         raise HTTPException(400, "无效路径")   # Path("..").name == "" 已拦截穿越
+    body = body or {}
+    def _coord(key: str) -> int:
+        try:
+            return int(body.get(key) or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"裁剪参数 {key} 必须是数字")
+    x, y = max(0, _coord("x")), max(0, _coord("y"))
+    w, h = _coord("w"), _coord("h")
+    if w < 10 or h < 10:
+        raise HTTPException(400, "裁剪区域太小")
     _receipt_ledger_gate(name)
     p = config.receipts_dir() / name
     if not p.is_file():
         raise HTTPException(404, "小票不存在")
-    body = body or {}
-    x, y = max(0, int(body.get("x") or 0)), max(0, int(body.get("y") or 0))
-    w, h = int(body.get("w") or 0), int(body.get("h") or 0)
-    if w < 10 or h < 10:
-        raise HTTPException(400, "裁剪区域太小")
     try:
         from PIL import Image
         img = Image.open(p)

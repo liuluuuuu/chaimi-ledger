@@ -149,16 +149,20 @@ function onTimeChange(){
 }
 function curStatRange(){
   const sc = appScope();
-  if(sc === "all") return {from:"2000-01-01", to:"2100-01-01", label:"全部"};
-  if(sc === "custom") return {from:dtGet($("#sc_from"))||"2000-01-01", to:dtGet($("#sc_to"))||"2100-01-01", label:"自定义区间"};
+  // toExclusive：to 是否为排他上界（下一周期首日/远期末日）。仅自定义区间的 to 是
+  // 含当天的裸截止日——位在构造时落定，消费方（rangeDto/rangeExcl/loadTx/accScopeInfo）
+  // 只读该位，不再各自读全局 scope 猜语义
+  const xe = sc !== "custom";
+  if(sc === "all") return {from:"2000-01-01", to:"2100-01-01", label:"全部", toExclusive:xe};
+  if(sc === "custom") return {from:dtGet($("#sc_from"))||"2000-01-01", to:dtGet($("#sc_to"))||"2100-01-01", label:"自定义区间", toExclusive:xe};
   if(sc === "year"){
     const y = dtGet($("#yearSel")) || new Date().getFullYear();
-    return {from:`${y}-01-01`, to:`${+y+1}-01-01`, label:`${y}年`};
+    return {from:`${y}-01-01`, to:`${+y+1}-01-01`, label:`${y}年`, toExclusive:xe};
   }
   const m = dtGet($("#monthSel")) || thisMonth();
   const y = m.slice(0,4);
   const to = nextMonthFirst(m);
-  return {from:`${y}-${m.slice(5,7)}-01`, to, label:m};
+  return {from:`${y}-${m.slice(5,7)}-01`, to, label:m, toExclusive:xe};
 }
 function gotoMonth(ymd){
   dtSet($("#monthSel"), ymd.slice(0,7));
@@ -168,14 +172,13 @@ const _fmtAmt = () => window.matchMedia("(max-width:640px)").matches ? fmtI : fm
 const _ymd = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
 /* 'YYYY-MM' → 下月首日（跨年 +1），月边界三处共用 */
 const nextMonthFirst = ym => { const y=+ym.slice(0,4), m=+ym.slice(5,7); return m===12 ? `${y+1}-01-01` : `${y}-${pad2(m+1)}-01`; };
-/* 统计请求的 to 参数（汇总条/统计页/归属三处共用）：仅自定义区间的 to 是含当天的结束日
-   （补 23:59:59，后端按 date< 排他）；月/年/全部的 to 已是下一周期排他界，原样传递 */
-const rangeDto = r => appScope() === "custom" ? r.to + " 23:59:59" : r.to;
-/* 区间「to 是否排他上界」判定（汇总条/蝴蝶图/分类日历下钻共用）：仅自定义区间的 to 是含当天的
-   裸截止日 → 不排他（裸日期交服务端膨胀 23:59:59 才不漏截止日）；月/年/全部与 AI 附件 range
-   的 to 本就是下一周期首日/给定排他界 → to_exclusive=1。settings 的账户口径走 nextDayStr
-   （/api/accounts 无 to_exclusive 参数，等效含当天） */
-const rangeExcl = r => !!(r && (r.toExclusive || appScope() !== "custom"));
+/* 统计请求的 to 参数（汇总条/统计页/归属三处共用）：位随区间对象（toExclusive）——
+   排他界原样传；仅自定义区间的裸截止日补 23:59:59（后端按 date< 排他） */
+const rangeDto = r => r.toExclusive ? r.to : r.to + " 23:59:59";
+/* 区间「to 是否排他上界」（汇总条/蝴蝶图/分类日历下钻共用）：位在 curStatRange 构造时
+   落定（loadSumbarAi / AI 附件 aiStatsRange 自建的区间同样带位）；settings 的账户口径走
+   nextDayStr（/api/accounts 无 to_exclusive 参数，等效含当天） */
+const rangeExcl = r => !!(r && r.toExclusive);
 function _heatClass(r){ return r>0.66?"h4":r>0.4?"h3":r>0.18?"h2":r>0.02?"h1":""; }
 
 const _sbRanges = {};   // page → {from,to,label,toExclusive}，点击时取回渲染时的区间

@@ -204,7 +204,7 @@ function txRow(t, mode){
   let catHtml;
   if(pv){
     catHtml = t.type === "transfer"
-      ? `<span class="tag plain">转账 · ${esc(t.category_name || "账户转账")}</span>`   // 兜底子类与后端 db.DEFAULT_TRANSFER_SUB 同值
+      ? `<span class="tag plain">转账 · ${esc(t.category_name || TX_SUB_DEFAULT)}</span>`   // 兜底子类走 core.js 单点
       : `<select data-pv-idx="${t._pvIdx}" onchange="impSetCat(this)">${pvCatOptions(t.parent_category)}<option value="__new__">＋新建分类…</option></select>`;
   } else {
     catHtml = esc(t.category_name || TYPE_CN[t.type] || "");   // 流水态：原始分类名裸拼进 innerHTML 会注入，必须转义

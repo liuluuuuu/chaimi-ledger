@@ -86,9 +86,24 @@ def _insert_rows(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
             conn.execute("UPDATE transactions SET refund_for=? WHERE id=?",
                          (inserted[tgt_pos], inserted[row_pos]))
 
+def _seed_attribution_roster(conn: sqlite3.Connection, ledger_id: int,
+                             previews: list[dict]) -> None:
+    """导入的归属名进归属名单（设置页「原始归属」表的数据源）：与组同名的跳过——
+    同名路径已归组，名单不保留孤行（与 server._attr_group_absorb 同口径）。
+    在 apply_import 事务内执行：入库与名单同一提交，无中途崩溃留半截的窗口。"""
+    group_names = {r["name"] for r in conn.execute(
+        "SELECT name FROM attribution_groups WHERE ledger_id=?", (ledger_id,))}
+    for p in previews:
+        attr = ((p.get("tags") or {}).get("attribution") or "").strip()
+        if attr and attr not in group_names:
+            conn.execute("INSERT OR IGNORE INTO attributions(ledger_id, name) VALUES(?,?)",
+                         (ledger_id, attr))
+
+
 def apply_import(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
                  filename: str, source: str) -> int:
-    """确认导入（7.8 ⑤~⑦），单事务四阶段：增强回填 → 建批次 → 逐行入库+批内回填 → rescan。"""
+    """确认导入（7.8 ⑤~⑦），单事务四阶段：增强回填 → 建批次 → 逐行入库+批内回填 →
+    归属名单播种 + rescan。"""
     # 批次边界只按合法日期算：坏日期行（_insert_rows 会跳过）不参与 min/max，
     # 否则 None/dict 等篡改值在这里 TypeError → 整个 confirm 500
     dates = [p["date"] for p in previews if _is_new_row(p) and _ok_date(p)]
@@ -100,6 +115,7 @@ def apply_import(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
             (ledger_id, source, filename, len(dates), min(dates) if dates else "", max(dates) if dates else ""))
         batch_id = cur.lastrowid
         _insert_rows(conn, ledger_id, previews, batch_id)
+        _seed_attribution_roster(conn, ledger_id, previews)
         # 反向补关联：本批新 expense 可能是此前未匹配退款行的原消费（7.7 匹配时机②）
         _rescan_unmatched_refunds(conn, ledger_id)
     return batch_id
@@ -146,7 +162,9 @@ def _rescan_unmatched_refunds(conn: sqlite3.Connection, ledger_id: int) -> None:
                          "WHERE id=?", (hit["id"], status, r["id"]))
 
 def undo_batch(conn: sqlite3.Connection, batch_id: int) -> int:
-    """整批撤销（7.8 ⑦）：删行 + 级联清理退款关联/learned 映射 + 删批次。"""
+    """整批撤销（7.8 ⑦）：删行 + 级联清理退款关联 + 删批次。
+    （≤1.0.1 随批写入的学习映射清理已随 1.0.6 后移除：写入窗口只有 2026-10-18~20
+    两天，残留 learned 行在映射页可见、修复区可重置，撤销不再连带清理。）"""
     with conn:
         n = conn.execute("SELECT COUNT(*) FROM transactions WHERE batch_id=?", (batch_id,)).fetchone()[0]
         ids = [r[0] for r in conn.execute("SELECT id FROM transactions WHERE batch_id=?", (batch_id,))]
@@ -157,9 +175,6 @@ def undo_batch(conn: sqlite3.Connection, batch_id: int) -> int:
                 conn.execute(f"UPDATE transactions SET {dbm.UNLINK_REFUND_SET}, need_confirm=1 "
                              f"WHERE refund_for IN ({q})", part)
             conn.execute("DELETE FROM transactions WHERE batch_id=?", (batch_id,))
-        # legacy 兼容（≤1.0.1 旧库遗留的 learned 行）：1.0.2 起导入不再回写学习映射，
-        # 新库此句删 0 行，仅为撤销旧批次时清掉当年随批写入的学习映射
-        conn.execute("DELETE FROM category_mappings WHERE learned=1 AND batch_id=?", (batch_id,))
         conn.execute("DELETE FROM import_batches WHERE id=?", (batch_id,))
     return n
 

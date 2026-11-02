@@ -91,7 +91,7 @@ async function llmModelsOpen(){
 }
 function llmModelsClose(){ $("#llmModelsMask").style.display="none"; }
 
-const LEDGER_CURS = [["CNY","人民币 ¥"],["USD","美元 $"],["EUR","欧元 €"],["JPY","日元 ¥"],["HKD","港币 HK$"],["GBP","英镑 £"]];
+const LEDGER_CURS = Object.entries(CUR_INFO).map(([v, [t, s]]) => [v, `${t} ${s}`]);   // 币种下拉（CUR_INFO 单源，见 core.js）
 const lgMine = l => l.mine !== false;   // mine=false=别人共享来的（undefined=系统上下文/旧接口，视为自己）
 async function loadLedgers(){
   const ls = await getLedgers();
@@ -266,9 +266,9 @@ function accScopeInfo(){
   if(sc === "all") return {from: "", to: "", label: "全部", months: 0};
   const r = curStatRange();
   const label = sc === "month" ? r.label.replace(/^(\d{4})-(\d{2})$/, "$1年$2月") : r.label;   // 裸 YYYY-MM 润色
-  // /api/accounts 后端按 date < to 排他：月/年的 to 本就是下一周期首日（排他界）；
-  // 仅自定义区间的 to 是含当天的裸截止日——转次日作排他上界，否则截止日当天消费漏计
-  return {from: r.from, to: sc === "custom" ? nextDayStr(r.to) : r.to, label, months: sc === "year" ? 12 : 1};
+  // /api/accounts 后端按 date < to 排他：排他界的 to（月/年）原样；仅自定义区间的
+  // 裸截止日转次日作排他上界，否则截止日当天消费漏计（toExclusive 位随区间对象）
+  return {from: r.from, to: r.toExclusive ? r.to : nextDayStr(r.to), label, months: sc === "year" ? 12 : 1};
 }
 
 function mkEditToggle(btnId, rerender){

@@ -1,7 +1,7 @@
 const $ = s => document.querySelector(s);
 const fmt = c => (c/100).toFixed(2);            // 分 → 元字符串
 const toCents = y => Math.round(parseFloat(y || "0") * 100);   // 元输入 → 分（记账/预算共用）
-const MAX_UPLOAD_B = 20*1024*1024;              // 上传上限（与后端 server.py MAX_UPLOAD 同值，改需同步）
+const MAX_UPLOAD_B = (window.CHAIMI_MAX_MB || 20) * 1048576;   // 上传上限：服务端 _page 注入（server.py MAX_UPLOAD 单源）；直开静态页无注入时回落 20MB
 const mobileMQ = matchMedia("(max-width:768px)");   // 抽屉断点，与 views.css @media 同阈值（769 起为桌面）；ledger.js 复用 !mobileMQ.matches
 
 /* 当前飞牛用户（/api/whoami 一次拉取；uid=null=本地开发无网关身份）：
@@ -21,7 +21,9 @@ async function loadMe(){
   return _mePromise;
 }
 
-const CUR_SYMBOLS = {CNY:"¥", USD:"$", EUR:"€", JPY:"¥", HKD:"HK$", GBP:"£"};
+/* 币种单源（curSym 与设置页币种下拉 LEDGER_CURS 共用）：[中文名, 符号]，新增币种只改这里 */
+const CUR_INFO = {CNY:["人民币","¥"], USD:["美元","$"], EUR:["欧元","€"], JPY:["日元","¥"], HKD:["港币","HK$"], GBP:["英镑","£"]};
+const CUR_SYMBOLS = Object.fromEntries(Object.entries(CUR_INFO).map(([c, [t, s]]) => [c, s]));
 let ledgersCache = [];   // loadAll 时刷新，供 curSym 反查当前账本币种
 function curSym(){
   const cur = ledgersCache.find(l => l.id === +($("#ledgerSel")?.value || 0));
@@ -41,6 +43,7 @@ async function aiConfigured(){
 }
 const lid = () => +$("#ledgerSel").value || 1;
 const TYPE_CN = {expense:"支出", income:"收入", transfer:"转账"};
+const TX_SUB_DEFAULT = "账户转账";   // 转账兜底子类单点（与后端 db.DEFAULT_TRANSFER_SUB 同值；import.js/ai.js 展示共用这里，不再各抄一份）
 const TX_TYPES = [{v:"expense",t:"支出"},{v:"income",t:"收入"}];
 const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));   // 文本/属性值转义（含单引号，与 home.html 独立实现同口径）
 const pad2 = n => String(n).padStart(2, "0");   // 两位补零（导出时间戳/排他上界/日历格子共用）

@@ -190,7 +190,7 @@ DEFAULT_MAPPINGS = [
 PLATFORM_CN = {"alipay": "支付宝", "wechat": "微信", "jd": "京东", "meituan": "美团"}
 
 # transfer 子类（7.6，不计收支；存 tags.transfer_sub）
-DEFAULT_TRANSFER_SUB = "账户转账"   # 无映射时的兜底子类（import_classify 两处 + 前端 import.js/ai.js 展示同款字面量）
+DEFAULT_TRANSFER_SUB = "账户转账"   # 无映射时的兜底子类（import_classify 两处；前端 core.js TX_SUB_DEFAULT 单点，import/ai 展示共用）
 TRANSFER_SUBCLASS = {
     "转账": "账户转账", "转账红包": "账户转账", "微信红包": "账户转账",
     "微信红包（单发）": "账户转账",
@@ -368,9 +368,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
 # ---------- 通用查询 ----------
 
 def month_range(month: str) -> tuple[str, str]:
-    """'2026-09' → ('2026-09-01', '2026-10-01')."""
-    y, m = map(int, month.split("-"))
-    return f"{y:04d}-{m:02d}-01", _next_month(month)
+    """'2026-09' → ('2026-09-01', '2026-10-01')。月份格式的唯一裁判：非法（非
+    YYYY-MM / 月份越界 / None）抛带人话的 ValueError——HTTP 端点翻译成 400，
+    AI 工具层透传给用户，不会再出现裸 int() 解析错误。"""
+    try:
+        y, m = month.split("-")
+        y, m = int(y), int(m)
+    except (AttributeError, ValueError):
+        raise ValueError(f"month 必须形如 2026-09（收到 {str(month)[:20]!r}）")
+    if not 1 <= m <= 12:
+        raise ValueError(f"月份越界：{str(month)[:20]!r}")
+    iso = f"{y:04d}-{m:02d}"
+    return iso + "-01", _next_month(iso)
 
 def _next_month(month: str) -> str:
     """'YYYY-MM' → 'YYYY-MM+1-01'，跨年自动 +1。"""

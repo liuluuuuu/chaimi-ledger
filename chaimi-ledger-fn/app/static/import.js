@@ -153,7 +153,7 @@ async function impSetCat(sel){
   const cat = categories.find(c=>c.id === +sel.value);
   if(cat && cat.type === "transfer"){
     p.type = "transfer";
-    p.tags = Object.assign({}, p.tags, {transfer_sub: cat.name === "退款" ? "退款" : "账户转账"});   // 兜底子类与后端 db.DEFAULT_TRANSFER_SUB 同值（改需同步）
+    p.tags = Object.assign({}, p.tags, {transfer_sub: cat.name === "退款" ? "退款" : TX_SUB_DEFAULT});   // 兜底子类走 core.js 单点（与后端 db.DEFAULT_TRANSFER_SUB 同值）
     p.category_name = p.parent_category = p.tags.transfer_sub;
     renderPv();
     return;

@@ -90,9 +90,13 @@ def _capped(rows):
             raise ValueError(f"行数超过上限 {MAX_PARSE_ROWS // 10000} 万行")
         yield row
 
+def _csv_rows(text: str) -> list:
+    """CSV 文本 → 行列表（带熔断）：parse_generic / parse_bill / sniff_template 共用。"""
+    return list(_capped(csv.reader(io.StringIO(text))))
+
 # ---------- 原语层（引擎与测试共用；每个原语在抽取时即有调用方，不预建） ----------
 
-# 缺省收/支枚举（_ttype 旧口径）；模板可传自己的 flow_map 覆盖（京东仅支出计收支）
+# 缺省收/支枚举；模板可传自己的 flow_map 覆盖（京东仅支出计收支）
 DEFAULT_FLOW_MAP = {"支出": "expense", "收入": "income"}
 
 # col 的标准键：引擎按各自语义装配；其余键（导出的 origin_source/export_id/export_ref 等）
@@ -109,10 +113,6 @@ def decide_type(flow_val: str, type_val: str, is_refund: bool,
     if type_val and transfer_types and type_val in transfer_types:
         return "transfer"
     return (DEFAULT_FLOW_MAP if flow_map is None else flow_map).get(flow_val, "transfer")
-
-def _ttype(shouzhi: str, is_refund: bool) -> str:
-    """收/支列 → 流水类型（支付宝/微信旧口径，保留供测试与兼容引用）。"""
-    return decide_type(shouzhi, None, is_refund)
 
 def resolve_name(values, cfg: dict) -> str:
     """名称回退链：依次取列值，首个有意义者胜出；全无意义返回 ""（AI 兜底）。
@@ -308,30 +308,33 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
             out.append(RawFlow(skip=f"日期无法解析：{normalize(g('date'))[:20]}"))
             continue
 
-        # 金额三态（expand）/ 宽松-严格两模式
+        # 金额解析三模式，就地统一产出 (kind, cents, bracket_refund, need_confirm)：
+        #   expand   京东金额括号三态（split=原额+退款额 / confirm=其他括号待确认 / plain）
+        #   lenient  宽松取绝对值——负号是方向冗余（方向由收/支列决定），保留会冲抵统计（内置平台）
+        #   strict   严格校验失败标 skip（向导/用户模板缺省口径）
+        need_confirm, b = False, 0
         if tpl.get("expand"):
             raw_amount = str(g("amount") or "").strip().replace("\t", "")
             sr = split_bracket_amount(raw_amount) if raw_amount else ("plain", 0)
-            kind, a = sr[0], sr[1]
+            kind, cents = sr[0], sr[1]
             b = sr[2] if kind == "split" else 0
-            reason = tpl.get("skip_zero_reason") or ""
-            if reason and kind == "plain" and a == 0:
-                out.append(RawFlow(skip=reason))
-                continue
+            if kind == "confirm":
+                is_refund, need_confirm = False, True
+            skip_zero = kind == "plain" and cents == 0
         elif tpl.get("amount_mode") == "lenient":
-            # 与 strict 同口径取绝对值：负号是方向冗余（方向由收/支列决定），保留会冲抵统计
-            cents = abs(to_cents(g("amount")))
-            reason = tpl.get("skip_zero_reason") or ""
-            if reason and cents == 0:
-                out.append(RawFlow(skip=reason))
-                continue
+            kind, cents = "plain", abs(to_cents(g("amount")))
+            skip_zero = cents == 0
+        else:
             kind = "plain"
-        else:   # strict：向导/用户模板口径——先严格校验（负号金额取绝对值），失败标 skip
             cents = _try_cents(g("amount"))
             if cents is None:
                 out.append(RawFlow(skip=f"金额无法解析：{normalize(g('amount'))[:20]}"))
                 continue
-            kind = "plain"
+            skip_zero = False
+        reason = tpl.get("skip_zero_reason") or ""
+        if reason and skip_zero:
+            out.append(RawFlow(skip=reason))
+            continue
 
         # 名称：回退链（微信）或直取；后缀清理（美团「订单详情」）
         if tpl.get("name_fallback"):
@@ -402,15 +405,10 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
             # 金额列含「退款」括号（京东）：退款额已独立成行——仅取括号外原消费（强制
             # expense 供退款行关联，含全额退的不计收支行），括号额存 bracket_refund
             # （(已全额退款)=全额）作②'' 层关联线索
-            out.append(RawFlow(**common, amount=a, type="expense",
-                               is_refund=False, hash_fields=hash_list(a),
+            out.append(RawFlow(**common, amount=cents, type="expense",
+                               is_refund=False, hash_fields=hash_list(cents),
                                bracket_refund=b))
             continue
-        need_confirm = False
-        if kind == "confirm":
-            cents, is_refund, need_confirm = a, False, True
-        elif tpl.get("expand"):
-            cents = a
         ttype = decide_type(flow_val, base_type, is_refund, transfer_types, flow_map)
         flow = RawFlow(**common, amount=cents, type=ttype, is_refund=is_refund,
                        hash_fields=hash_list(cents))
@@ -428,7 +426,7 @@ def parse_template(rows: list, tpl: dict) -> list[RawFlow]:
 
 def parse_generic(text: str, tpl: dict) -> list[RawFlow]:
     """通用模板入口（向导试解析 / 兼容引用）：文本 + 模板 → 统一引擎。"""
-    rows = list(_capped(csv.reader(io.StringIO(text))))
+    rows = _csv_rows(text)
     return parse_template(rows, tpl)
 
 def _decode_csv(data: bytes) -> str:
@@ -460,7 +458,7 @@ def parse_bill(data: bytes, filename: str) -> list[RawFlow]:
     """统一路由：xlsx→行 / CSV 解码后，用户模板优先、内置模板次之，表头集合命中即解析。
     覆盖机制：用户复制的模板排在前面，改列名后即接管该格式的路由。"""
     text = text_from_upload(data, filename)
-    rows = list(_capped(csv.reader(io.StringIO(text))))
+    rows = _csv_rows(text)
     for tpl in [*user_templates(), *pt.PLATFORM_TEMPLATES]:
         if _tpl_header_hit(rows, tpl) >= 0:
             return parse_template(rows, tpl)
@@ -485,7 +483,7 @@ def sniff_template(text: str) -> dict:
     """向导嗅探（纯函数）：定位表头行 + 提取样例 + 预填列映射猜测。
     表头启发：窗口内首个"≥4 个非空单元格 且 含 时间/日期/金额/单号 字样"的行；
     全不中再退到首个 ≥4 列的行。"""
-    rows = list(_capped(csv.reader(io.StringIO(text))))
+    rows = _csv_rows(text)
     h, fallback = -1, -1
     for i, r in enumerate(rows[:_HEADER_WINDOW]):
         cells = [normalize(c) for c in r if normalize(c)]

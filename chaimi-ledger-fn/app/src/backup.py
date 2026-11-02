@@ -159,8 +159,8 @@ def _is_last_day_of_month(now: datetime) -> bool:
     return now.day == calendar.monthrange(now.year, now.month)[1]
 
 class AutoBackup:
-    """自动备份：到配置 hour 点检查——年末(12-31)优先生成年备并跳过月备；
-    其余月末生成本月月备。保留按月数/年数分层清理，只清周期文件。
+    """自动备份：到配置 hour 点检查——年末(12-31)优先生成年备并跳过月备（年备
+    周期关闭时不拦月备）；其余月末生成本月月备。保留按月数/年数分层清理，只清周期文件。
     每轮重读配置，设置页改参数即时生效；备份成功才记当日已备（失败下一轮重试）。"""
 
     def __init__(self):
@@ -187,12 +187,12 @@ class AutoBackup:
             if (cfg.get("enabled") and int(cfg.get("hour", 3)) == now.hour
                     and self._last_date != today
                     and _is_last_day_of_month(now)):
-                if now.month == 12 and now.day == 31:
-                    # 12-31 年备优先（年备已覆盖当月），跳过月备
-                    if int(cfg.get("keep_years", 3)) > 0:
-                        self.last_result = create_backup("yearly")
-                        self._last_date = today
-                        _cleanup_old(int(cfg.get("keep_years", 3)), now, yearly=True)
+                # 12-31 年备优先（年备已覆盖当月），跳过月备；keep_years=0（年备周期关闭）
+                # 不拦月备——否则 12 月一天备份都没有
+                if now.month == 12 and now.day == 31 and int(cfg.get("keep_years", 3)) > 0:
+                    self.last_result = create_backup("yearly")
+                    self._last_date = today
+                    _cleanup_old(int(cfg.get("keep_years", 3)), now, yearly=True)
                 elif int(cfg.get("keep_months", 3)) > 0:
                     self.last_result = create_backup("monthly")
                     self._last_date = today
