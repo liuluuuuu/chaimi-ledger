@@ -177,14 +177,8 @@ function toggleSidebar(){
   $("#sideMask").classList.toggle("on", open && mobile);
   $(".main").classList.toggle("pushed", open && mobile);
 }
-function toggleTheme(){
-  const b=document.body, dark=b.dataset.theme==="dark";
-  b.dataset.theme = dark?"light":"dark";
-
-  $("#ic-sun-ai").style.display = dark?"block":"none";
-  $("#ic-moon-ai").style.display = dark?"none":"block";
-  dropCharts();
-}
+/* 主题三态（浅色/深色/自动·含飞牛宿主跟随）在 static/theme.js（ESM，本文件之后执行）：
+   toggleTheme 挂在 window，侧栏按钮 onclick 直调；dropCharts 由其在明暗翻转时调用 */
 let _scopeHome = null;   // 顶栏选择器的原位父节点（首次 moveScopeBar 时记录，供搬回）
 function moveScopeBar(p){
 

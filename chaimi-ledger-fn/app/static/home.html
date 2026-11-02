@@ -6,6 +6,7 @@
 <base href="../">   <!-- 经 /static/home.html 访问时无服务端 base 注入：自备相对基（/home 路由注入的 base 在前，同样指向应用根） -->
 <title>选择用户 · 柴米记账</title>
 <link rel="stylesheet" href="static/base.css">
+<script type="module" src="static/theme.js"></script>   <!-- 三态主题（浅/深/自动·飞牛宿主跟随），与 app.html 共用 -->
 <style>
 /* ===== 登录/用户选择页：≤768px 竖排、宽屏左品牌右操作。
    lg-* 样式只在本页使用（app.html 不携带）。 ===== */
@@ -75,6 +76,19 @@ body{display:flex;align-items:center;justify-content:center;background:var(--bg)
 </style>
 </head>
 <body data-theme="light">
+<script>
+/* 主题先行：与 app.html 同源逻辑——按偏好 + 上次解析明暗在首帧前落地，登录/选用户页
+   与主应用明暗一致；宿主/系统切换的实时联动由 theme.js 接管 */
+(function(){
+  var dark;
+  try{
+    var m = localStorage.getItem("chaimi_theme") || "auto";
+    dark = m === "dark" ? true : m === "light" ? false
+      : (localStorage.getItem("chaimi_theme_dark") || (matchMedia("(prefers-color-scheme: dark)").matches ? "1" : "0")) === "1";
+  }catch(_){ dark = matchMedia("(prefers-color-scheme: dark)").matches; }
+  document.body.dataset.theme = dark ? "dark" : "light";
+})();
+</script>
   <div class="lg-wrap">
     <div class="lg-brand">
       <div class="lg-blob b1"></div><div class="lg-blob b2"></div><div class="lg-blob b3"></div>

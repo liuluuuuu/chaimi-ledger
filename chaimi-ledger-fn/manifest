@@ -16,6 +16,9 @@ distributor=山归山
 distributor_url=
 
 app_type=system
+# 前端 JS SDK(@trimjs/web-app)：自动主题经 getPlatformConfig/$on('os/theme') 跟随飞牛宿主
+# 明暗（系统>=1.2.0401 才有该开放能力；旧系统静默回落浏览器 prefers-color-scheme）
+micro_app=true
 # install_type 留空:安装时由用户选择存储卷(数据落 /vol{n}/@app* 下,不再占系统分区)
 ctl_stop=true
 
