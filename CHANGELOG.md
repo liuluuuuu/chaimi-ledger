@@ -57,13 +57,6 @@
 - 全量 319 用例在升级组合下回归通过；pycryptodome 4.x 的 AES-128-ECB 解密路径
   单测可验，微信真机发图链路待发布前验证
 
-### 依赖：传递依赖一并锁死，NAS 安装完全可复现
-- fastapi 对 starlette 只有 `>=0.46` 下界，装机时点不同的 NAS 会拿到不同
-  starlette/pydantic（实测同日解析已出现 starlette 1.6.0 与 1.10.0 并存）；
-- requirements.txt 新增传递依赖段（starlette 1.10.0、pydantic 2.14.2、anyio 4.16.0、
-  httpx2 2.16.0 等 18 项，均确认有 cp312/abi3 轮子，飞牛 python312 免编译），
-  安装脚本按文件哈希判断重装（cmd/main），锁法与刷新步骤见文件头注释
-
 ## 1.0.5（2026-11-01）修复与优化
 
 ### 优化：首次打开直进选择页，不再先闪应用界面
