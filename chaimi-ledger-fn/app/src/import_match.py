@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import applog
 import db as dbm   # refund_status 单源判定
+import platform_templates as pt   # 跨源配对的平台渠道/显示名单源（PLATFORMS 派生）
 from import_common import _is_placeholder_name, _is_new_row
 
 _log = applog.get("import")   # 退款匹配决策日志：日志包里可直接看出每笔退款链到谁/置信度
@@ -27,7 +28,9 @@ class _LedgerSnapshot:
         self.by_type_amount: dict = {}
         for r in self.rows:
             self.by_type_amount.setdefault((r["type"], r["amount"]), []).append(r)
-        # 精确去重索引：(source, row_hash) → id；同键多行取后写者（同旧 IN 查询的覆盖序）
+        # 精确去重索引：(source, row_hash) → id；同键多行取后写者（同旧 IN 查询的覆盖序）。
+        # 史前 NULL-source 行的 row_hash 与现行模板哈希算法不同、天然不可比：其重导
+        # 判重由 dup_hints 软提示（同日同额）兜底，属设计行为（db.dup_hints 注释）
         self.by_hash = {(r["source"], r["row_hash"]): r["id"]
                         for r in self.rows if r["row_hash"]}
 
@@ -66,9 +69,9 @@ def _day_window(date_str: str, days: int) -> tuple[str, str]:
     except ValueError:
         return "0000-00-00", "9999-12-31"
 
-# P2 跨源配对：平台来源的显示名（支付渠道账单中该平台商户的典型叫法）
-_PLATFORM_DISPLAY = {"meituan": "美团"}
-_PAYMENT_CHANNELS = ("wechat", "alipay", "jd")
+# P2 跨源配对：平台显示名/渠道集合单源在 platform_templates.PLATFORMS（派生视图）
+_PLATFORM_DISPLAY = pt.NAME_MATCH_PLATFORMS
+_PAYMENT_CHANNELS = pt.PAYMENT_CHANNELS
 # 手动记账来源：UI 记一笔（app）/ 机器人确认入库（bot；manual 为历史/测试写入口径）。
 # 手动行无 row_hash，与平台账单的重复（先手记、后导微信）由 _link_payment 末层配对兜住
 _MANUAL_SOURCES = ("app", "bot", "manual")
@@ -82,15 +85,22 @@ def _sole(cands: list):
 def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
                   snap: _LedgerSnapshot | None = None) -> None:
     """P2 跨源配对（双向）：同一笔消费在平台账单与支付渠道账单各出现一次 → 后导入的标 pay_dupe 跳过。
-    正向（导平台 → 查支付渠道）：① 订单号 ② 商户含平台名 ③ 同日同额；增强（态A）回填泛化名称/订单号。
-    反向（导支付渠道 → 查平台）：同日±1 + 金额 + 类型。duplicate 行也过（旧数据重导时增强仍需执行）。
+    只认身份证据：正向（导平台 → 查渠道）① 订单号 ② 商户/名称含平台名；反向（导渠道 → 查平台）
+    渠道行自带平台名 + 同窗同额唯一候选。曾有 ③ 层「同日同额唯一候选即跳」与反向纯金额层——
+    无任何文本证据，同日两笔无关同额消费（手记午餐 ¥35 + 账单星巴克 ¥35）会被默认吞行，
+    与 dup_hints「同日同额只提示不拦截」的全局原则矛盾，已删——该场景由 db.dup_hints 的
+    「疑似重复」软提示接管（预览可见、一键跳过），不再静默吞。
     末层（任意导入来源 → 查手动记账）：同日±1 + 金额 + 类型 + 唯一候选 → 标「手动记账」跳过——
-    先手记后导账单的双计由此兜住；命中行预览默认跳过、点行可恢复（=用户确认），增强只补单号不碰手填名称。
+    先手记后导账单的双计由此兜住（手动行名称与账单名常对不上，金额+日期是仅有可用证据，
+    唯一候选 + 1:1 消耗两道防线防误吞，是有意的权衡）；命中行预览默认跳过、点行可恢复
+    （=用户确认），增强只补单号不碰手填名称。duplicate 行也过（旧数据重导时增强仍需执行）。
     匹配在账本快照上进行：①② 取首个命中 = id 升序最早一条（旧 SQL 无 ORDER BY 的默认扫描序，现为保证）。"""
     def mark(p, r, via):
-        p.update(pay_dupe=True, pay_dupe_of=r["id"], pay_dupe_via=via, skip="跨源重复")
+        # 末层 via="手动记账" 的理由与跨源层区分：预览 skip 文案直读，混用会误导排查
+        p.update(pay_dupe=True, pay_dupe_of=r["id"], pay_dupe_via=via,
+                 skip="与手动记账重复" if via == "手动记账" else "跨源重复")
 
-    snap = _snap_or_load(conn, ledger_id, snap)
+    snap = snap if snap is not None else _LedgerSnapshot(conn, ledger_id)   # 懒加载：build_previews 传共享快照
     used_manual: set = set()   # 已被配对消耗的手动行 id（1:1 防一笔手记吸收多笔同额导入）
     used_cross: set = set()    # 已被跨源配对消耗的库行 id（同款 1:1：一笔渠道流水只吸收
                                # 一笔平台流水，多笔同日同额真实消费不再被整批吞掉）
@@ -103,10 +113,10 @@ def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
         d_from, d_to = _day_window(p["date"], 1)
 
         if src in _PLATFORM_DISPLAY:
-            # 正向：导平台账单，查库中支付渠道流水（订单号 → 商户名 → 同日同额）；
+            # 正向：导平台账单，查库中支付渠道流水（订单号 → 商户名，身份证据才跳）；
             # 候选剔除已消耗行、命中即消耗（1:1，与末层手动配对同款防线）
             display = _PLATFORM_DISPLAY[src]
-            base = [c for c in snap.candidates(p, ("wechat", "alipay", "jd"), d_from, d_to)
+            base = [c for c in snap.candidates(p, _PAYMENT_CHANNELS, d_from, d_to)
                     if c["id"] not in used_cross]
             if p.get("order_no"):
                 r = next((c for c in base if c["order_no"] == p["order_no"]), None)
@@ -116,19 +126,18 @@ def _link_payment(conn: sqlite3.Connection, ledger_id: int, previews: list,
                       or display in (c["name"] or "")), None)
             if r:
                 mark(p, r, "商户名"); used_cross.add(r["id"]); continue
-            # ③ 同日+金额+跨来源兜底——须唯一候选（多笔等额=歧义，不自动跳过）
-            r = _sole(base)
-            if r:
-                mark(p, r, "同日同额"); used_cross.add(r["id"])
 
-        elif src in _PAYMENT_CHANNELS:
-            # 反向：导微信/支付宝/京东，查库中平台流水（美团等）——同日同额且唯一候选
-            # （与正向③层同门槛：库中一笔前日美团 ¥35 不能吞掉无关的微信星巴克 ¥35）
-            cands = [c for c in snap.candidates(p, ("meituan", "custom"), d_from, d_to)
+        elif src in _PAYMENT_CHANNELS and any(
+                d in (p.get("merchant") or "") or d in (p.get("name") or "")
+                for d in _PLATFORM_DISPLAY.values()):
+            # 反向（导支付渠道 → 查平台）：仅身份证据——渠道行自身带平台名（微信账单的
+            # 「美团平台」）且同窗同额唯一候选才跳，与正向②同类证据。曾有纯金额版
+            # （同日同额唯一即跳）：库中一笔无关美团 ¥35 会吞掉手记午餐 ¥35，已收窄。
+            cands = [c for c in snap.candidates(p, tuple(_PLATFORM_DISPLAY), d_from, d_to)
                      if c["id"] not in used_cross]
             r = _sole(cands)
             if r:
-                mark(p, r, "跨源（反向）"); used_cross.add(r["id"])
+                mark(p, r, "商户名（反向）"); used_cross.add(r["id"])
 
         if not p.get("pay_dupe"):
             # 末层：查手动记账（app/bot）。手动行时间金额是人填的，同额碰撞概率高于渠道
@@ -151,17 +160,18 @@ def _refund_name_candidates(name: str) -> list:
                     if name.startswith(pref) and len(name) > len(pref)]
     return [c for c in dict.fromkeys(c for c in out if c) if not _is_placeholder_name(c)]
 
-def _snap_or_load(conn: sqlite3.Connection, ledger_id: int,
-                  snap: _LedgerSnapshot | None) -> _LedgerSnapshot:
-    """快照懒加载：build_previews 传入共享快照，独立调用（测试/直调）自建。"""
-    return snap if snap is not None else _LedgerSnapshot(conn, ledger_id)
-
 def _pool_entry(pid, name, merchant, amount, order_no, date, source,
                 bracket_refund=None) -> dict:
     """退款候选池条目（库行与批内预览共用形状；负 id = -(预览序号+1)）。
-    bracket_refund：原消费行括号标注的退款额（京东新导出，②'' 层匹配用）。"""
+    bracket_refund：原消费行括号标注的退款额（京东新导出，②'' 层匹配用）。
+    _d 为日期到天的预解析（条目在池的整个匹配期不变，此前 _in_window 每条退款
+    都对全池重新 strptime 一遍，千条退款×万级池就是千万次解析）；坏日期为 None。"""
     entry = {"id": pid, "name": name or "", "merchant": merchant or "",
              "amount": amount, "order_no": order_no or "", "date": date, "source": source}
+    try:
+        entry["_d"] = datetime.strptime((date or "")[:10], "%Y-%m-%d")
+    except ValueError:
+        entry["_d"] = None
     if bracket_refund is not None:
         entry["bracket_refund"] = bracket_refund
     return entry
@@ -178,7 +188,7 @@ def _refund_pool(conn: sqlite3.Connection, ledger_id: int, previews: list,
                  snap: _LedgerSnapshot | None = None) -> list:
     """退款候选池：库中支出 + 本批支出预览（退款与原消费常在同一账单里；负 id=-(预览序号+1)）。
     日期倒序固定遍历顺序——旧版无排序，多候选时取哪条取决于数据库返回序（等于随机）。"""
-    snap = _snap_or_load(conn, ledger_id, snap)
+    snap = snap if snap is not None else _LedgerSnapshot(conn, ledger_id)   # 懒加载：build_previews 传共享快照
     out = [_pool_entry(r["id"], r["name"], r["merchant"], r["amount"],
                        r["order_no"], r["date"], r["source"], _bracket_of(r))
            for r in snap.rows if r["type"] == "expense"]
@@ -209,20 +219,16 @@ def _match_order(pool: list, p: dict):
 
 def _in_window(pool: list, date: str, days: int) -> list:
     """池中落在退款日 [0, days] 天窗内的候选（0=当日；日期晚于退款日或解析失败 → 排除）。
-    各匹配层共用：_match_refund / rescan 入口一次收窄，层内不再重复过滤。"""
+    各匹配层共用：_match_refund / rescan 入口一次收窄，层内不再重复过滤。
+    日期按天比较（_pool_entry 的 _d 预解析，口径同 [:10]）：坏日期条目（_d=None，
+    norm_date 收紧前入库的行）排除——但 10 位历史日期行在入池时已按天解析，不会
+    被静默排除出匹配（旧版只认 19 位，这些行的退款永远配不上原消费）。"""
     try:
-        ref = datetime.strptime((date or "")[:19], "%Y-%m-%d %H:%M:%S")
+        ref = datetime.strptime((date or "")[:10], "%Y-%m-%d")
     except ValueError:
         return []
-    out = []
-    for e in pool:
-        try:
-            d = datetime.strptime((e["date"] or "")[:19], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        if 0 <= (ref - d).days <= days:
-            out.append(e)
-    return out
+    return [e for e in pool
+            if e["_d"] is not None and 0 <= (ref - e["_d"]).days <= days]
 
 def _pick_recent(hits: list):
     """命中挑选（「宁低勿错」统一收口）：唯一 → (候选, 高置信)；
@@ -244,14 +250,17 @@ def _name_hits(pool: list, p: dict, bases: list) -> list:
     return [e for e in pool if e["amount"] == p["amount"]
             and any(e["name"].startswith(b) for b in strong)]
 
-def _match_name(pool: list, p: dict, bases: list):
+def _match_name(pool: list, p: dict, bases: list, fuzzy: bool = True):
     """② 金额+名称：等额+前缀唯一（前缀≥2 字）→ high；多命中取最近降 low（优先于
     模糊兜底）；无等额命中 → 模糊最长公共前缀比 ≥0.5（京东改写标题容错，前缀≥2 字）
     → low，同额候选优先于高相似度（真机案例：9.9 退款与同店 12.9/9.9 两笔模糊打平，
-    误链时间更晚的 12.9）。high 三门槛缺一降级——宁低勿错。"""
+    误链时间更晚的 12.9）。high 三门槛缺一降级——宁低勿错。
+    fuzzy=False 关闭模糊层（rescan 补关联口径：模糊命中不参与，宁缺勿滥）。"""
     pick = _pick_recent(_name_hits(pool, p, bases))
     if pick:
         return pick                      # 唯一命中 high / 多命中取最近降 low
+    if not fuzzy:
+        return None
     best, best_key = None, None
     for e in pool:                       # pool 已收窗：模糊只在窗内找相似
         if e["amount"] < p["amount"]:
@@ -287,23 +296,36 @@ def _match_bracket(pool: list, p: dict):
 
 def _match_heuristic(pool: list, p: dict):
     """③ 启发式：金额 ≥ 退款额 + 唯一候选 → low；多候选但恰有一笔同额 → 优先同额（low，
-    仍进待确认）。同额也歧义（多笔等额）则放弃——宁低勿错。"""
+    仍进待确认）。同额也歧义（多笔等额）则放弃——宁低勿错。
+    第二个 _sole 非冗余：首行让位仅因「≥ 的候选多笔」，等额子集仍可能恰好唯一
+    （如 100/35 两笔 ≥ 35 时取唯一的 35），删掉会把这些可裁决行误抛给人工。"""
     r = _sole([e for e in pool if e["amount"] >= p["amount"]])
     if r:
         return r, True
     r = _sole([e for e in pool if e["amount"] == p["amount"]])
     return (r, True) if r else None
 
-def _match_refund(pool_all: list, p: dict, flow: dict):
+def _match_refund(pool_all: list, p: dict, flow: dict, *, fuzzy: bool = True,
+                  heuristic: bool = True):
     """单条退款行的匹配链：候选一次收窄到统一 90 天窗（含日期 ≤ 退款日），再走
-    ①订单号 → ②名称 → ②'微信专属 → ②''括号 → ③启发式。返回 (候选, 低置信) 或 None。"""
+    ①订单号 → ②名称 → ②'微信专属 → ②''括号 → ③启发式。返回 (候选, 低置信) 或 None。
+    fuzzy/heuristic 供 rescan 补关联收窄（两层证据太弱，命中也仅低置信进待确认）：
+    关闭时名称层不做模糊前缀、不做「金额≥退款额」启发式；占位名/过短名回落
+    等额最近（原 rescan 内联实现的口径，收口到这条链防两处漂移）。"""
     pool = _in_window(pool_all, p["date"], REFUND_WINDOW_DAYS)
     bases = _refund_name_candidates(p["name"])
-    return (_match_order(pool, p)
-            or _match_name(pool, p, bases)
-            or (_match_wechat(pool, p, flow) if flow.get("platform") == "wechat" else None)
-            or _match_bracket(pool, p)
-            or _match_heuristic(pool, p))
+    m = (_match_order(pool, p)
+         or _match_name(pool, p, bases, fuzzy=fuzzy)
+         or (_match_wechat(pool, p, flow) if flow.get("platform") == "wechat" else None)
+         or _match_bracket(pool, p))
+    if m:
+        return m
+    if heuristic:
+        return _match_heuristic(pool, p)
+    if not _strong_bases(bases):
+        eq = [e for e in pool if e["amount"] == p["amount"]]
+        return (eq[0], True) if eq else None
+    return None
 
 def _match_refunds(conn: sqlite3.Connection, ledger_id: int, previews: list[dict],
                    flows: list, snap: _LedgerSnapshot | None = None) -> None:

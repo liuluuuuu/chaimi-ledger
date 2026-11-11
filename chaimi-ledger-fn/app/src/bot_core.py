@@ -1,9 +1,12 @@
 """微信机器人大脑（DESIGN 十章）：通道无关，文本进 / 文本出。
 
-A 通道（bot_ilink iLink 直连）与设置页测试按钮都只调 handle()；
+A 通道（bot_ilink iLink 直连）只调 handle()；
 CLI：python bot_core.py 直接交互联调（bypass_auth），不依赖任何外部通道。
+记账确认模式（设置页 bot.confirm_mode 开关）：reply=识别进草稿等「确认」入库（默认）；
+auto=识别即直接入库（错账靠「撤销/撤销N笔」兜底；金额无效/入库异常的笔留草稿等「确认」，
+其后新记的账与之并入同批入库）。
 会话三态（per user，内存，TTL 30 分钟）：draft 草稿 / query 最近查询列表 /
-del_pending 两步删除确认——指令用词互不冲突，可与草稿态共存。
+del_pending 两步删除确认（待删 id 列表：单笔 1 个 /「撤销N笔」批量 N 个）——指令用词互不冲突，可与草稿态共存。
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import ai
 import applog
 import config
 import db as dbm
+from import_common import cents_loose, yuan_to_cents
 
 TTL_SECONDS = 30 * 60     # 三态会话 TTL；会话期内任何消息续期
 
@@ -39,11 +43,13 @@ _RE_DEL_OK = re.compile(r"^确认删除$")
 _RE_DEL_NO = re.compile(r"^取消删除$")
 _RE_PAGE = re.compile(r"^(更多|对应明细|明细|上一页|上页)$")
 _RE_CAT_PAGE = re.compile(r"^(.{1,12})明细$")   # 「XX明细」：XX=分类名（可简称），见 _cat_page
-_RE_UNDO = re.compile(r"^(撤销|撤回|undo)$", re.I)
+# 「撤销」删最近一笔；带数量（撤销5笔/撤回两笔/undo 2，「笔」可省）走批量两步确认
+_RE_UNDO = re.compile(r"^(?:撤销|撤回|undo)\s*(?:([0-9]+|[一二两三四五六七八九十]{1,3})\s*笔?)?$", re.I)
+_CN_DIGIT = {c: i for i, c in enumerate("一二三四五六七八九", 1)} | {"两": 2}
 _RE_HELP = re.compile(r"^帮助$")
 _RE_MONTH = re.compile(r"^(?:月报|分析)\s*(\d{4}-\d{2})?$")
 
-_sessions: dict[str, dict] = {}
+_sessions: dict[tuple, dict] = {}   # (user, ledger_id) → 会话（见 _session 注释）
 _lock = threading.Lock()
 _user_locks: dict[str, threading.Lock] = {}
 
@@ -61,9 +67,12 @@ def _ulock(user: str) -> threading.Lock:
 def _now() -> float:
     return datetime.datetime.now().timestamp()
 
-def _session(user: str) -> dict:
+def _session(user: str, ledger: int | None) -> dict:
+    """会话按 (user, ledger) 隔离：草稿/翻页/删除确认属于「某人在某账本」的上下文——
+    旧版只按 user 键，同一微信号存在两个绑定（旧版单 dict 条目无 user 字段、重扫不
+    顶替）时，A 账本的草稿会被 B 账本的「确认」以 B 的归属入账（跨账本串账）。"""
     with _lock:
-        s = _sessions.setdefault(user, {})
+        s = _sessions.setdefault((user, ledger), {})
     now = _now()
     # 三态各自独立过期(删除态的 ts 键是 del_ts 不是 del_pending_ts);
     # 过期静默清理(无法主动通知,等下一条消息自然走新流程)
@@ -81,7 +90,7 @@ def _cfg() -> dict:
     return config.load().get("bot") or {}
 
 def _ledger(ledger_id: int | None) -> int | None:
-    """解析目标账本：仅认显式指定（A 通道各 bot 绑定 / 测试按钮首条绑定）；
+    """解析目标账本：仅认显式指定（A 通道各 bot 绑定 / CLI 首个账本）；
     未指定或账本已被删返回 None——调用方回复重绑提示。不做任何默认兜底：
     多用户同一库后"第一个账本/全局默认"都会落到他人账本（B 通道网关模式已下线）。"""
     if not ledger_id:
@@ -92,31 +101,22 @@ def _ledger(ledger_id: int | None) -> int | None:
 _BOT_NO_LEDGER = ("机器人未绑定有效账本（账本可能已被删除）："
                   "请到 App 设置→微信机器人重新扫码绑定。")
 
-def _match_top_cat(rows: list, name: str, tx_type=None):
-    """一级分类两段式匹配：先（按 type）精确名，再双向包含。
-    _resolve_category（取 id）与 _cat_page（取显示名）共用；tx_type=None 时只按名匹配。"""
-    r = next((x for x in rows if x["name"] == name
-              and (tx_type is None or x["type"] == tx_type)), None)
-    return r or next((x for x in rows if name in x["name"] or x["name"] in name), None)
+def _match_top_row(ledger: int, name: str, tx_type: str | None = None):
+    """一级分类名 → 匹配行（db.top_cat_rows + match_top_cat 单源）：
+    _resolve_category 取 id、_match_cat_name 取规范名，两个同构解析共用一处。"""
+    return dbm.match_top_cat(dbm.top_cat_rows(dbm.connect(), ledger), name, tx_type)
 
 def _resolve_category(ledger: int, tx_type: str, name) -> int | None:
-    """一级分类名 → id：先按 type 精确匹配（与前端 aiItems 同口径），再放宽包含匹配。
+    """一级分类名 → id（单条改单路径；批量入库走 ai._cat_ids 一次取行）。
     解析不到返回 None（category_id 留空，App 端编辑时可补）。"""
-    if not name or not str(name).strip():
-        return None
-    hit = _match_top_cat(dbm.connect().execute(
-        "SELECT id, name, type FROM categories WHERE ledger_id=? AND parent_id IS NULL",
-        (ledger,)).fetchall(), str(name).strip(), tx_type)
+    hit = _match_top_row(ledger, str(name or "").strip(), tx_type)
     return hit["id"] if hit else None
 
 # ---------- 渲染 ----------
 
 def _rowget(r, k, default=""):
-    """sqlite3.Row / dict 双兼容取值。"""
-    try:
-        return r[k] if k in r.keys() else default
-    except AttributeError:
-        return r.get(k, default)
+    """sqlite3.Row / dict 双兼容取值（两者都有 .keys()，按成员判定即可）。"""
+    return r[k] if k in r.keys() else default
 
 _TYPE_SIGN = {"expense": "−", "income": "+", "transfer": ""}
 _TYPE_CN = {"expense": "支出", "income": "收入", "transfer": "转账"}
@@ -178,7 +178,7 @@ def _cat_rank(cats: list) -> str:
     valid = [c for c in (cats or []) if c.get("net")]
     if not valid:
         return ""
-    mx = max(abs(c["net"]) for c in valid) or 1
+    mx = max(abs(c["net"]) for c in valid)   # net 为非零整数分值，mx ≥ 1
 
     def row(c):
         name = c["name"] + "　" * max(0, 4 - len(c["name"]))
@@ -199,11 +199,10 @@ def _dup_view(s: dict, ledger: int) -> str:
     ids = _dup_ids(s["draft"]["items"])
     if not ids:
         return "草稿里没有对库的 ⚠️ 重复笔（批内重复直接说「第N笔删了」）。"
-    lines = [f"{no}. {_fmt_item(0, row)}" for no, tid in enumerate(ids, 1)
-             if (row := _tx_row(tid, ledger))]
+    rows = [row for tid in ids if (row := _tx_row(tid, ledger))]
     # 仍指「第N笔删了」防误删其他笔
     drop = "或「丢弃」去掉草稿里那笔" if len(s["draft"]["items"]) == 1 else "或说「第N笔删了」去掉草稿里那笔"
-    return "已记的疑似重复流水：\n" + "\n".join(lines) + f"\n对照后「确认」全记 · {drop}"
+    return "已记的疑似重复流水：\n" + _rows_block(rows, 1) + f"\n对照后「确认」全记 · {drop}"
 
 def _draft_reply(s: dict, title: str = "") -> str:
     """草稿卡文本版——标题/话术与 App AI 页卡片（ai.js aiBookingCard）一字不差：
@@ -216,13 +215,14 @@ def _draft_reply(s: dict, title: str = "") -> str:
             ("\n⚠️ 标 ⚠️ 的笔疑似与已记流水重复，回复「查看」显示重复流水" if dup else "") +
             f"\n回复「确认」记入 {n} 笔 · 「丢弃」取消 · 有误直接说（如「金额改为30」）")
 
-def _help() -> str:
+def _help(auto: bool = False) -> str:
     return ("🤖 柴米记账助手\n"
             "· 记账：直接说，如「午饭25 打车13」，小票直接拍照发来\n"
-            "· 草稿确认中：确认 / 丢弃，改字段直接说\n"
-            "· 查账：如「上周餐饮多少钱」「本月花了多少」；「餐饮明细」看分类流水，「对应明细」看区间流水\n"
+            + ("· 已开直接入库：记错回「撤销」或「撤销N笔」整批撤\n" if auto
+               else "· 草稿确认中：确认 / 丢弃，改字段直接说\n")
+            + "· 查账：如「上周餐饮多少钱」「本月花了多少」；「餐饮明细」看分类流水，「对应明细」看区间流水\n"
             "· 改流水：查询后说「第2笔改成86」「打车那笔删了」\n"
-            "· 撤销：删最近一笔机器人记账 · 月报：月报 / 月报 2026-09 · 帮助")
+            "· 撤销：删最近一笔机器人记账 · 「撤销5笔」批量删（两步确认）· 月报：月报 / 月报 2026-09 · 帮助")
 
 # ---------- SSE 收集（ai.chat / monthly_analysis 结构化事件流 → dict） ----------
 
@@ -247,7 +247,7 @@ def handle(text: str, user: str, image_path: str | None = None,
            bypass_auth: bool = False, ledger_id: int | None = None,
            attribution: str = "") -> str:
     """消息统一入口：返回回复文本。A 通道在轮询线程调用后 POST 送出(带该 bot 绑定的
-    ledger_id 与用户名——绑定谁,记的账自动带谁的归属)。bypass_auth 供 CLI / 设置页测试按钮使用。
+    ledger_id 与用户名——绑定谁,记的账自动带谁的归属)。bypass_auth 供 CLI 联调使用。
     并发口径：白名单校验先行(陌生 id 不注册 per-user 锁,防锁表被撑大——能发消息的
     微信用户 id 不可枚举)，授权用户全程持 per-user 锁串行（见 _ulock）。"""
     cfg = _cfg()
@@ -262,9 +262,22 @@ def _handle(text: str, user: str, image_path: str | None,
     ledger = _ledger(ledger_id)
     if ledger is None:
         return _BOT_NO_LEDGER
-    s = _session(user)
+    s = _session(user, ledger)
+    auto = cfg.get("confirm_mode") == "auto"   # 记账确认开关：auto=识别即入库（见模块注释）
 
-    # 1) 草稿指令（DRAFT_PENDING）
+    # 1) 删除确认（PENDING_DELETE）：只认「确认删除/取消删除」，其余任何消息当场取消挂起。
+    #    放在最前且就地取消——此前只在落到末尾分支才取消，草稿指令/翻页/撤销/月报/帮助/
+    #    小票都提前 return 把它留着，30 分钟内一句迟到的「确认删除」会删掉早已遗忘的旧清单。
+    #    （「确认删除」与草稿的「确认」是不同整句，先判不会误吞草稿指令）
+    if s.get("del_pending"):
+        if _RE_DEL_OK.match(text):
+            return _do_delete(s, ledger)
+        s["del_pending"] = None
+        if _RE_DEL_NO.match(text):
+            return "已取消删除"
+    elif _RE_DEL_OK.match(text):
+        return "没有待确认的删除（已取消或已过期），请重新发起。"
+    # 2) 草稿指令（DRAFT_PENDING）
     if s.get("draft"):
         if _RE_OK.match(text):
             return _confirm(s, ledger, attribution)
@@ -276,13 +289,6 @@ def _handle(text: str, user: str, image_path: str | None,
             return _draft_reply(s)
         if text == "查看":
             return _dup_view(s, ledger)
-    # 2) 删除确认（PENDING_DELETE；任何其他消息在后续分支里被取消）
-    if s.get("del_pending"):
-        if _RE_DEL_OK.match(text):
-            return _do_delete(s, ledger)
-        if _RE_DEL_NO.match(text):
-            s["del_pending"] = None
-            return "已取消删除"
     if s.get("query") and _RE_PAGE.match(text):
         return _page(s, ledger, text)
     # 3) 分类明细翻页（本地路由不过模型——直接问「餐饮明细」会被系统提示的
@@ -290,102 +296,205 @@ def _handle(text: str, user: str, image_path: str | None,
     m = _RE_CAT_PAGE.match(text)
     if m and s.get("query"):
         return _cat_page(s, ledger, m.group(1).strip())
-    # 4) 撤销
-    if _RE_UNDO.match(text):
-        return _undo(ledger, attribution)
+    # 4) 撤销：单笔直接删；「撤销N笔」批量走两步确认（不可逆，防手滑）
+    m = _RE_UNDO.match(text)
+    if m:
+        return _ask_undo_n(s, ledger, m.group(1), attribution) if m.group(1) else _undo(ledger, attribution)
     # 5) 月报（精确匹配；模糊句落入编辑/对话由模型处理）
     m = _RE_MONTH.match(text)
     if m:
         return _monthly(ledger, m.group(1) or datetime.date.today().strftime("%Y-%m"))
     # 6) 帮助
     if _RE_HELP.match(text):
-        return _help()
-    # 7) 图片：小票 → 开草稿 / 追加到当前草稿
+        return _help(auto)
+    # 7) 图片：小票 → 开草稿 / 追加到当前草稿（auto 直接入库）
     if image_path:
-        return _receipt(s, ledger, image_path)
+        return _receipt(s, ledger, image_path, attribution, auto)
     # 8) 其余一切：有草稿进编辑回合，无草稿走 ai.chat（记账/查账模型自路由）
-    s["del_pending"] = None   # 走到这说明不是删除确认指令 → 取消挂起的删除
     if s.get("draft"):
-        return _edit_flow(s, ledger, text)
-    return _chat_flow(s, ledger, text)
+        return _edit_flow(s, ledger, text, attribution, auto)
+    return _chat_flow(s, ledger, text, attribution, auto)
 
 # ---------- 记账链路 ----------
 
-def _confirm(s: dict, ledger: int, attribution: str = "") -> str:
-    """「确认」：批量入库（need_confirm=0 正式流水，source='bot'）;
-    attribution=绑定的账本用户,写入 tags.attribution(流水页按归属筛选可用)。
-    入库异常时草稿放回会话（DB 事务已回滚,输入与小票引用不丢,孤儿清理链路管不到）,
-    用户重试「确认」即可,不必重新口述/重拍小票。"""
-    draft = s["draft"]
+def _amt_ok(it) -> bool:
+    """草稿条目金额可入库（正整数分）：上游 _booking_items/小票解析已把金额统一
+    归一成 int 分值（字符串清洗、nan/inf 归 0 都在换算单点完成），0/负/脏值兜 0，
+    0 额过 check_tx_fields 必抛——此处只验形态，不再 try/int 二次换算。"""
+    amt = it.get("amount")
+    return isinstance(amt, int) and not isinstance(amt, bool) and amt > 0
+
+def _set_draft(s: dict, items: list, text: str) -> None:
+    """开/换草稿并续期（TTL 自最后一次改动起算）。"""
+    s["draft"] = {"items": items, "text": text}
+    s["draft_ts"] = _now()
+
+
+def _commit(s: dict, ledger: int, items: list, attribution: str, text: str,
+            auto: bool = False) -> str:
+    """入库收口（「确认」与直接入库共用）：好笔批量入库——need_confirm=0 正式流水、
+    source='bot'，attribution 写 tags.attribution（流水页按归属筛选可用）。
+    金额无效笔（0/负/脏值）前置拦截（App txSubmitCreate 的 filter(x=>x.amount>0) 同口径）：
+    全坏不入库、整单留草稿指引改金额（放行必抛，「确认」原地死循环）；部分坏→好笔入库、
+    坏笔留草稿续期（连同 receipt_path：改金额的指引才可执行，小票也不成孤儿）。
+    入库异常事务已回滚，整单留草稿（输入与小票引用不丢），重发「确认」即可。
+    auto=直接入库：没有确认前的人工闸，疑似重复（dup_hint）入库后如实附注。"""
+    good = [it for it in items if _amt_ok(it)]
+    bad = [it for it in items if not _amt_ok(it)]
+    fix = "说「第 1 笔金额改为30」修正后回复「确认」，或「丢弃」放弃"   # 留草稿的坏笔从第 1 笔起编号
+    if not good:
+        _set_draft(s, items, text)
+        return f"⚠️ {len(bad)} 笔金额均为 0/无效，无法入库，已留在草稿：{fix}。"
     s["draft"] = None
-    c = dbm.connect()
-    ids = []
     try:
-        with c:
-            for it in draft["items"]:
-                ttype = it.get("type") if it.get("type") in ("expense", "income", "transfer") else "expense"
+        # 分类在插入时按名重新注记（不沿用草稿期 id：期间分类可能被删改，旧 id 外键必败），
+        # 整批一次取行——与 AI 条目规范化同一解析单源；放 try 内，查库失败同样留草稿
+        ai._cat_ids(ledger, good)
+        with dbm.connect() as c:
+            for it in good:
+                ttype = it.get("type") if it.get("type") in dbm.TX_TYPES else "expense"
                 d = it.get("date") or _today()
-                ids.append(dbm.insert_tx(
-                    c, ledger, type=ttype, amount=int(it.get("amount") or 0),
-                    category_id=_resolve_category(ledger, ttype, it.get("category_name")),
+                cid = it["category_id"]
+                # name/note 的文本截断在 insert_tx 写库单点完成（与 App 写入同一道）
+                dbm.insert_tx(
+                    c, ledger, type=ttype, amount=int(it["amount"]),
+                    category_id=cid,
                     account_id=it.get("account_id"),
                     date=d,
-                    name=(it.get("name") or "")[:40], note=(it.get("note") or "")[:80],
+                    name=it.get("name") or "",
+                    note=it.get("note") or "",
                     receipt_path=it.get("receipt_path"),
                     tags=({"attribution": attribution} if attribution else None),
                     source="bot",
+                    # 与 App 提交同口径（AI 解析分类+用户确认）：打 manual_cat——
+                    # 同一语义此前 App 打标、bot 不打，修复可翻 bot 确认行的分类
+                    manual_cat=bool(cid),
                     # time_source:AI 记一笔时间规则——date 带 HH:MM(时段/时刻映射)记 "ai",
                     # 纯日期记 "none"(显示层据此只显日期,norm_date 补的当前时刻不展示)
-                    ai_meta={"via": "bot", "chat_text": (draft.get("text") or "")[:200],
-                             "time_source": "ai" if len(d) > 10 else "none"}))
+                    ai_meta={"via": "bot", "chat_text": (text or "")[:200],
+                             "time_source": "ai" if len(d) > 10 else "none"})
     except Exception as e:
-        s["draft"] = draft
-        applog.get("bot-core").warning(f"草稿入库失败(草稿已保留): {type(e).__name__}: {e}")
-        return "⚠️ 入库失败，草稿已保留，请稍后重发「确认」。"
+        _set_draft(s, items, text)
+        applog.get("bot-core").warning(f"入库失败(已留草稿): {type(e).__name__}: {e}")
+        return "⚠️ 入库失败，已留在草稿，请稍后回复「确认」重试。"
     _bump()
-    return f"✅ 已记入 {len(ids)} 笔 · 回复「撤销」可删最近一笔"
+    dup = sum(isinstance(it.get("dup_hint"), dict) for it in good) if auto else 0
+    # 单笔只给「撤销」：「撤销1笔」同义却多一道两步确认，并列反而误导
+    undo = "「撤销」删最近一笔" + (f" · 「撤销{len(good)}笔」整批撤" if len(good) > 1 else "")
+    msg = f"✅ 已记入 {len(good)} 笔" + (f"（{dup} 笔疑似与已记流水重复，请核对）" if dup else "")
+    if auto:
+        # 没有草稿卡可对照，好笔明细列进回复（行格式与草稿卡同款），单笔多笔一致——
+        # 单笔只回一行时，核对金额/分类得去 App 翻流水
+        msg += f"：\n{_rows_block(good, 1)}\n{undo}"
+    else:
+        msg += f" · {undo}"
+    if bad:
+        _set_draft(s, bad, text)
+        # auto 下坏笔同样列行（否则「第 1 笔改金额」无从对照）；reply 模式草稿卡就在上一条，只提示
+        if auto:
+            msg += f"\n❌ 另 {len(bad)} 笔金额无效未入库，已留在草稿：\n{_rows_block(bad, 1)}\n{fix}"
+        else:
+            msg += f"\n（另 {len(bad)} 笔金额无效未入库，已留在草稿：{fix}）"
+    return msg
 
-def _receipt(s: dict, ledger: int, image_path: str) -> str:
-    """小票图片 → parse_receipt → 开草稿或追加（连拍多张场景）。"""
+
+def _confirm(s: dict, ledger: int, attribution: str = "") -> str:
+    """「确认」：草稿整单入库（口径见 _commit）。"""
+    return _commit(s, ledger, s["draft"]["items"], attribution, s["draft"].get("text") or "")
+
+def _pending(s: dict) -> list:
+    """auto 模式下待「确认」的遗留草稿条目（金额无效/入库异常留下的）：新记账并入同批
+    _commit——好笔入库、坏笔续留草稿；不并会被新草稿顶掉（坏笔丢失、小票成孤儿）。"""
+    return s["draft"]["items"] if s.get("draft") else []
+
+
+def _receipt(s: dict, ledger: int, image_path: str,
+             attribution: str = "", auto: bool = False) -> str:
+    """小票图片 → parse_receipt → 开草稿 / 并入当前草稿（连拍多张场景）；auto 直接入库。"""
     out = ai.parse_receipt(image_path)
     if out.get("error"):
         unlink_receipt(image_path)   # 识别失败的图片不留草稿,文件直接清理(防孤儿)
         return f"⚠️ {out['error']}"
     it = {"type": out.get("type") or "expense",
-          "amount": round(float(out.get("amount") or 0) * 100),
+          "amount": yuan_to_cents(out.get("amount")) or 0,   # 元→分（parse_receipt 返回元；全库换算单点）
           "category_name": out.get("category_name") or "", "account": "", "account_id": None,
           "date": out.get("date") or _today(),
           "name": out.get("name") or "小票", "note": out.get("note") or "",
           # 入库约定与 App 一致:存 "receipts/文件名"(viewReceipt 按相对 URL 取图)。
           # parse_receipt 不回传该字段,由本函数从落盘路径补齐(server /api/ai/receipt 同款)
           "receipt_path": "receipts/" + Path(image_path).name}
-    title = ""
-    if not s.get("draft"):
-        s["draft"] = {"items": [], "text": "小票"}
-        title = "小票识别结果，请确认"   # 首张:App 同款标题;追加时用统一草稿卡
-    s["draft"]["items"].append(it)
-    s["draft_ts"] = _now()
-    return _draft_reply(s, title)
+    if auto:
+        return _commit(s, ledger, _pending(s) + [it], attribution, "小票", auto=True)
+    if s.get("draft"):
+        _set_draft(s, s["draft"]["items"] + [it], s["draft"]["text"])
+        return _draft_reply(s)
+    _set_draft(s, [it], "小票")
+    return _draft_reply(s, "小票识别结果，请确认")   # 首张:App 同款标题;追加时用统一草稿卡
+
+def _undo_rows(ledger: int, attribution: str, limit: int) -> list:
+    """可撤销流水整行（时间倒序前 limit 条，TX_COLS 连分类/账户名）——单笔撤销与
+    「撤销N笔」共用同一口径：source='bot'、24h 内、按归属过滤。多人共用账本按归属
+    过滤——A 通道只删绑定人记的（tags.attribution=归属名），B 网关/CLI（无归属）
+    只删同样无归属的，不误删家人刚记的流水。"""
+    if attribution:
+        cond, args = f" AND {dbm.jx('tags')}=?", (attribution,)
+    else:
+        cond, args = f" AND COALESCE({dbm.jx('tags')},'')=''", ()   # jx 安全片段：脏 tags 行不再让撤销 500
+    # created 默认值 datetime('now') 存 UTC：比较须同为 UTC（'localtime' 在 UTC+8 下
+    # 阈值比 UTC 早 8h，有效窗口从 24h 缩到 16h）
+    return dbm.connect().execute(
+        f"SELECT {dbm.TX_COLS}{dbm.TX_FROM} WHERE t.ledger_id=? AND t.source='bot' "
+        f"AND t.created>=datetime('now','-1 day'){cond} ORDER BY t.id DESC LIMIT ?",
+        (ledger, *args, limit)).fetchall()
+
 
 def _undo(ledger: int, attribution: str = "") -> str:
-    """撤销：删最近一笔 source='bot' 的流水（24h 内，限本人）。
-    多人共用账本按归属过滤——A 通道只删绑定人记的（tags.attribution=归属名），
-    B 网关/CLI（无归属）只删同样无归属的，不误删家人刚记的流水。"""
-    if attribution:
-        cond, args = " AND json_extract(tags,'$.attribution')=?", (attribution,)
-    else:
-        cond, args = " AND COALESCE(json_extract(tags,'$.attribution'),'')=''", ()
-    row = dbm.connect().execute(
-        f"SELECT id, name, amount FROM transactions WHERE ledger_id=? AND source='bot' "
-        # created 默认值 datetime('now') 存 UTC：比较须同为 UTC（'localtime' 在 UTC+8 下
-        # 阈值比 UTC 早 8h，有效窗口从 24h 缩到 16h）
-        f"AND created>=datetime('now','-1 day'){cond} ORDER BY id DESC LIMIT 1",
-        (ledger, *args)).fetchone()
-    if not row:
+    """撤销：删最近一笔 source='bot' 的流水（24h 内，限本人），口径见 _undo_rows。"""
+    rows = _undo_rows(ledger, attribution, 1)
+    if not rows:
         return "最近 24 小时没有你经机器人记的流水。"
-    _remove_tx(row["id"])
+    _remove_tx(rows[0]["id"])
     _bump()
-    return f"🗑️ 已撤销：{row['name'] or '（未命名）'} ¥{row['amount'] / 100:.2f}"
+    return f"🗑️ 已撤销：{_tx_name(rows[0])} ¥{rows[0]['amount'] / 100:.2f}"
+
+
+def _cn_num(s: str) -> int | None:
+    """中文数字（一/两~九十九）→ 整数：「撤销五笔」「撤回两笔」「撤回二十五笔」同收；
+    不合法写法（如「十十」）返回 None，消息回落普通对话分支。"""
+    if s in _CN_DIGIT:
+        return _CN_DIGIT[s]
+    m = re.fullmatch(r"([一二三四五六七八九]?)十([一二三四五六七八九]?)", s)
+    return _CN_DIGIT.get(m.group(1), 1) * 10 + _CN_DIGIT.get(m.group(2), 0) if m else None
+
+
+def entry_ledger(e: dict) -> int:
+    """conf 里 bot.ilink 条目的 ledger 容错解析：手改坏值（"abc"/None）归 0（=未指定），
+    不让 apply/组改名同步/删账本清理 500（应用自己的写入方恒为 int）。三处消费方共用。"""
+    try:
+        return int(e.get("ledger") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+def _ask_undo_n(s: dict, ledger: int, n_raw: str, attribution: str) -> str:
+    """「撤销N笔」第一步：列出将删的最近 N 笔（口径同单笔撤销，见 _undo_rows），
+    挂 del_pending（id 列表）等「确认删除」执行——批量删不可逆，
+    与单笔两步删除同款闸。数量不足如实提示（要 5 笔只有 2 笔就按 2 笔确认），
+    确认卡超 10 行折叠「…等共 N 笔」。"""
+    n = int(n_raw) if n_raw.isdigit() else _cn_num(n_raw)
+    if not n or n < 1:
+        return "没看懂要撤销几笔：如「撤销5笔」（单笔直接回「撤销」）。"
+    if n > 999:
+        # LIMIT ? 绑参须在 int64 内；正常家庭账也不会一次撤近千笔，上限从紧
+        return "一次最多撤销 999 笔；如需更多请分批操作。"
+    rows = _undo_rows(ledger, attribution, n)
+    if not rows:
+        return "最近 24 小时没有你经机器人记的流水。"
+    s["del_pending"] = [r["id"] for r in rows]
+    s["del_ts"] = _now()
+    less = "" if len(rows) == n else f"（24 小时内可撤销的只有 {len(rows)} 笔）"
+    more = f"\n…等共 {len(rows)} 笔" if len(rows) > 10 else ""
+    return (f"⚠️ 确认撤销最近 {len(rows)} 笔{less}：\n" + _rows_block(rows[:10], 1) + more +
+            "\n回复「确认删除」执行 · 「取消删除」放弃")
 
 def _remove_tx(tid: int) -> None:
     """删行 + 解除退款关联 + 清小票文件（撤销/两步删除共用）。"""
@@ -453,13 +562,14 @@ def _merge_receipts(old_items, new_items) -> None:
 
 # ---------- 对话 / 编辑链路 ----------
 
-def _chat_flow(s: dict, ledger: int, text: str) -> str:
+def _chat_flow(s: dict, ledger: int, text: str,
+               attribution: str = "", auto: bool = False) -> str:
     """无草稿态：ai.chat 全权处理（记账→booking 草稿 / 查账→统计回答+列表+条形图）。
     兜底在 ai.chat 后端核心:LLM 不可用时补发正则拆分的 booking,
     bot 自动同源获得;连兜底都拆不出才透传错误。传输层依旧零解析。"""
     out = _collect(ai.chat(text, ledger))
-    if out["error"] and not out["text"] and not out["booking"]:
-        return f"⚠️ {out['error']}"   # 兜底也没拆出东西才透传错误(兜底在 ai.chat 后端核心)
+    if out["error"] and not (out["text"] or out["booking"] or out["stats"]):
+        return f"⚠️ {out['error']}"   # 毫无产出才只回错误（产出含 stats，与 ai.chat 同口径；兜底在 ai.chat 后端核心）
     reply = out["text"].strip()
     st = out["stats"]
     if st:
@@ -468,9 +578,8 @@ def _chat_flow(s: dict, ledger: int, text: str) -> str:
                       "category": st.get("category") if st.get("matched") else None}
         s["query_ts"] = _now()
         if st.get("matched") and st.get("items"):
-            # 命中分类：原始词换规范名（「餐饮」→「餐饮美食」），紧凑明细首屏与「XX明细」同形态
-            s["query"]["category"] = _match_cat_name(ledger, st.get("category") or "") \
-                or s["query"]["category"]
+            # 分类名即规范名：ai._run_tool 命中时已按分类清单归一（「餐饮」→「餐饮美食」，
+            # test_backup_ai_bot 钉住该契约），紧凑明细首屏与「XX明细」同形态
             lst = _list_view(s, ledger, LIST_MAX)
             if lst:
                 reply += ("\n" if reply else "") + lst
@@ -482,13 +591,23 @@ def _chat_flow(s: dict, ledger: int, text: str) -> str:
         items = out["booking"].get("items") or []
         if items:
             btext = out["booking"].get("text") or ""
-            s["draft"] = {"items": items, "text": btext or text}
-            s["draft_ts"] = _now()
+            if auto:
+                return _commit(s, ledger, _pending(s) + items, attribution, btext or text, auto=True)
+            # 自 _edit_flow（new 回合）落回此处时旧草稿被整体顶掉：旧条目的 receipt_path
+            # 未入库，先按删光分支口径清理（同 _edit_flow），否则孤儿文件落盘
+            if s.get("draft"):
+                _purge_receipts(s["draft"].get("items"))
             # 兜底 booking 的 text 是提示标题(≠原句),沿用为草稿标题;LLM booking 的 text=原句不重复显示
+            _set_draft(s, items, btext or text)
             reply = _draft_reply(s, btext if btext and btext != text else "")
+    elif out["error"]:
+        # 有产出又出错（流式回答中途断网等）：错误随文附上——此前只在「毫无产出」时透传，
+        # 半截回答被当成完整答复，用户无从知道被截断
+        reply += f"\n⚠️（回答中断：{out['error']}）"
     return reply.strip() or "（没有返回内容）"
 
-def _edit_flow(s: dict, ledger: int, text: str) -> str:
+def _edit_flow(s: dict, ledger: int, text: str,
+               attribution: str = "", auto: bool = False) -> str:
     """草稿态：先过编辑回合（revise/tx/new/none），new/none 落回 ai.chat。"""
     out = ai.edit_round(text, _draft_ctx(s), _query_ctx(s, ledger), ledger)
     tgt = out.get("target")
@@ -499,15 +618,14 @@ def _edit_flow(s: dict, ledger: int, text: str) -> str:
             s["draft"] = None
             return "草稿条目已全部删除。重新说一句即可再记。"
         _merge_receipts(s["draft"].get("items"), items)
-        s["draft"] = {"items": items, "text": (s["draft"].get("text") or "") + ";" + text}
-        s["draft_ts"] = _now()
+        _set_draft(s, items, (s["draft"].get("text") or "") + ";" + text)
         return _draft_reply(s)   # App 等价:卡片原地重渲染 → 重发同款草稿卡
     if tgt == "tx":
         if out.get("action") == "delete":
             return _ask_delete(s, ledger, out["id"])
         if out.get("action") == "update":
             return _apply_patch(ledger, out["id"], out.get("patch") or {})
-    return _chat_flow(s, ledger, text)   # new / none：草稿保留，正常对话
+    return _chat_flow(s, ledger, text, attribution, auto)   # new / none：草稿保留，正常对话
 
 def _draft_ctx(s: dict) -> list | None:
     """给编辑模型的草稿上下文（金额转元，字段与记账解析器一致）。"""
@@ -543,8 +661,10 @@ def _fetch_rows(ledger: int, q: dict, limit: int | None = None) -> list:
     return dbm.fetch_tx_rows(dbm.connect(), ledger, **_q(q), limit=limit)
 
 def _q_title(q: dict) -> str:
-    """缓存查询标题：分类（有则）· 区间（无界=全部流水）。"""
-    rng = f"{q.get('dfrom')}~{q.get('dto')}" if q.get("dfrom") and q.get("dto") else "全部流水"
+    """缓存查询标题：分类（有则）· 区间（无界=全部流水）。
+    dto 是排他上界（上周显示 ~11-02 多一天），展示减回含端末日（db.excl_to_incl 单点）。"""
+    dto = dbm.excl_to_incl(q.get("dto") or "")   # 非法串原样保留（同旧版 try/pass 口径）
+    rng = f"{q.get('dfrom')}~{dto}" if q.get("dfrom") and dto else "全部流水"
     return f"{q['category']} · {rng}" if q.get("category") else rng
 
 def _rows_compact(rows: list) -> str:
@@ -588,10 +708,9 @@ def _page(s: dict, ledger: int, text: str) -> str:
     return _list_view(s, ledger, LIST_MAX) or "这段区间没有流水。"
 
 def _match_cat_name(ledger: int, name: str) -> str | None:
-    """一级分类名 → 规范名（_cat_page 与命中分类明细共用，简称可命中）。"""
-    hit = _match_top_cat(dbm.connect().execute(
-        "SELECT name FROM categories WHERE ledger_id=? AND parent_id IS NULL",
-        (ledger,)).fetchall(), name)
+    """一级分类名 → 规范名（_cat_page 与命中分类明细共用，简称可命中；
+    行集/匹配与 _resolve_category 同源（_match_top_row），仅取字段不同）。"""
+    hit = _match_top_row(ledger, name)
     return hit["name"] if hit else None
 
 def _cat_page(s: dict, ledger: int, cat: str) -> str:
@@ -611,10 +730,10 @@ def _cat_page(s: dict, ledger: int, cat: str) -> str:
     return r
 
 def _tx_row(tid: int, ledger: int):
-    # 单笔取行用 LEFT JOIN（外连接）：无分类的行也取得到（列表查询的 INNER JOIN 口径会排除它们）
+    # 单笔取行：TX_FROM 的 LEFT JOIN（外连接）无分类的行也取得到（列表查询的
+    # INNER JOIN 口径会排除它们），与 _undo_rows 同一联表单源
     return dbm.connect().execute(
-        f"SELECT {dbm.TX_COLS} FROM transactions t LEFT JOIN categories c ON t.category_id=c.id "
-        f"LEFT JOIN accounts a ON t.account_id=a.id WHERE t.id=? AND t.ledger_id=?",
+        f"SELECT {dbm.TX_COLS}{dbm.TX_FROM} WHERE t.id=? AND t.ledger_id=?",
         (tid, ledger)).fetchone()
 
 _TX_NOT_FOUND = "没找到这笔流水（可能已删除或列表过期），请重新查询后再试。"
@@ -623,18 +742,25 @@ def _ask_delete(s: dict, ledger: int, tid: int) -> str:
     row = _tx_row(tid, ledger)
     if not row:
         return _TX_NOT_FOUND
-    s["del_pending"] = tid
+    s["del_pending"] = [tid]   # 单笔=1 元素列表：与「撤销N笔」批量同态，_do_delete 不分叉
     s["del_ts"] = _now()
     return (f"⚠️ 确认删除：{_fmt_item(0, row)} ?\n"
             "回复「确认删除」执行 · 「取消删除」放弃")
 
 def _do_delete(s: dict, ledger: int) -> str:
-    tid = s["del_pending"]
+    """「确认删除」执行：单笔与「撤销N笔」批量同一收口——确认间隙被并发删掉的
+    跳过并如实计数（delete_tx 幂等，跳过只为不虚报）。"""
+    ids = s["del_pending"] or []
     s["del_pending"] = None
-    row = _tx_row(tid, ledger)
-    _remove_tx(tid)
-    _bump()
-    return "🗑️ 已删除：" + (_fmt_item(0, row) if row else f"#{tid}")
+    rows = [r for tid in ids if (r := _tx_row(tid, ledger))]
+    for r in rows:
+        _remove_tx(r["id"])
+    if rows:
+        _bump()
+    if len(ids) == 1:
+        return "🗑️ 已删除：" + (_fmt_item(0, rows[0]) if rows else f"#{ids[0]}")
+    gone = len(ids) - len(rows)
+    return f"🗑️ 已撤销 {len(rows)} 笔" + (f"（另 {gone} 笔已不存在）" if gone else "")
 
 def _apply_patch(ledger: int, tid: int, patch: dict) -> str:
     row = _tx_row(tid, ledger)
@@ -642,10 +768,13 @@ def _apply_patch(ledger: int, tid: int, patch: dict) -> str:
         return _TX_NOT_FOUND
     fields = {}
     if patch.get("amount") is not None:
-        try:
-            fields["amount"] = round(float(str(patch["amount"]).replace(",", "")) * 100)
-        except (TypeError, ValueError):
-            pass
+        # 口说金额换算单点（cents_loose，与 ai._booking_items 同一份）："30元"/"¥30"/"1.5万" 都认；
+        # None=空/解析不了/nan/inf（"1e999" 等），跳过金额字段其余照改
+        amt = cents_loose(patch["amount"])
+        if amt is not None:
+            if amt <= 0:
+                return "⚠️ 金额必须大于 0，未做修改；请换个说法（如「第2笔改成86.5」）。"
+            fields["amount"] = amt
     if patch.get("category_name"):
         cid = _resolve_category(ledger, row["type"], patch["category_name"])
         if cid:
@@ -665,14 +794,18 @@ def _apply_patch(ledger: int, tid: int, patch: dict) -> str:
             bad_date = str(patch["date"])[:16]
     for k in ("name", "note", "merchant"):
         if patch.get(k) is not None:
-            fields[k] = str(patch[k])[:60]
+            fields[k] = str(patch[k])   # 截断单源在 db.patch_tx（TX_TEXT_MAX），此处不另截
     if not fields:
         if bad_date:
             return f"日期「{bad_date}」没听懂，请说完整日期（如「改成11月1号」）。"
         return "没有识别到要修改的字段，请说得更明确些（如「第2笔改成86.5」）。"
     c = dbm.connect()
-    with c:
-        dbm.patch_tx(c, tid, fields)
+    try:
+        with c:
+            dbm.patch_tx(c, tid, fields)
+    except ValueError as e:
+        # patch_tx 值域闸（兜住绕过上层校验的 future 调用方）：可读回复而非裸异常
+        return f"⚠️ 修改未生效：{e}"
     new = _tx_row(tid, ledger)
     _bump()
     tip = f"\n⚠️ 日期「{bad_date}」没听懂未修改，请说完整日期（如 11月1号）。" if bad_date else ""
@@ -684,7 +817,9 @@ def _monthly(ledger: int, month: str) -> str:
     out = _collect(ai.monthly_analysis(ledger, month))
     if out["error"] and not out["text"]:
         return f"⚠️ {out['error']}"
-    return f"📊 {month} 月报：\n{out['text']}".strip()
+    # 半截月报（流式中途出错）如实附注，不冒充完整分析（与 _chat_flow 同口径）
+    tail = f"\n⚠️（分析中断：{out['error']}）" if out["error"] else ""
+    return f"📊 {month} 月报：\n{out['text']}".strip() + tail
 
 # ---------- CLI 冒烟（python bot_core.py；不依赖任何通道） ----------
 

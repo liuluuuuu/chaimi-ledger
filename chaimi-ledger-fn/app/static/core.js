@@ -1,25 +1,25 @@
-const $ = s => document.querySelector(s);
+/* 基础工具（$/esc/qEsc/api/apiSend/makeSeq/ledgerScope/avatarUrl/nextDayStr/pad2/mkEditToggle）
+   单源在 shared-lite.js（app.html 与 home.html 共载，core.js 不再重复声明——双份实现
+   曾出现 esc 写法漂移）；fmt/toCents 为本文件声明的 app 专属变体。 */
 const fmt = c => (c/100).toFixed(2);            // 分 → 元字符串
-const toCents = y => Math.round(parseFloat(y || "0") * 100);   // 元输入 → 分（记账/预算共用）
+/* 元输入 → 分（记账/预算共用）：先 toPrecision(12) 再取整——裸 Math.round(parseFloat*100)
+   在 *.005 边界因二进制误差丢 1 分（1.005*100=100.4999…→100） */
+const toCents = y => Math.round((parseFloat(y || "0") * 100).toPrecision(12));
 const MAX_UPLOAD_B = (window.CHAIMI_MAX_MB || 20) * 1048576;   // 上传上限：服务端 _page 注入（server.py MAX_UPLOAD 单源）；直开静态页无注入时回落 20MB
 const mobileMQ = matchMedia("(max-width:768px)");   // 抽屉断点，与 views.css @media 同阈值（769 起为桌面）；ledger.js 复用 !mobileMQ.matches
 
 /* 当前飞牛用户（/api/whoami 一次拉取；uid=null=本地开发无网关身份）：
    身份徽标/共享标记/默认归属选中/设置页 admin 门共用 */
 let ME = {uid:null, username:"", isadmin:false};
-let _mePromise = null;
-async function loadMe(){
-  if(!_mePromise) _mePromise = api("api/whoami").then(m=>{
-    ME = m || ME;
-    const b = $("#meBadge");
-    if(b){
-      b.style.display = ME.uid ? "" : "none";
-      b.textContent = "👤 " + (ME.username || ("uid " + ME.uid)) + (ME.isadmin ? " · 管理员" : "");
-    }
-    return ME;
-  }, ()=>ME);
-  return _mePromise;
-}
+const loadMe = singleFlight(async () => {
+  try{ ME = (await api("api/whoami")) || ME; }catch(_){ return ME; }   // 拉不到按当前值用（原口径：失败不阻断）
+  const b = $("#meBadge");
+  if(b){
+    b.style.display = ME.uid ? "" : "none";
+    b.textContent = "👤 " + (ME.username || ("uid " + ME.uid)) + (ME.isadmin ? " · 管理员" : "");
+  }
+  return ME;
+});
 
 /* 币种单源（curSym 与设置页币种下拉 LEDGER_CURS 共用）：[中文名, 符号]，新增币种只改这里 */
 const CUR_INFO = {CNY:["人民币","¥"], USD:["美元","$"], EUR:["欧元","€"], JPY:["日元","¥"], HKD:["港币","HK$"], GBP:["英镑","£"]};
@@ -36,20 +36,16 @@ const today = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.
 const thisMonth = () => today().slice(0,7);
 /* 退款对「吸收」过滤：已被退款行引用的原交易 id 集合（流水/详情共用） */
 function absorbedIds(items){ return new Set(items.filter(x=>x.refund_for).map(x=>x.refund_for)); }
-/* AI 是否已配置；接口异常时按已配置处理（与各调用点原逻辑一致：失败不阻断） */
+/* AI 是否已配置；接口异常时按已配置处理（产品口径：失败不阻断，让用户走到具体
+   功能处收到真实报错，而不是被"未配置 AI"误导） */
 async function aiConfigured(){
   try{ const cfg = await getCfg(); return !!(cfg.llm && cfg.llm.api_key); }
-  catch(_){ return true; }
+  catch(e){ console.warn("配置读取失败，按已配置放行", e); return true; }
 }
 const lid = () => +$("#ledgerSel").value || 1;
 const TYPE_CN = {expense:"支出", income:"收入", transfer:"转账"};
 const TX_SUB_DEFAULT = "账户转账";   // 转账兜底子类单点（与后端 db.DEFAULT_TRANSFER_SUB 同值；import.js/ai.js 展示共用这里，不再各抄一份）
 const TX_TYPES = [{v:"expense",t:"支出"},{v:"income",t:"收入"}];
-const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));   // 文本/属性值转义（含单引号，与 home.html 独立实现同口径）
-const pad2 = n => String(n).padStart(2, "0");   // 两位补零（导出时间戳/排他上界/日历格子共用）
-// onclick 内联字符串转义：先 JS 字符串层（\ ' 换行），再 HTML 属性层（& < > "，' 不转——\' 须原样到达 JS）。
-// 原实现只转 '：账单商户名/账本名等可控文本里的 < 和 " 可闭合属性注入 HTML（XSS）
-const qEsc = t => String(t==null?"":t).replace(/[\\']/g, c => "\\"+c).replace(/[\n\r\u2028\u2029]/g, "\\n").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const signed = (type, amount) => type === "expense" ? -amount : amount;   // 收支符号化金额（日净额/退款净额计算共用）
 /* 分类→色系单源（马卡龙 CSS 变量名对）：tx-card[data-cat] 的 --cat-color/--cat-bg（启动时注入
    <style>）与 txIcon 的内联底色/字色共用这一份，改色只动这里（AI 聊天图标与流水卡永不分叉） */
@@ -96,11 +92,14 @@ let categories = [], accounts = [], attributions = [], attrGroups = [], attrGrou
     impPreviews = null, impMeta = null, charts = {}, txCache = {}, editTx = null;
 let txMode = "create";   // 统一记账弹窗当前模式：create/edit/confirm
 let eRcp = null;   // 弹窗小票三态：null=未改；""=移除；"path"=覆盖
+/* id → 名称（saveEditTx 卡片重渲 / txSelApply 批量同步 / aiConfirmCard 假交易三处共用，
+   此前各写一份 find+回退） */
+const catNameOf = id => (categories.find(c=>c.id===id) || {}).name || "";
+const accNameOf = id => (accounts.find(a=>a.id===id) || {}).name || "";
 
 /* ===== 基础 ===== */
-/* Toast：下滑入场 + 3 秒自动消失。
-   用法：msg("操作成功") 绿色 / msg("失败", false) 珊瑚红 / msg("提示", true, "info") 蓝色
-   实现：先清 class 强制 reflow，再加 .on 触发动画，避免动画失效 */
+/* Toast：下滑入场 + 3 秒自动消失。msg(t) 绿 / msg(t,false) 红 / msg(t,true,"info") 蓝；
+   先清 class 强制 reflow 再加 .on，动画才可靠重放 */
 let _msgTimer = null;
 function msg(t, ok=true, type){
   const m = $("#msg");
@@ -113,9 +112,7 @@ function msg(t, ok=true, type){
   clearTimeout(_msgTimer);
   _msgTimer = setTimeout(() => m.classList.remove("on"), 3000);
 }
-/* 全局兜底：onclick 直调 async 函数（tplDel/undoBatch/deleteEditTx/delAcc/catMgrDel/addAccount/delLedger/doBackup…）
-   失败时是未处理的 Promise rejection——此前完全静默。这里统一 toast 出 e.reason 的错误信息；
-   只处理未被捕获的 rejection（有本地 catch 的路径不会进到这里，不会重复提示）。 */
+/* 全局兜底：onclick 直调 async 函数失败时 toast 出 e.reason（有本地 catch 的路径不会重复提示） */
 window.addEventListener("unhandledrejection", e => {
   const r = e.reason;
   const m = r && r.message ? r.message : (typeof r === "string" && r ? r : "");
@@ -124,6 +121,7 @@ window.addEventListener("unhandledrejection", e => {
 
 let _cfmRes = null;
 function uiConfirm(text, okLabel){
+  if(_cfmRes) cfmClose(false);   // 重入守卫：先决掉旧 Promise（同 uiPrompt），防第一次 await 永久悬挂
   $("#cfmText").textContent = text;
   $("#cfmOk").textContent = okLabel || "确定";
   $("#cfmMask").style.display = "flex";
@@ -132,6 +130,9 @@ function uiConfirm(text, okLabel){
 
 let _prmRes = null;
 function uiPrompt(text, def){
+  // 重入守卫：单槽 resolver 被第二次调用覆盖后，第一次的 await 永远悬挂（调用链泄漏
+  // 且无法取消）——先按取消决掉旧 Promise 再开新框
+  if(_prmRes) prmClose(null);
   $("#prmText").textContent = text;
   const inp = $("#prmInput");
   inp.value = def || "";
@@ -147,29 +148,25 @@ function cfmClose(ok){
   $("#cfmMask").style.display = "none";
   if(_cfmRes){ const r = _cfmRes; _cfmRes = null; r(ok); }
 }
-async function api(path, opts){
-  const r = await fetch(path.replace(/^\//,""), opts);   // 相对路径,经 <base href> 兼容网关前缀/直连
-  if(!r.ok){ let e="请求失败"; try{ e=(await r.json()).detail||e }catch(_){} throw new Error(e); }
-  return r.json();
-}
-async function apiSend(path, method, body){   // JSON 写操作简写（各模块共用）
-  return api(path, {method, headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-}
-/* 接口缓存（并发去重 + 结果复用；写操作后由调用方置空失效）：
-   /api/ledgers：设置页一次打开原会重复 GET 多次；/api/config：loadCfg/loadBkCfg/loadBotCfg 三连同源 */
-let _ledgersPromise = null;
+/* api/apiSend 定义在 shared-lite.js（全页单源） */
+/* 接口缓存（写操作后由调用方置空失效）：/api/ledgers 设置页一次打开原会重复 GET；
+   /api/config 的在途去重由 singleFlight 承担（shared-lite 单源，不再三处各抄一块） */
+const _fetchLedgers = singleFlight(async () => (ledgersCache = await api("api/ledgers")));
 async function getLedgers(force){
   if(!force && ledgersCache.length) return ledgersCache;
-  if(!_ledgersPromise) _ledgersPromise = api("/api/ledgers").then(
-    ls=>{ ledgersCache = ls; _ledgersPromise = null; return ls; },
-    e=>{ _ledgersPromise = null; throw e; });
-  return _ledgersPromise;
+  return _fetchLedgers();
 }
 let _cfgCache = null;
+const _fetchCfg = singleFlight(async () => (_cfgCache = await api("api/config")));
 async function getCfg(force){
   if(_cfgCache && !force) return _cfgCache;
-  _cfgCache = await api("/api/config");
-  return _cfgCache;
+  return _fetchCfg();
+}
+/* /api/config PUT 单源：写后缓存失效一处收口（settings 页 saveCfg/saveBkCfg/saveBotCfg
+   共用；restore/扫码确认/解绑等非 PUT 写路径各自显式失效并注释原因） */
+async function putConfig(section, body){
+  await apiSend("api/config", "PUT", {[section]: body});
+  _cfgCache = null;
 }
 const curLedger = () => getLedgers().then(ls => ls.find(l => l.id === lid()));   // 当前账本对象（预算/币种/导出文件名共用）
 function toggleSidebar(){
@@ -200,12 +197,25 @@ function moveScopeBar(p){
 
 let _navStack = [];    // 页面栈：元素=页名（loadAll 时推入初始页）；空 = 初始帧已弹尽（再按物理键=退出）
 let _navSkip = false;  // popstate 恢复中重入 showPage 不再 push
+/* 悬浮小层（fixed ui-pop：统计日期/年份 dtPop/ddPop、头像选择 avPop；记账弹窗内退款
+   下拉 e_refund_dd）：Esc 与物理返回键都要先于大弹窗收。此前判断只写在 Esc 先行块、
+   popstate 路径没有——弹层开着按返回页面切走、fixed 浮层残留新页；退款下拉开着按返回
+   连编辑中的整窗一起关。单源于此，两路入口共用 */
+function topFloatLayer(){
+  if(["dtPop","ddPop","avPop"].some(id => document.getElementById(id)?.style.display === "block"))
+    return () => _popHide();
+  if($("#e_refund_dd")?.classList.contains("open")) return () => closeRefundDD();   // 叠在记账弹窗内：先收它，别把整窗关掉
+  return null;
+}
 /* 最顶层模态及其关闭动作（物理键优先关它；顺序≈叠放层级：确认/输入框最上，抽屉最下）。
    弹窗开启不 pushState，返回键先 pop 一条导航历史——未登记的弹窗会漏关（返回键
    表现为"没反应"，连按直接退出应用），新弹窗必须在这里登记 */
 function navTopModal(){
+  const f = topFloatLayer();
+  if(f) return f;
   if($("#cfmMask").style.display === "flex") return () => cfmClose(false);    // 通用确认框
   if($("#prmMask").style.display === "flex") return () => prmClose(null);     // 通用输入框
+  if($("#cropMask").style.display === "flex") return () => closeCrop();       // 小票裁剪（叠在小票预览之上，先于它关闭）
   if($("#rcpMask").classList.contains("on")) return () => closeReceipt();      // 小票预览（叠在记账弹窗上）
   if($("#editMask").classList.contains("on")) return () => txClose();          // 统一记账弹窗
   if($("#txSelMask").classList.contains("on")) return () => txSelCloseModal();
@@ -213,9 +223,9 @@ function navTopModal(){
   if($("#wizMask").style.display === "flex") return () => wizClose();          // 模板向导（预览叠其上）
   if($("#dayMask").classList.contains("on")) return () => closeDay();          // 日历详情
   if($("#llmModelsMask").style.display === "flex") return () => llmModelsClose();   // 模型列表
-  if($("#catNewMask").style.display === "flex") return () => catNewClose();    // 新建分类
+  const cn = catNewLayer();   // 新建分类弹窗（catmgr 单源：懒构建判空+关闭配对）
+  if(cn) return cn;
   if($("#shareMask").style.display === "flex") return () => shareClose();      // 账本共享（多用户）
-  if($("#avPop")?.style.display === "block") return () => _popHide();   // 头像选择浮层
   if($("#sidebar").classList.contains("open")) return () => toggleSidebar();   // 侧栏抽屉（移动端）
 
   const pw = $(".ai-plus-wrap");
@@ -233,22 +243,75 @@ window.addEventListener("popstate", e => {
   _navSkip = true;
   showPage(_navStack[_navStack.length-1]);
 });
+/* ===== Esc 关闭顶层浮层/弹窗（物理返回键同款栈）与弹窗焦点圈禁 ===== */
+document.addEventListener("keydown", e=>{
+  if(e.key !== "Escape") return;
+  const f = topFloatLayer();   // 悬浮小层先收（输入态不豁免：日期弹层就锚在只读输入上）
+  if(f){ f(); return; }
+  // 正在表单里输入：Esc 仍关弹窗（弹窗内按 Esc 关窗是标准行为），只豁免
+  // 聊天/抽屉等界面层（退出输入态不该顺手折叠界面）
+  const ae = document.activeElement;
+  if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)){
+    const maskOpen = [...document.querySelectorAll(".modal-mask")]
+      .some(el => getComputedStyle(el).display === "flex");
+    if(!maskOpen) return;
+  }
+  const m = navTopModal();
+  if(m) m();
+});
+/* 焦点圈禁：顶层可见弹窗（含退款全屏选择）内 Tab 循环、焦点不逃到背景。
+   取「最后一个可见者」为顶层——cfm/prm 已由 --z-confirm 保证最上，与视觉栈顶一致 */
+document.addEventListener("keydown", e=>{
+  if(e.key !== "Tab") return;
+  const masks = [...document.querySelectorAll(".modal-mask, .rf-dd")].filter(el => {
+    if(el.classList.contains("rf-dd")) return el.classList.contains("open");
+    return getComputedStyle(el).display === "flex";
+  });
+  const top = masks[masks.length - 1];
+  if(!top) return;
+  const f = [...top.querySelectorAll('button:not(:disabled),input:not([type="hidden"]):not(:disabled),select,textarea,[href],[tabindex]:not([tabindex="-1"])')]
+    .filter(el => el.getClientRects().length);
+  if(!f.length) return;
+  const first = f[0], last = f[f.length-1];
+  if(!top.contains(document.activeElement)){ e.preventDefault(); first.focus(); }
+  else if(e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+  else if(!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+});
+function applyPageState(p){
+  /* 页面态落地（showPage 与 loadAll 的刷新恢复共用）：page 标记 + 高亮 + 侧栏选中 */
+  document.body.dataset.page = p;
+  document.querySelectorAll(".page").forEach(x=>x.classList.toggle("on", x.id==="tab-"+p));
+  document.querySelectorAll(".sidebar .nav-item[data-p]").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
+  moveScopeBar(p);
+}
 function showPage(p){
   if(_navSkip) _navSkip = false;                                  // popstate 恢复调用：历史已 pop，不再 push
   else if(document.body.dataset.page !== p){ _navStack.push(p); history.pushState({chaimiNav:p}, ""); }   // 用户切换：双栈同步 push
-  document.body.dataset.page = p;
-  document.querySelectorAll(".page").forEach(x=>x.classList.toggle("on", x.id==="tab-"+p));
-  moveScopeBar(p);
-  document.querySelectorAll(".sidebar .nav-item[data-p]").forEach(b=>b.classList.toggle("on", b.dataset.p===p));
-  // 之后点输入框（focus→aiChatOn）重进对话时旧消息仍在；顺带收起「+」菜单防残留
+  try{ localStorage.setItem("chaimi_page", p); }catch(_){}        // 刷新恢复停留页（loadAll 首载读取）
+  applyPageState(p);
+  // 离开 AI 页收起对话态与「+」菜单
   if(p!=="ai"){ $("#tab-ai").classList.remove("chat-on"); const pw=$(".ai-plus-wrap"); if(pw) pw.classList.remove("open"); }
   if(p!=="list" && txSelMode) txSelExit();
+  sumbarCollapseReset();   // 页切复位汇总收起态（gsum 全页共享）；下方按保留滚动位对齐
+  sumbarCollapseApply();
   if(p==="list") { loadTx(); loadSumbarList(); }
   if(p==="renqing") loadRenqing();
   if(p==="cal"||p==="stats") refreshStats();
   if(p==="io") { loadBatches(); expInitRange(); }
   if(p==="ai"){ loadSumbarAi(); aiToday(); }
   if(p==="settings") stLoad();
+  // 离开设置页：机器人扫码轮询与二维码倒计时只属于设置页场景——清定时器并把二维码框
+  // 一并收起（只停轮询不收框，回来时框挂着冻结的倒计时、轮询死亡且无人恢复）。
+  // _qrTimer/_ilinkTimer 声明在 settings.js（defer 序在本文件后），showPage 只在
+  // 脚本全部就绪后才会被调用，直接引用（上面的 aiToday 同理）
+  if(p!=="settings"){
+    if(_qrTimer){ clearInterval(_qrTimer); _qrTimer = null; }
+    if(_ilinkTimer){ clearTimeout(_ilinkTimer); _ilinkTimer = null; }
+    const qr = document.getElementById("bot_qrbox");
+    if(qr) qr.style.display = "none";
+  }
+  // 离开 AI 页：关闭进行中的 SSE 流（服务端 LLM 继续烧 token、文本打进隐藏气泡）
+  if(p!=="ai") aiSseStop();
 }
 document.querySelectorAll(".sidebar .nav-item[data-p]").forEach(b=>b.onclick=()=>{
   showPage(b.dataset.p);
@@ -259,29 +322,57 @@ document.querySelectorAll(".sidebar .nav-item[data-p]").forEach(b=>b.onclick=()=
 /* ===== 数据加载 ===== */
 const ledgerOptions = (ls, sel) => ls.map(l=>   // 账本下拉 option（顶栏/共享标记；有图标时图标与名字间自动空格；mine=false=别人共享来的）
   `<option value="${l.id}"${sel && l.id===sel ? " selected" : ""}>${l.icon ? esc(l.icon)+" " : ""}${esc(l.name)}${l.mine===false ? "（共享）" : ""}</option>`).join("");
+const _loadAllGen = makeSeq();   // loadAll 自己的世代序号：快速连切账本时（change 事件/建删账本/
+                                 // 恢复备份多入口并发），慢的旧 loadAll 不得覆盖新的选择器/月份/预算框——
+                                 // 这里不能用 ledgerScope（#ledgerSel 的值正是被 loadAll 改写的，
+                                 // lid() 在自身 await 期间变化是它自己的产物）
 async function loadAll(selectId){
+  const gen = _loadAllGen.next();
   await loadMe();   // 身份先行：默认归属选中/账本过滤共享标记都依赖 ME
+  if(!_loadAllGen.isCurrent(gen)) return;
   txCache = {};   // 切账本/初始加载：旧缓存作废（openEdit 取不到即静默返回，挡住跨账本误编辑）
+  if(txSelMode) txSelExit();   // 批量选择集是旧账本的 id：restore 同款清理（后端 _tx_row_in_ledger
+                               // 会跳过跨账本行，但工具条仍显示旧账本「已选 N 笔」误导操作）
   const ls = await getLedgers(true);   // 强制刷新：账本切换/增删入口都走这里，缓存随之换血
-  // localStorage 是根因修复：此前整页重载(登录页回来/刷新)后 keep 取自空 select 回落第一个账本，
-  // 导致「新账本建用户，进入后却回到旧账本」（真机实测 bug）
+  if(!_loadAllGen.isCurrent(gen)) return;
+  // 设备记忆里的账本（Cookie，见 shared-lite.js）：整页重载后 select 为空须避免回落第一个账本
   let keep = selectId || +$("#ledgerSel").value || 0;
-  if(!keep){ try{ keep = +localStorage.getItem("chaimi_ledger") || 0; }catch(_){} }
+  if(!keep) keep = +ckGet("chaimi_ledger") || 0;
   $("#ledgerSel").innerHTML = ledgerOptions(ls, keep);
   if(!ls.length){ location.replace("static/home.html"); return; }   // 无账本（新飞牛用户/全新安装）→ home 页建账本，不再停在空白应用
   if(keep && ls.some(l=>l.id===+keep)) $("#ledgerSel").value = keep;
-  try{ localStorage.setItem("chaimi_ledger", String(lid())); }catch(_){}   // 持久化当前账本（被删/失效时下次自然回落）
-  await Promise.all([loadCats(), loadAccs(), loadAttrs(), loadTx(), refreshStats(), loadPendingBadge(), loadSumbarAi(), loadSumbarList(), aiToday()]);
+  ckSet("chaimi_ledger", lid());   // 记住当前账本（被删/失效时下次自然回落）
+  // 月份选择器先归位本月再并发取数：refreshStats/loadSumbarList/loadTx 都经
+  // dtGet(#monthSel)||thisMonth() 回退取月，若先取数后复位，切账本时会按用户上月
+  // 选的月份拉数据、选择器却显示本月（数据与选择器不一致）。dtSet 只写值不派发
+  // change（不触发 onTimeChange），不会引发二次加载
   dtSet($("#monthSel"), thisMonth());
+  // 刷新恢复上次停留页：在并发取数**之前**落地（applyPageState 只操作 DOM class，
+  // 不依赖任何数据）——refreshStats 等渲染器的「页面可见性」门控此后都能命中，
+  // 不再需要取数后按页补拉（此前 stats 页为此专门在尾部再发一次请求）
+  if(!document.body.dataset.page){
+    let _rst = "ai";
+    try{ const _sv = localStorage.getItem("chaimi_page"); if(_sv && document.getElementById("tab-"+_sv)) _rst = _sv; }catch(_){}
+    applyPageState(_rst);
+  }
+  await Promise.all([loadCats(), loadAccs(), loadAttrs(), loadTx(), refreshStats(), loadPendingBadge(), loadSumbarAi(), loadSumbarList(), aiToday()]);
+  if(!_loadAllGen.isCurrent(gen)) return;   // 子加载器各有守卫（数据不脏），这里只挡同步写的三个控件
   await fillYearSel();
   syncScopeChips();
   $("#bdg_amt").value = ""; bdgDirty = false;   // 切账本：预算框退出编辑态，stAccs 按新账本回填（未手改才回填，防覆盖输入）
-  if(document.body.dataset.page === "settings") stLoad();   // 停在设置页切账本：分类/账户/用户/预算各表随新账本重拉
-  document.body.dataset.page = document.body.dataset.page || "ai";   // 初始默认 AI 页，供 body[data-page] 样式与顶栏渲染判断
+  // 停留页随新账本重拉（showPage 只在进页时触发；settings/renqing/io 的表不在上面的
+  // 并发取数里，stats 的 refreshStats 已在并发取数中按落地后的页面态渲染）
+  { const _p = document.body.dataset.page;
+    if(_p === "settings") stLoad();
+    if(_p === "renqing") loadRenqing();
+    if(_p === "io") loadBatches(); }
 
-  _navStack.push(document.body.dataset.page);
-  history.pushState({chaimiNav: document.body.dataset.page}, "");
-  moveScopeBar(document.body.dataset.page);
+  // 仅首载入导航栈：loadAll 还被建/删账本、改币种、恢复备份等复用，重复 push 会
+  // 占满物理返回键历史、「再按一次退出」判定被稀释
+  if(!_navStack.length){
+    _navStack.push(document.body.dataset.page);
+    history.pushState({chaimiNav: document.body.dataset.page}, "");
+  }
 }
 /* 账本列表同步（lrev 长轮询唤醒：他人共享给我/移除共享/建删改账本）：
    重拉列表刷新下拉；当前账本已不在列表（被移除/被删）→ home 页自愈回落，
@@ -293,17 +384,28 @@ async function syncLedgers(){
     const cur = +sel.value || 0;
     if(!ls.length || !ls.some(l=>l.id===cur)){ location.replace("static/home.html"); return; }
     sel.innerHTML = ledgerOptions(ls, cur);
-  }catch(_){}
+  }catch(e){ console.warn("账本列表同步失败", e); }   // 下拉可能停在旧列表，留痕便于排查
 }
+/* 以下全局加载按「账本身份」守卫（ledgerScope 单源；loadTx 那类是序号守卫，但这些函数
+   写的是跨页全局数组，账本切换后旧账本的迟到响应写进来会污染下拉/弹窗）：
+   await 回来后账本已变即整包丢弃，赋值必须发生在任何全局数组写入之前 */
 async function loadCats(){
-  categories = await api(`/api/categories?ledger=${lid()}`);
+  const sc = ledgerScope();
+  const cs = await api(`/api/categories?ledger=${sc.id}`);
+  if(!sc.isCurrent()) return;   // 期间切了账本：旧账本分类表不写全局
+  categories = cs;
 }
 async function loadAccs(){
-  accounts = await api(`/api/accounts?ledger=${lid()}`);
+  const sc = ledgerScope();
+  const r = await api(`/api/accounts?ledger=${sc.id}`);
+  if(!sc.isCurrent()) return;   // 期间切了账本：旧账本账户表不写全局
+  accounts = r.items;
 }
 async function loadPendingBadge(){
+  const sc = ledgerScope();   // 账本身份守卫（ledgerScope 单源）：旧账本徽标的迟到响应不回填
   try{
-    const r = await api(`/api/transactions?ledger=${lid()}&need_confirm=1&page=1&page_size=1`);
+    const r = await api(`/api/transactions?ledger=${sc.id}&need_confirm=1&page=1&page_size=1`);
+    if(!sc.isCurrent()) return;
     $("#pendBdg").textContent = r.total;
     $("#pendBdg").style.display = r.total ? "inline-block" : "none";
     const chip = $("#ftConfirm");
@@ -316,10 +418,10 @@ async function loadPendingBadge(){
         loadTx();
       }
     }
-  }catch(_){ $("#pendBdg").style.display="none"; }
+  }catch(e){ console.warn("待确认徽标加载失败", e); if(sc.isCurrent()) $("#pendBdg").style.display="none"; }   // 过期失败不误藏新账本徽标
 }
 
-function txCatOptions(type, selId, sub){   // 一级分类 option；收支两类末尾挂「不计收支」分组（退款/不计收支），
+function txCatOptions(type, selId){   // 一级分类 option；收支两类末尾挂「不计收支」分组（退款/不计收支），
   const tHtml = transferOptgroup(selId);
   if(type === "transfer") return `<option value="">未分类</option>` + tHtml;
   return `<option value="">未分类</option>` + categories
@@ -349,19 +451,16 @@ let curUserId = 0;
 function curUser(){ return attrGroups.find(g=>g.id===curUserId) || null; }
 function setCurUser(id){
   curUserId = id;
-  try{ localStorage.setItem("chaimi_user_"+lid(), String(id)); }catch(_){}
+  if(id) ckSet("chaimi_user_"+lid(), id);   // 0=无选择，不落盘（与「没记过」同义）
   renderGreet();
 }
 function restoreCurUser(){
-  let saved = 0;
-  try{ saved = +localStorage.getItem("chaimi_user_"+lid()) || 0; }catch(_){}
-  curUserId = attrGroups.some(g=>g.id===saved) ? saved : 0;
-  if(!curUserId && ME.username){
-    // 多用户：被共享者默认归属自己（同名归属组由共享时自动创建）；无匹配组再回落选择页
-    const g = attrGroups.find(g=>g.name===ME.username);
-    if(g) curUserId = g.id;
-  }
-  renderGreet();
+  const saved = +ckGet("chaimi_user_"+lid()) || 0;
+  // 同名组兜底（多用户：被共享者默认归属自己，同名归属组由共享时自动创建）也走
+  // setCurUser 落盘——只改内存不写记忆的话，切到无记忆账本的设备每次冷启动都还得再点一次用户
+  const same = ME.username ? attrGroups.find(g=>g.name===ME.username) : null;
+  setCurUser(attrGroups.some(g=>g.id===saved) ? saved : (same ? same.id : 0));
+  if(curUserId) gateLift();   // 闸门放行：渐隐揭掉启动画面（无记录时不经过=画面盖着直到跳 home）
   userGateOpen();
 }
 function greetWord(){ const h = new Date().getHours();
@@ -370,33 +469,42 @@ function renderGreet(){
   const b = $("#gbUser"), u = curUser();
   b.style.display = u ? "inline-flex" : "none";
   if(u){
-    b.value = u.id;
     const av = `<img src="${avatarUrl(u.avatar)}" alt="">`;
     b.innerHTML = av + `<b>${esc(u.name)}</b><span class="gw">${greetWord()} ▾</span>`;
   }
 }
 function goUserHome(){
-  location.replace("static/home.html?ledger=" + lid());   // replace：回退键不回选择页
+  location.replace("static/home.html?ledger=" + lid() + "&pick=1");   // pick=1：显式选人，跳过 home 自动进入（否则又被弹回原用户）；replace：回退键不回选择页
 }
 function userGateOpen(){
   if(curUser()) return;
   location.replace("static/home.html?ledger=" + lid());   // 走 /static 路径（网关已验证可路由）；replace：回退键不回登录页
 }
 async function loadAttrs(){
+  const sc = ledgerScope();   // 发请求时的账本身份：await 期间切账本，响应不得进全局（见 loadCats 注释）
   try{
     const [ats, gs] = await Promise.all([
-      api(`/api/attributions?ledger=${lid()}`),
-      api(`/api/attribution-groups?ledger=${lid()}`)
+      api(`/api/attributions?ledger=${sc.id}`),
+      api(`/api/attribution-groups?ledger=${sc.id}`)
     ]);
+    // 丢弃必须发生在 setAttrState 之前：它一进来就写 attrGroups 等 4 个全局数组并连带
+    // restoreCurUser 改当前用户/问候栏，旧账本的归属会把新账本的用户态整体顶掉
+    if(!sc.isCurrent()) return [[], []];
     setAttrState(ats, gs);
     return [ats, gs];   // 原始名单返回：设置页 stAttrs 渲染表格复用（拉取/解析单源）
-  }catch(_){ attributions = []; attrGroupNames = []; raw2group = {}; return [[], []]; }
+  }catch(e){   // 失败清空并留痕（静默清空会让归属下拉/用户页空得莫名其妙，与全站 loader 口径一致）
+    console.warn("归属名单加载失败", e);
+    if(sc.isCurrent()){ attributions = []; attrGroupNames = []; raw2group = {}; }
+    return [[], []];
+  }
 }
 async function txItemAddAttr(btn){   // 条目卡内新建用户并选中（与「＋新建」分类同款交互）
+  const sc = ledgerScope();
   const name = await uiPrompt("新建用户名：");
   if(!name) return;
-  try{ await apiSend(`/api/attribution-groups?ledger=${lid()}`, "POST", {name: name.trim()}); }
+  try{ await apiSend(`/api/attribution-groups?ledger=${sc.id}`, "POST", {name: name.trim()}); }
   catch(e){ return msg(e.message, false); }
+  if(!sc.isCurrent()) return;   // POST 期间切账本：用户名不并入新账本的用户列表（loadAttrs 会拉到）
   attrGroupNames = [...new Set([...attrGroupNames, name.trim()])];
   const sel = btn.closest(".txf-item").querySelector(".txf-attr");
   if(sel) sel.innerHTML = txAttrOptionsHtml(name.trim());
@@ -406,9 +514,6 @@ async function txItemAddAttr(btn){   // 条目卡内新建用户并选中（与�
 function txAccOptions(selId){   // 账户 option；始终含「未指定」占位
   return `<option value="">未指定</option>` + accounts
     .map(a=>`<option value="${a.id}" ${a.id===selId?"selected":""}>${esc(a.name)}</option>`).join("");
-}
-function avatarUrl(av){   // 牛牛头像地址（'m' 男牛，其余一律兜底女牛）——core/settings 共用，home 独立页自带
-  return `images/avatar-cow-${av === "m" ? "m" : "f"}.png`;
 }
 function cashAccId(){   // 「现金」账户 id（新建默认）；账本无现金账户返回 0（回落未指定）
   const a = accounts.find(x=>x.name==="现金");
@@ -436,7 +541,7 @@ function txItemHtml(it, i, n, mode){   // 单张条目卡：多笔才有序号+�
     : `<div class="filters txf-types">${transfer   // 编辑/确认的转账：给「转账 · 不计收支」chip 可切回
         ? `<button class="fchip${type==="transfer"?" on":""}" data-t="transfer" onclick="txItemSetType(this)">转账 · 不计收支</button>` : ""}${TX_TYPES
       .map(x=>`<button class="fchip${x.v===type?" on":""}" data-t="${x.v}" onclick="txItemSetType(this)">${x.t}</button>`).join("")}</div>`;
-  const catHtml = txCatOptions(type, it.category_id, it.tags && it.tags.transfer_sub);
+  const catHtml = txCatOptions(type, it.category_id);
   let attrCur = (it.tags && it.tags.attribution) || "";
   if(!attrCur && mode === "create"){ const u = curUser(); if(u) attrCur = u.name; }
   const dupHtml = it.dup_hint ? `<div class="txf-dup">⚠️ 疑似重复：${esc(dupHintText(it.dup_hint))}，确认前可删此笔</div>` : "";
@@ -464,12 +569,17 @@ function txItemSetType(btn){
   refundRowSync(item);
 }
 /* 新建分类公共流程（条目卡/导入预览/设置页共用）：prompt → POST /api/categories → 重拉分类表。
-   返回新分类 {id,name}；用户取消返回 null。DOM 侧（插 option/选中）由调用方自理。 */
+   返回新分类 {id,name}；用户取消返回 null。DOM 侧（插 option/选中）由调用方自理。
+   重拉走 loadCats 单源（此前裸 GET 直写 categories 全局，是三处共写里唯一无守卫的）。 */
 async function newCategoryAndPick(type, promptText){
+  const sc = ledgerScope();
   const name = await uiPrompt(promptText);
   if(!name) return null;
-  const r = await apiSend(`/api/categories?ledger=${lid()}`, "POST", {name: name.trim(), type});
-  categories = await api(`/api/categories?ledger=${lid()}`);
+  const r = await apiSend(`/api/categories?ledger=${sc.id}`, "POST", {name: name.trim(), type});
+  await loadCats();
+  // 单点守卫（txItemAddCat/impSetCat 两个调用方共用）：prompt/POST 期间切账本时，
+  // 旧账本的新分类 id 不得交给调用方插下拉/写预览（同族 txItemAddAttr 的 isCurrent）
+  if(!sc.isCurrent()) return null;
   return {id: r.id, name: name.trim()};
 }
 async function txItemAddCat(btn){   // 为所在条目卡新建分类并选中
@@ -512,11 +622,17 @@ function txRemoveItem(btn){   // 移除该笔并重编号；弹窗里删空即�
     else{ const bb = host.closest(".bk-bubble"); if(bb){ rcpDiscard(bb.dataset.receipt); bb.remove(); } }
   }
 }
+const _txModalGen = makeSeq();   // 记账弹窗世代（txOpen 开启、txClose 关闭各 next() 一次）：
+                                 // editRcpUpload 等慢异步回来时弹窗可能已关（旧图成孤儿）
+                                 // 或已换另一笔（小票挂错行），过代响应一律作废
 function txOpen(mode, opts){   // 打开统一记账弹窗
   opts = opts || {};
+  _txModalGen.next();   // 新一代弹窗：作废在途的弹窗级异步（editRcpUpload 等，见其守卫）
   txMode = mode;
   editTx = opts.tx || null;                      // 编辑/确认态的原始流水（editRcp 依赖）
   eRcp = opts.receipt ? opts.receipt : null;     // null=未改，字符串=已有/新上传小票
+  editRefundSel = 0;   // 退款选中态按弹窗复位：非退款流水编辑中把分类切到「退款」时，
+                       // refundRowSync 兜底读它——残留上一笔的旧链会把本笔错链到别人的原消费
   const txItems = (opts.items && opts.items.length) ? opts.items
     : [{type:"expense", amount:0, date: opts.date || today()}];
   const n = txItems.length;
@@ -532,6 +648,8 @@ function txOpen(mode, opts){   // 打开统一记账弹窗
   $("#editMask").classList.add("on");
 }
 function txClose(){   // 关闭并复位状态；DOM 下次 txOpen 时整体重渲染
+  _txModalGen.next();   // 关闭也推进世代：editRcpUpload 在途时（上传中关弹窗未再开），
+                        // 完成响应不得把旧图写进已关闭弹窗的 eRcp（成孤儿文件）
   if(eRcp) rcpDiscard(eRcp);   // 未保存的新上传小票随手清理(已入库的被服务端按流水引用拦下)
   $("#editMask").classList.remove("on");
   txMode = "create"; eRcp = null; editTx = null;
@@ -555,16 +673,17 @@ function txCollect(root){   // 读条目 DOM → 条目数组（金额转分）�
 }
 async function txPostItems(items, meta){   // 逐笔 POST；失败时抛错并带上已成功笔数 e.ok（避免整卡重试导致重复入库）
   meta = meta || {};
+  const l = lid();   // 整批一次定账本：循环内逐笔现取 lid() 时，中途切账本会把剩余几笔记进另一本账
   const ids = [];   // 各笔入库后的 id（供 AI 聊天里渲染确认卡片）
   try{
     for(let i=0;i<items.length;i++){
       const it = items[i];
-      // 归属随条目（卡片内逐笔选择）；保留条目已有的其他 tags（如 AI 草稿的 transfer_sub）
+      // 归属随条目（卡片内逐笔选择）；条目已有的其他 tags 原样保留（调用方带什么留什么）
       const tags = Object.assign({}, it.tags);
       if(it.attr) tags.attribution = it.attr; else delete tags.attribution;
       it.tags = tags;   // 供确认卡回显归属
       // date 原样 10 位：服务端 db.norm_date 补「记账时刻」，不再固定 12:00:00
-      const r = await apiSend(`/api/transactions?ledger=${lid()}`, "POST", {
+      const r = await apiSend(`/api/transactions?ledger=${l}`, "POST", {
         type:it.type, amount:it.amount, category_id:it.category_id, account_id:it.account_id,
         name:it.name, note:it.note, date:it.date, tags, order_no:it.order_no || null,
         refund_for: it.refund_for || null,
@@ -575,6 +694,23 @@ async function txPostItems(items, meta){   // 逐笔 POST；失败时抛错并�
     }
     return ids;
   }catch(e){ e.ok = ids.length; throw e; }
+}
+/* 一张条目卡是否会被提交：与 txSubmitCreate/aiBookingSubmit 里 txCollect().filter(x=>x.amount>0)
+   同判据（单源于此，调用方勿再抄一份）。重试裁卡必须与提交过滤同一口径——否则零金额卡
+   混在中间时按 DOM 序裁会裁错卡，已成功笔重试即重复入库 */
+function txSubmittable(el){
+  return toCents(el.querySelector(".txf-amt").value) > 0;
+}
+/* 部分成功后裁掉已入库的条目卡：取 container 内全部 .txf-item，按 txSubmittable 过滤
+   （DOM 序=提交序：txCollect 按容器顺序收集）后移除前 doneN 张。
+   doneN 覆盖全部可提交卡时不裁（全部成功语义保持现状，由调用方走成功路径）。
+   返回剩余待重试的可提交卡数（0=没裁，调用方无需重编号） */
+function trimPostedCards(container, doneN){
+  if(!container || !(doneN > 0)) return 0;
+  const submittable = [...container.querySelectorAll(".txf-item")].filter(txSubmittable);
+  if(doneN >= submittable.length) return 0;
+  submittable.slice(0, doneN).forEach(el=>el.remove());
+  return submittable.length - doneN;
 }
 function afterTxWrite(){   // 记账成功后统一刷新各页数据
   loadTx(); loadPendingBadge(); refreshStats(); loadSumbarAi(); loadSumbarList(); loadRenqing(); aiToday();
@@ -604,6 +740,8 @@ async function txSubmitCreate(){   // 弹窗 create 模式：逐笔 POST，失�
     }
     afterTxWrite();
   }catch(e){
+    // 部分成功：先把已入库的笔从弹窗裁掉（判据/顺序与提交同源），用户修正后重试才不会重复入库
+    if(trimPostedCards($("#txItems"), e.ok || 0)) txRenumber($("#txItems"));
     msg(`已记入 ${e.ok || 0} 笔，第 ${(e.ok || 0)+1} 笔失败：${e.message}`, false);
   }finally{ btn.disabled = false; }
 }
@@ -619,21 +757,26 @@ function editRcpSync(){   // 同步小票缩略图与「移除」按钮显隐
   img.src = p || ""; img.style.display = p ? "" : "none";
   $("#e_rcp_rm").style.display = p ? "" : "none";
 }
+/* 上传小票公共链路（记账弹窗 editRcpUpload 与 AI 页 aiReceipt 共用）：
+   客户端大小预检（后端同上限，免上传 20MB 后才被拒）→ POST /api/ai/receipt。
+   返回识别结果（含 receipt_path；失败为 {error}）；超限/网络错误抛 Error，UI 收尾由调用方自理 */
+async function uploadReceipt(file){
+  if(file.size > MAX_UPLOAD_B) throw new Error(`图片超过 ${MAX_UPLOAD_B/1048576}MB 上限`);
+  const fd = new FormData(); fd.append("file", file);
+  return api(`/api/ai/receipt?ledger=${lid()}`, {method:"POST", body:fd});
+}
 async function editRcpUpload(){
   const f = $("#e_rcp_file").files[0]; if(!f) return;
-  if(f.size > MAX_UPLOAD_B){   // 客户端预检（后端同上限）：免上传 20MB 后才被拒
-    $("#e_rcp_file").value = "";
-    return msg(`图片超过 ${MAX_UPLOAD_B/1048576}MB 上限`, false);
-  }
-  const fd = new FormData(); fd.append("file", f);
+  const gen = _txModalGen.now();
   try{
-    const r = await api(`/api/ai/receipt?ledger=${lid()}`, {method:"POST", body:fd});
+    const r = await uploadReceipt(f);
+    if(!_txModalGen.isCurrent(gen)) return;   // 上传期间弹窗被关/重开：响应作废
     if(r.error){ msg(r.error, false); $("#e_rcp_file").value=""; return; }
     eRcp = r.receipt_path;
     $("#e_rcp_file").value="";   // 成功也清空（错误路径已清）：否则换回同一文件不触发 change
     editRcpSync();
     msg("已上传新图，保存后生效");
-  }catch(e){ msg("上传失败: "+e.message, false); $("#e_rcp_file").value=""; }
+  }catch(e){ if(_txModalGen.isCurrent(gen)) msg("上传失败: "+e.message, false); $("#e_rcp_file").value=""; }
 }
 function editRcpClear(){
   if(eRcp) rcpDiscard(eRcp);   // 移除新上传且未保存的图即弃(本笔已有小票的被服务端按引用拦下)
@@ -642,19 +785,16 @@ function editRcpClear(){
   editRcpSync();
 }
 
-/* ===== 数据变更实时刷新（自 app.html 移入）=====
-   长轮询 /api/rev/wait(方案B)——每个请求时长有限,可穿透会掐杀 SSE 无限流的缓冲网关;
-   有变更立即返回,前端 300ms 内续上下一条,任意端记账其他端 1s 内刷新。
-   回前台(focus/pageshow/visible)：掐掉可能半开的挂起请求 + 轻量探测——不带 since 的
-   wait 立即返回当前 rev,与本地基线相同则什么都不做(旧版无条件刷:每次切回 6~8 个
-   接口全重载,明细弹窗闪「加载中…」并丢选择态/滚动);真错过变更才刷,探测失败
-   (网络抖)保守刷一次,兜底性与旧版持平。探测独立于长轮询环,环卡死也能发现变更。 */
+/* ===== 数据变更实时刷新 =====
+   长轮询 /api/rev/wait：有变更立即返回，前端 300ms 续下一条；回前台掐掉半开请求并
+   轻量探测——rev 与基线相同则不刷（避免每次切回全量重载丢弹窗状态），错过才刷。 */
 (function(){
   let _rev = null, _lrev = null, _t = null, _lt = null, _ctrl = null;
   const cv = "cv=" + (window.CHAIMI_VER || "");
-  const bump = ()=>{ clearTimeout(_t); _t = setTimeout(()=>{ if(typeof afterTxWrite === "function") afterTxWrite(); }, 800); };
+  // afterTxWrite/syncLedgers/loadAll 均为本文件函数声明（脚本作用域提升），直接调用
+  const bump = ()=>{ clearTimeout(_t); _t = setTimeout(afterTxWrite, 800); };
   // lrev（账本列表代数）变化：防抖后重拉账本下拉（共享/移除/建删账本实时生效）
-  const lsync = ()=>{ clearTimeout(_lt); _lt = setTimeout(()=>{ if(typeof syncLedgers === "function") syncLedgers(); }, 400); };
+  const lsync = ()=>{ clearTimeout(_lt); _lt = setTimeout(syncLedgers, 400); };
   // rev/lrev 基线统一收口：首轮只立基线不刷,此后偏离才刷（loop 与 probe 共用）
   const seen = r => {
     const rv = String(r.rev), lv = String(r.lrev);
@@ -662,15 +802,18 @@ function editRcpClear(){
     if(_lrev !== null && lv !== _lrev) lsync();
     _rev = rv; _lrev = lv;
   };
+  // hold 契约（服务端 /api/rev/wait 钳 1..30s）：显式下发，超时返回本身即心跳；
+  // 半开检测 = hold+10s（正常请求必在 ≤hold 完成，超时必是连接已死），不再拍脑袋 35s
+  const HOLD = 20;
   const loop = async ()=>{
     _ctrl = new AbortController();
-    const to = setTimeout(()=>_ctrl.abort(), 35000);   // 半开连接兜底:超 hold+10s 强制重开
+    const to = setTimeout(()=>_ctrl.abort(), (HOLD+10)*1000);
     try{
-      const q = (_rev === null) ? "?" : `?since=${_rev}&lsince=${_lrev}&`;
+      const q = (_rev === null) ? "?" : `?since=${_rev}&lsince=${_lrev}&hold=${HOLD}&`;
       const r = await fetch("api/rev/wait" + q + cv, {signal: _ctrl.signal});
       seen((await r.json()));
       setTimeout(loop, 300);
-    }catch(_){ setTimeout(loop, 2000); }   // 网络故障/被掐:2s 退避重试
+    }catch(_){ setTimeout(loop, 2000); }   // 网络故障/被掐/半开强断:2s 退避重连，基线比对补拉
     finally{ clearTimeout(to); }
   };
   loop();
@@ -678,12 +821,16 @@ function editRcpClear(){
     try{
       const r = await fetch("api/rev/wait?" + cv);
       seen((await r.json()));
-    }catch(_){ bump(); }
+    }catch(_){ /* 探测失败不盲刷（旧版 bump 一次网络抖动就整页重载丢弹窗状态）：回环重连后按基线比对补拉 */ }
   };
   const wake = ()=>{ if(_ctrl) _ctrl.abort(); probe(); };
-  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "visible") wake(); });
-  addEventListener("focus", wake);
-  addEventListener("pageshow", wake);
+  // 跨午夜陈旧：seen() 只比对 rev，0 点后没有写库时回前台也不重拉，「今天」卡/汇总条
+  // 会一直显示昨天的全日数据。回前台顺带核对日期，变了就整页重载
+  let _day = today();
+  const wakeDay = ()=>{ if(today() !== _day){ _day = today(); loadAll(); } };
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "visible"){ wake(); wakeDay(); } });
+  addEventListener("focus", ()=>{ wake(); wakeDay(); });
+  addEventListener("pageshow", ()=>{ wake(); wakeDay(); });
 })();
 /* P3-4:直连凭证过期横幅(打开应用查一次,点击跳设置页重新扫码) */
 (async()=>{ try{
@@ -691,9 +838,33 @@ function editRcpClear(){
   const exp = s && (s.bots||[]).filter(b=>b.state==="expired").map(b=>b.label||"成员");
   if(exp && exp.length){
     const b = document.createElement("div");
-    b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:999;background:#f59e0b;color:#fff;text-align:center;font-size:13px;padding:6px;cursor:pointer";
+    b.className = "bot-banner";   // 样式与 z 阶梯收进 base.css（原内联 z-index:999 脱离分层体系）
     b.textContent = "微信机器人凭证已过期（" + exp.join("、") + "），点击前往重新扫码";
     b.onclick = ()=>{ const nav = document.querySelector('[data-p="settings"]'); if(nav) nav.click(); };
     document.body.appendChild(b);
   }
-}catch(_){} })();
+}catch(e){ console.warn("凭证过期探测失败", e); }   // 探测挂了横幅永远不亮，留痕控制台
+})();
+/* ===== 模板实例化（app.html 的 tpl-search-box / tpl-sel-bar）=====
+   搜索框三件套与选择态工具条此前在 HTML 里逐字拷贝四份（流水/人情页、流水页/日弹窗），
+   改结构须同步四处；现 HTML 只留壳（id+placeholder），启动时按 data-part 挂 id 实例化。
+   本段在 core.js 顶层执行——defer 序先于 ledger.js 的 bindSearch 取用 #q_text/#rq_q。 */
+function mountTpl(tplId, hostId, ids){
+  const host = document.getElementById(hostId);
+  const tpl = document.getElementById(tplId);
+  if(!host || !tpl || host.childElementCount) return;
+  host.appendChild(tpl.content.cloneNode(true));
+  for(const [part, id] of Object.entries(ids || {})){
+    const el = host.querySelector(`[data-part="${part}"]`);
+    if(el) el.id = id;
+  }
+  const inp = host.querySelector('[data-part="input"]');
+  if(inp){
+    if(host.dataset.placeholder) inp.placeholder = host.dataset.placeholder;
+    if(host.dataset.name) inp.name = host.dataset.name;
+  }
+}
+mountTpl("tpl-search-box", "txSearchBox", {input: "q_text", clear: "q_clear"});
+mountTpl("tpl-search-box", "rqSearchBox", {input: "rq_q", clear: "rq_q_clear"});
+mountTpl("tpl-sel-bar", "txSelBar", {all: "txSelAll", count: "txSelCount", mod: "txSelModBtn", del: "txSelDelBtn"});
+mountTpl("tpl-sel-bar", "daySelBar", {all: "daySelAll", count: "daySelCount", mod: "daySelModBtn", del: "daySelDelBtn"});

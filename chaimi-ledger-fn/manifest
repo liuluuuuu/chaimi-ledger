@@ -1,29 +1,25 @@
-appname=chaimi-ledger
-version=1.0.6
-display_name=柴米记账
-desc=<b>柴米记账</b>：数据全在本机的家庭记账本。<br>📚 多账本分账：日常 / 旅行 / 装修，成员与预算一起管<br>📥 账单导入：支付宝 / 微信 / 京东一键导入，自动分类 + 退款匹配 + 重复检测<br>📊 统计看板：日历收支、分类饼图、趋势曲线、月度对比、人情往来<br>🤖 AI 记账：一句话记一笔、小票拍照识别、对话查账、月度分析（填 Key 即用，支持百炼 / 智谱 / DeepSeek / 本地模型）<br>💬 微信机器人：微信里对话记账查账，多人多账本，支持网关接入<br>🔒 SQLite 单文件存储，数据不出家门；备份一键拷贝，明暗主题三态自动跟随<br>🐧 QQ 交流群：<a href="https://qm.qq.com/q/3LSusMpHnO">108508834</a>（点击可直接加群 / 使用问题 / 功能建议 / Bug 反馈）
-platform=all
-source=thirdparty
-
+appname               = chaimi-ledger
+version=1.0.13
+display_name          = 柴米记账
+desc                  = <b>柴米记账</b>：数据全在本机的家庭记账本。<br>📚 多账本分账：日常 / 旅行 / 装修，成员与预算一起管<br>📥 账单导入：支付宝 / 微信 / 京东 / 美团一键导入，自动分类 + 退款匹配 + 重复检测<br>📊 统计看板：日历收支、分类饼图、趋势曲线、月度对比、人情往来<br>🤖 AI 记账：一句话记一笔、小票拍照识别、对话查账、月度分析（填 Key 即用，支持百炼 / 智谱 / DeepSeek / 本地模型）<br>💬 微信机器人：微信里对话记账查账，扫码直连，多人多账本<br>🔒 SQLite 单文件存储，数据不出家门；备份一键拷贝，明暗主题三态自动跟随<br>🐧 QQ 交流群：<a href="https://qm.qq.com/q/3LSusMpHnO">108508834</a>（点击可直接加群 / 使用问题 / 功能建议 / Bug 反馈）
+platform              = all
+source                = thirdparty
 # Python 运行时取应用中心依赖包（fnOS 系统不保证自带 python3）；
 # 生命周期脚本统一把 /var/apps/python*/target/bin 前置到 PATH 后调用 python3，
 # pip/依赖安装由启动脚本在可写数据基目录完成（--target 隔离，不污染系统）
-install_dep_apps=python312
-
-maintainer=liulu
-maintainer_url=https://github.com/liuluuuuu/chaimi-ledger
-distributor=山归山
-distributor_url=
-
-app_type=system
+install_dep_apps      = python312
+maintainer            = liulu
+maintainer_url        = https://github.com/liuluuuuu/chaimi-ledger
+distributor           = 山归山
+distributor_url       = 
+app_type              = system
 # 前端 JS SDK(@trimjs/web-app)：自动主题经 getPlatformConfig/$on('os/theme') 跟随飞牛宿主
 # 明暗（系统>=1.2.0401 才有该开放能力；旧系统静默回落浏览器 prefers-color-scheme）
-micro_app=true
+micro_app             = true
 # install_type 留空:安装时由用户选择存储卷(数据落 /vol{n}/@app* 下,不再占系统分区)
-ctl_stop=true
-
-os_min_version=1.2.0302
-
-desktop_uidir=server
-desktop_applaunchname=chaimi-ledger.web
-reloadui=yes
+ctl_stop              = true
+os_min_version        = 1.2.0302
+desktop_uidir         = server
+desktop_applaunchname = chaimi-ledger.web
+reloadui              = yes
+checksum              = 543fc48f704c480735498678dd375469

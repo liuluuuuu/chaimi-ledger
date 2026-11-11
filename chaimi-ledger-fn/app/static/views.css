@@ -2,14 +2,14 @@
 
 /* ===== 归属蝴蝶图（方案 U：中心人名，左红=支出右绿=收入） ===== */
 .attr-butterfly{margin-top:10px}
-.attr-b-axis{display:flex;font-size:10px;color:var(--muted);margin-bottom:4px}
+.attr-b-axis{display:flex;font-size:11px;color:var(--muted);margin-bottom:4px}
 .attr-b-axis .l{flex:1;text-align:right}
 .attr-b-axis .c{width:60px}
 .attr-b-axis .r{flex:1}
 .attr-b-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}
 .attr-b-half{flex:1;display:flex;align-items:center;min-width:0}
 .attr-b-half.left{justify-content:flex-end}
-.attr-b-bar{height:20px;border-radius:4px;display:flex;align-items:center;padding:0 6px;font-size:10px;color:#fff;font-weight:600;white-space:nowrap;overflow:hidden;min-width:24px;cursor:pointer;transition:opacity .15s}
+.attr-b-bar{height:20px;border-radius:4px;display:flex;align-items:center;padding:0 6px;font-size:11px;color:#fff;font-weight:600;white-space:nowrap;overflow:hidden;min-width:24px;cursor:pointer;transition:opacity .15s}
 .attr-b-bar:hover{opacity:.8}
 .attr-b-bar.exp{background:var(--expense)}
 .attr-b-bar.inc{background:var(--income)}
@@ -17,9 +17,12 @@
 .attr-b-center:hover{color:var(--primary)}
 
 /* ===== AI 记一笔 ===== */
-.ai-hero{max-width:min(1400px,100%);margin:0 auto;position:relative;display:flex;flex-direction:column;height:calc(100vh - var(--gbar-h,96px) - 2px);padding-bottom:32px}
-#tab-ai{padding-top:0;margin-top:-8px;padding-bottom:0}
-@supports (height:100dvh){.ai-hero{height:calc(100dvh - var(--gbar-h,96px) - 2px)}}
+/* AI 页占满 .main 剩余高（.main 已是纵向 flex，gbar 在流内占掉顶栏高） */
+#tab-ai{padding-top:0;padding-bottom:0}
+#tab-ai.on{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+/* width:100%：#tab-ai 是纵向 flex，hero 的 margin:0 auto 交叉轴 auto 边距同样会
+   关闭拉伸（同 .page 的坑）；父级 .page 已 1400 封顶，hero 撑满内容列即与各页同宽 */
+.ai-hero{width:100%;margin:0 auto;position:relative;display:flex;flex-direction:column;flex:1;min-height:0;padding-bottom:32px}
 
 .side-theme-btn{position:absolute;top:10px;right:10px;z-index:5;background:none;border:none;color:var(--muted);width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .18s}
 .side-theme-btn:hover{background:var(--hover);color:var(--m-purple);transform:rotate(15deg)}
@@ -61,7 +64,7 @@
 .ai-chip:hover .ic{color:var(--m-purple)}
 .ai-chip .tx{display:flex;flex-direction:column;align-items:flex-start;flex:1;font-size:11.5px;font-weight:500;line-height:1.15;min-width:0;white-space:nowrap;overflow:hidden;color:var(--muted)}   /* 1.15：两行文字块≈27px 与 26px 图标等高，卡片高度不变且中文字形不叠行（原 .6 会上下溢出重叠） */
 .ai-chip:hover .tx{color:var(--fg)}
-.ai-chip .tx small{display:block;font-size:10.5px;font-weight:400;color:var(--muted);margin-top:2px}   /* line-height 继承自 .tx */
+.ai-chip .tx small{display:block;font-size:11px;font-weight:400;color:var(--muted);margin-top:2px}   /* line-height 继承自 .tx */
 @media(min-width:1020px){.ai-chips{grid-template-columns:repeat(4,minmax(0,1fr))}}   /* ≥1020 视口内容列够宽,单行 4 个等宽(hero 已=全局版心 1400) */
 
 .ai-chip-stack{display:grid}
@@ -89,7 +92,7 @@
 .ai-box{display:flex;align-items:center;gap:8px;background:var(--card);border:2px solid var(--m-purple-bd);border-radius:16px;padding:8px 8px 8px 12px;box-shadow:var(--shadow-md)}
 /* 输入框随文字换行自动增高（高度由 JS 写入），超过 max-height 才出现滚动条 */
 .ai-box input,.ai-box textarea{flex:1;min-width:0;border:none;outline:none;background:none;font-size:16px;line-height:1.5;padding:6px 2px;font-family:inherit;color:var(--fg);resize:none;overflow-y:auto;max-height:180px}
-.ai-box input::placeholder,.ai-box textarea::placeholder{color:var(--muted);font-size:16px;line-height:1.5;font-family:inherit}
+.ai-box input::placeholder,.ai-box textarea::placeholder{font-size:16px;line-height:1.5;font-family:inherit}   /* 颜色由 base.css 全局 ::placeholder 统一 */
 .ai-box textarea::first-line{line-height:1.5}
 
 #txSearchBox,#rqSearchBox{border:1px solid var(--border);box-shadow:none}   /* 流水/人情页搜索框同款 */
@@ -106,52 +109,71 @@
 
 .txf-ro{font-size:12.5px;color:var(--muted)}
 /* ===== 流水 ===== */
-.tx-filter{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+/* 筛选/搜索区 = 顶栏（范围条+汇总+横线，原布局不动）正下方的固定行，结构化钉顶
+   （#tab-list 占满剩余高、列表在 #txList 内部滚动）——不依赖 sticky。
+   搜索为工具条内联展开：点搜索按钮后按钮让位消失、搜索框自按钮位向左展开——
+   电脑版贴住操作按钮（宽 min(380px,42vw)），手机版铺满整行、遮挡筛选按钮
+   （下方媒体查询）；Esc/点工具条外收起（ledger.js）。.tx-filter 只剩上下留白职责
+   （子级筛选行/选择态工具条互斥展示，无需布局规则） */
+.tx-filter{margin:0 0 12px}
+.tx-search{display:none;align-items:center;gap:6px;height:34px;padding:0 6px;min-width:0;
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm)}
+#txSearchBtn{margin-left:auto}   /* 收起态：按钮组右贴（勿加 #tab-list 前缀——双 id 特异性会压过下方 searching 覆盖） */
+.filters.searching .tx-search{display:flex;margin-left:auto;width:min(380px,42vw)}
+.filters.searching #txSearchBtn{display:none}       /* 展开态：按钮让位消失，搜索框即原按钮位向左展开 */
+.tx-search input{flex:1;min-width:0;border:none;outline:none;background:none;
+  font-size:14px;padding:4px 2px;font-family:inherit;color:var(--fg)}
+.tx-search svg{color:var(--muted);flex:none}
+.tx-search [data-part="clear"]{display:flex !important}   /* ✕ 恒显（!important 压模板内联 display:none 与 bindSearch 按值显隐）：有内容=清空/无内容=收起（ledger.js） */
+@media(max-width:768px){
+  .filters.searching .fchip{display:none}   /* 手机：搜索展开铺满整行，遮挡筛选按钮 */
+  .filters.searching .tx-search{flex:1 1 auto;width:auto}
+}
+.icon-btn.on{color:var(--primary-fg);border-color:var(--primary-2);background:var(--primary-bg)}   /* 搜索按钮激活态：展开中或有关键词 */
+#tab-list{padding-top:8px}   /* 页顶距收口（原 20px）：线→筛选行的间隙与列表行间节奏一致 */
 .filters{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
 .fchip{border:1px solid var(--border);background:var(--card);color:var(--muted);border-radius:999px;padding:6px 14px;font-size:13px;transition:all .18s}
 .fchip.on{background:var(--primary-bg);color:var(--primary-fg);border-color:var(--primary-2)}
-.fchip.warn{background:var(--m-butter);border-color:var(--m-butter-bd);color:#5C4713;font-weight:600}
+.fchip.warn{background:var(--m-butter);border-color:var(--m-butter-bd);color:var(--warn-strong);font-weight:600}
 .fchip.warn .cnt{font-weight:700;font-size:12px}
 
-#tab-list.on{display:flex;flex-direction:column;min-height:100%}
+/* 流水页结构化钉顶（与 #tab-ai 同范式）：顶栏 gbar（范围条+汇总+横线，原布局不动）
+   与其正下方的筛选/搜索区均为天然固定行，页面占满 .main 剩余高（flex:1），卡片列表
+   在 #txList 内部滚动、翻页行常驻视口底——不依赖 position:sticky（部分手机 WebView
+   内 sticky 失效，见 .modal-day 注释；sticky 版在真机上表现为筛选区随内容滚走、
+   卡片从钉顶间隙漏出） */
+#tab-list.on{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}
+#txList{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
 
-#txPager{position:fixed;left:0;right:0;bottom:0;z-index:5;margin:0;padding:5px 0;justify-content:center;background:var(--bg);border-top:1px solid var(--border)}
-@media(min-width:769px){#txPager{left:200px}}   /* 与 base.css .sidebar 桌面宽 200px 对齐 */
-@media(max-width:768px){#txPager{height:60px;align-items:flex-start}}
-/* 流水卡：轻盈通透（1px 极细边框 + 大圆角 + 分类色体现在图标与 hover 边框） */
+/* 流水页上滑收起汇总：#txList 滚动 1:1 驱动 #gsum 高度（ledger.js 绑定）——汇总/
+   搜索框随流水上滑，收到底（sum-pin）后筛选按钮/搜索框顶在顶栏正下方（结构化钉顶
+   天然顶住）；滚回顶部展开复位，离开流水页由 showPage 复位。
+   overflow:hidden：收起时裁内容；同时建立 BFC 收住 .sb-cells 的 margin-top:6px
+   （否则子级 margin 穿透折叠到 gsum 外，高度控制不完整） */
+#gsum{overflow:hidden}
+
+/* 底部翻页行：结构化钉底（列表内部滚动的普通 flex 行），长列表常驻视口底、可达性更好 */
+#txPager{flex:0 0 auto;margin:8px 0 0;padding:8px 0;justify-content:center;border-top:1px solid var(--border)}
+/* 流水行（行式布局）：无边框/圆角/行距——「框」只由外层容器承担（日分组卡/
+   明细弹窗/预览/聊天气泡），行间 hairline 分隔、悬停底色高亮 */
 .tx-card{
-  border:1px solid var(--border);
-  border-radius:var(--radius-lg);
-  background:var(--card);
-  margin-bottom:8px;
-  overflow:hidden;
-  padding:6px 16px;
+  background:transparent;
+  padding:8px 12px;   /* 左右 12 对称，与行内 gap:12 同步 */
   display:flex;
-  gap:16px;
+  gap:12px;   /* 仅选择态「勾选框-行」消费：与整体 12 节奏一致 */
   align-items:center;
   cursor:pointer;
-  transition:border-color .18s,box-shadow .18s,background .18s;
+  transition:background .18s;
   position:relative;
 }
-.tx-card:hover{border-color:var(--cat-color,var(--m-blue));box-shadow:var(--shadow)}
+.tx-card + .tx-card{border-top:1px solid var(--line)}
+.tx-card:hover{background:var(--hover)}
+.tx-card:active{background:var(--chip)}
 
 .tx-selbar{display:flex;align-items:center;gap:12px}
 .tx-sel-all{display:flex;align-items:center;gap:6px;font-size:14px;cursor:pointer;margin:0}   /* margin:0 抵消全局 label{margin-bottom:4px}，否则全选比已选计数高 2px */
 .tx-sel-all span{line-height:20px}   /* 与 20px 勾选框共基线，避免与已选计数错位 */
 #txSelCount,#daySelCount{line-height:20px}
-/* 流水页钉顶：筛选区（类型chips+搜索+编辑按钮；选择态时为 全选/修改/完成 工具条）整体
-   fixed 紧贴固定顶栏下缘——与 #txPager 同款方案；不用 sticky：部分手机 WebView 内
-   sticky 失效（见 base.css .gbar 注释），真机实测会整条滚走。
-   gbarFit 写入的 --gbar-h 含 +8px 正文留白，这里 calc 扣回，紧贴顶栏 border-bottom。
-   外层通栏背景（同 .gbar 做法），内容层 .txf-pin 限宽居中与 .page 列表对齐 */
-#tab-list .tx-filter{position:fixed;top:calc(var(--gbar-h,96px) - 8px);left:0;right:0;z-index:5;
-  margin:0;padding:8px 0 6px;background:var(--bg)}   /* 不加 border-bottom：搜索框/卡片自带边框，通栏分隔线多余 */
-@media(min-width:769px){#tab-list .tx-filter{left:200px}}   /* 与 #txPager 一致，让位桌面常驻侧栏 */
-#tab-list .txf-pin{width:100%;max-width:1400px;margin:0 auto;padding:0 clamp(16px,4vw,64px);
-  display:flex;flex-direction:column;gap:10px}   /* width:100% 必需：父级纵向 flex 里 auto 边距会取消拉伸致收缩 */
-@media(max-width:768px){
-  #tab-list .txf-pin{padding:0 8px}   /* 与 #tab-list 手机 8px 留空对齐，卡片/筛选同缘 */
-}
 /* 详情弹窗：.modal-day 三段式（head+工具条固定、body 滚动），工具条为普通条带即天然钉顶；
    不加 border-bottom/背景（与主页钉顶区同口径：上缘由 head 的下边线分隔，底色沿用弹窗卡底） */
 #daySelBar{flex:0 0 auto;padding:10px 20px}
@@ -160,12 +182,14 @@
 #txSelMask label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
 .day-head{display:flex;justify-content:space-between;padding:0 4px 6px;font-size:12px;color:var(--muted)}
 .tx-icon{
-  width:44px;height:44px;flex-shrink:0;
+  width:44px;height:44px;flex:0 0 44px;   /* flex 基线显式给足：老内核不认 flex-shrink:0 简写时图标也不被压扁 */
   border-radius:var(--radius);
   display:flex;align-items:center;justify-content:center;
   color:var(--cat-color,var(--m-blue));
   background:var(--cat-bg,var(--m-blue-100));
-
+}
+.tx-icon{   /* 描边装饰独立成条：color-mix 是 2023 年的函数，老内核解析失败若按整条规则丢弃，
+               只丢这一层描边，上面的尺寸/布局规则不受牵连 */
   box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--cat-color,var(--m-blue)) 35%,transparent);
 }
 .tx-icon svg{color:var(--cat-color,var(--m-blue));width:22px;height:22px;stroke-width:2.25}
@@ -176,10 +200,9 @@
 .tx-note{font-weight:500;font-size:16px;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tx-sub{line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tx-amt{font-size:15px;font-weight:600;flex-shrink:0;flex-grow:0;min-width:55px;text-align:right}
-.tx-tags{flex-shrink:0;flex-grow:0;display:flex;gap:4px;align-items:center;max-width:120px;overflow:hidden}
 .rf-item{display:flex;align-items:center;gap:10px;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--border)}
 .rf-item:last-child{border-bottom:none}
-.rf-item.on{background:rgba(59,130,246,.12)}
+.rf-item.on{background:color-mix(in srgb,var(--primary) 14%,transparent)}   /* 原硬编码蓝不随主题/主色 */
 .rf-qbox{border:1px solid var(--border);box-shadow:none;padding:6px 10px;margin:8px}
 .rf-qbox input{font-size:13.5px;line-height:20px;padding:2px}
 .rf-hint{padding:4px 10px 6px;font-size:11.5px}
@@ -193,7 +216,7 @@
 
 .rf-sheet{display:contents}
 .rf-head{display:none}
-.rf-dd.open{position:fixed;inset:0;z-index:130;display:flex;align-items:center;justify-content:center;
+.rf-dd.open{position:fixed;inset:0;z-index:var(--z-modal-over);display:flex;align-items:center;justify-content:center;
   padding:16px;background:var(--mask);backdrop-filter:blur(2px);animation:rfMaskIn .18s ease}
 .rf-dd.open .rf-sheet{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--border);
   border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);width:100%;max-width:600px;max-height:90vh;
@@ -222,53 +245,39 @@
 [data-theme="dark"] .tag.refund-low{background:var(--m-butter-100);color:var(--m-butter-fg)}
 .tag.refund-unmatched{background:var(--chip);color:var(--muted)}        /* 灰：未匹配（用 "退回"） */
 
-.tx-card.tx-card-double{
-  display:grid;
-  grid-template-columns:minmax(0,1fr) auto;
-  column-gap:8px;
-}
+/* 退款双行卡：图标在主行 .tx-row 行内（与单行卡同一结构——图标作卡级 flex 独立子元素
+   的旧摆位在飞牛桌面客户端 webview 里整体崩坏，2026-11-10 真机截图复现）；
+   内容列 = 主行 + 回执行 */
+.tx-double-body{flex:1;min-width:0;display:flex;flex-direction:column}
 .tx-card .tx-row{display:flex;align-items:center;gap:12px;padding:2px 0;min-width:0;flex:1}
-.tx-card.tx-card-double .tx-row{grid-column:1;min-width:0}
 
-.tx-card .tx-row+.tx-row{position:relative}
-.tx-card .tx-row+.tx-row::before{
-  content:"";position:absolute;top:0;left:0;height:1px;width:100%;
-  background:linear-gradient(to right,var(--border) 0%,var(--border) 60%,transparent 100%);
-}
-
-.tx-card.tx-card-double>.tx-side{
-  grid-column:2;grid-row:1/span 2;align-self:stretch;
-  display:flex;align-items:center;justify-content:flex-end;gap:6px;
-  white-space:nowrap;
-}
-.tx-card.tx-card-double>.tx-side>.tx-side-net{
-  font-weight:600;font-size:14px;white-space:nowrap;
-}
-.tx-card.tx-card-double>.tx-side .tag{font-size:10.5px;padding:1px 6px}
+/* 回执行：左缩进 56px（44 图标 + 12 间距）与主行标题对齐——图标移入主行后内容列占满
+   整卡，不缩进的话原消费行会顶到卡左缘、跑到图标下方；净额/退款标签与金额列同右缘 */
+.tx-origin{display:flex;align-items:center;gap:12px;padding:0 0 9px 56px;cursor:pointer;font-size:12px;color:var(--muted);transition:background .18s}
+.tx-origin:hover{background:var(--hover)}
+.tx-origin-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tx-origin-text b{font-weight:600}
+.tx-origin-text b.tx-origin-name{color:var(--fg)}   /* 名称用前景色从 muted 行里突出（字重沿用 b 的 600） */
+.tx-origin-net{flex:0 0 auto;font-weight:600;white-space:nowrap}
 
 .tx-card .tx-row>.tx-right{
   display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;min-width:55px;
 }
 .tx-card .tx-row>.tx-right>.tx-tags{
-  display:flex;flex-direction:row;flex-wrap:wrap;justify-content:flex-end;gap:4px;max-width:140px;
+  display:flex;flex-wrap:wrap;justify-content:flex-end;gap:4px;max-width:140px;
 }
 .tx-card .tx-row>.tx-right>.tx-tags .tag{margin-left:0}
 
 .tx-card .tx-row>.tx-right>.tx-amt-row{
-  display:flex;flex-direction:row;align-items:baseline;justify-content:flex-end;gap:6px;flex-shrink:0;
-}
-.tx-card .tx-row>.tx-right>.tx-amt-row>.tx-src{font-size:10.5px;padding:1px 6px;line-height:1.2}
-
-.tx-card .tx-row>.tx-right>.tx-amt-row>.tx-src-stack{
-  display:flex;flex-direction:column;align-items:flex-end;gap:3px;
+  /* 金额独占一行（来源/小票标签沉到金额下方、与状态标签同区），各行金额列天然右对齐 */
+  display:flex;flex-shrink:0;
 }
 /* ===== 日历 ===== */
 .cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
 .cal-wd{text-align:center;font-size:12px;color:var(--muted);padding:4px 0}
-.cal-d{aspect-ratio:1/0.85;border-radius:var(--radius-sm);border:1px solid var(--border);padding:6px 8px;font-size:12px;background:var(--card);transition:transform .15s,box-shadow .15s,border-color .15s;min-width:0;overflow:hidden;display:flex;flex-direction:column}
+.cal-d{aspect-ratio:1/0.85;border-radius:var(--radius-sm);border:1px solid var(--border);padding:6px 8px;font-size:12px;background:var(--card);transition:transform .15s,box-shadow .15s,border-color .15s;min-width:0;overflow:hidden;display:flex;flex-direction:column;cursor:pointer}
 .cal-d:hover{transform:scale(1.03);border-color:var(--primary-2);box-shadow:var(--shadow)}
-.cal-d.other{border:none;background:none}
-.cal-d{cursor:pointer}
+.cal-d.other{border:none;background:none;color:var(--muted);opacity:.55}
 /* 今日：薄荷绿光晕 + 数字加粗；深色模式用 mint-100 让光晕可见 */
 .cal-d.today{border:2px solid var(--m-mint);box-shadow:0 0 0 3px var(--m-mint-50),0 2px 8px rgba(93,191,138,.18)}
 [data-theme="dark"] .cal-d.today{box-shadow:0 0 0 3px var(--m-mint-100),0 2px 12px rgba(122,207,160,.25)}
@@ -287,7 +296,6 @@
 .h4 .v.e{color:var(--cal-amt-e3)}
 .h4 .v.i{color:var(--cal-amt-i3)}
 
-.cal-d.other{cursor:pointer;color:var(--muted);opacity:.55}
 .cal-d.other .n{font-size:13px}
 .cal-d.other:hover{opacity:.85;transform:none}
 .h1{background:var(--cal-heat-1)}.h2{background:var(--cal-heat-2)}.h3{background:var(--cal-heat-3)}.h4{background:var(--cal-heat-4)}
@@ -297,7 +305,6 @@
 .chart-card{margin-bottom:14px}
 
 .donut-pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(440px,100%),1fr));gap:14px;align-items:stretch}
-.donut-pair .chart-card{margin-bottom:14px}
 
 .donut-row{display:flex;align-items:center;justify-content:center;gap:16px;margin-top:8px;flex-wrap:wrap}
 .donut-box{width:100%;max-width:200px;height:200px;flex:0 1 200px;margin:0 auto}
@@ -318,10 +325,15 @@
   .cal-d.trend .n{font-size:13px}
   .cal-d.trend .v{font-size:13px;line-height:1.4;font-weight:600}
 
-  .cal-grid{gap:3px}
-  .cal-d{aspect-ratio:1/1;padding:3px 2px;min-height:30px;height:auto}
-  .cal-d .n{font-size:10px;margin-bottom:4px}
-  .cal-d .v{font-size:8px;line-height:1.2;font-weight:700;text-align:center;min-height:1.2em}
+  /* 手机月历：格子显示 日期 + 热力底 + 支出/收入两行金额（整数元，_fmtAmt→fmtI 单源）。
+     数字 9px + 字距 -0.02em 实测 "-123,456" 完整放下（六位数日净额的极限兜底；4 位数
+     10px 时收入行 +12,345 溢出 1px 触发省略号）——保双行同格可见；配合 .cal-d 的
+     overflow:hidden + aspect-ratio 定高，安卓 ROM 强制最小字号（12px）也只裁不破。
+     trend 年/月概览格不受限、原字号照常 */
+  .cal-grid:not(.trend){gap:3px}
+  .cal-grid:not(.trend) .cal-d{aspect-ratio:1/1;padding:2px 1px;min-height:32px;height:auto}
+  .cal-grid:not(.trend) .cal-d .n{font-size:11px;margin:0}
+  .cal-grid:not(.trend) .cal-d .v{font-size:9px;line-height:1.15;letter-spacing:-0.02em}
 }
 
 .bubble{border-radius:14px;padding:12px 14px;max-width:min(86%,1100px);line-height:1.65;white-space:pre-wrap;word-break:break-word}
@@ -333,8 +345,7 @@
 /* 排版完全复用统计页 .donut-row/.donut-box/.donut-legend（结构见 ai.js），
    唯一差异：气泡内圆图 150px（统计页 200px）；图例、窄屏换行居中全部继承基础类 */
 .ai-stats-donut .donut-box{width:150px;height:150px;flex:0 0 150px}
-.ai-stats-tx{display:flex;flex-direction:column;gap:6px}
-.ai-stats-tx .tx-card{margin:0}
+.ai-stats-tx{display:flex;flex-direction:column}   /* 行式流水：无行距，hairline 分隔 */
 
 .msgs{display:flex;flex-direction:column;gap:12px;overflow-y:auto;flex:1;min-height:0;padding:4px 2px 8px;
 
@@ -353,11 +364,8 @@
 .bk-foot{display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap}
 .bk-ok{margin-left:auto}
 
-/* 空状态：垂直居中于消息区，标题排版与记账卡片同款 */
-#ai_msgs .empty{margin:auto 0;padding:16px 12px;text-align:center;
-
-  /* -gbar-h/2 为理论补偿，+30px 为实机校准（输入区占位偏差），合成后空态中心=视口中心 */
-  transform:translateY(calc(var(--gbar-h,96px) / -2 + 30px))}
+/* 空状态：垂直居中于消息区（hero 由 flex 精确填满剩余高） */
+#ai_msgs .empty{margin:auto 0;padding:16px 12px;text-align:center}
 #ai_msgs .empty h1{font-size:19px;font-weight:600;margin-bottom:6px;letter-spacing:.5px}
 #ai_msgs .empty .sub{font-size:12.5px}
 
@@ -369,7 +377,7 @@
 }
 /* ===== 表格(导入/批次) ===== */
 table{width:100%;border-collapse:collapse;font-size:13.5px}
-th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--border);vertical-align:top}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--muted);font-weight:500;font-size:12px}
 
 /* ===== 设置页（应用内页面，与其他菜单一致） ===== */
@@ -409,6 +417,11 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 }
 
 .lg-addrow{display:grid;grid-template-columns:1fr 130px 70px;align-items:center}
+/* 手机收窄固定列（原 130+70+边距 ≈ 230px，375px 屏输入列只剩 ~110px 太挤） */
+@media(max-width:640px){
+  .lg-addrow{grid-template-columns:1fr 92px 56px}
+  .lg-addrow>*{margin:0 2px}
+}
 .lg-addrow>*{margin:0 6px}
 .lg-addrow>input,.lg-addrow>select{width:auto;min-width:0}   /* 特异性须压过 .st-sec input/select 的 width:100%（否则在 grid 列内溢出 12px） */
 .st-sec .row.bdg-row{gap:8px}
@@ -420,6 +433,13 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 #bkTable th:last-child{width:100%}   /* 操作列吃满剩余宽：按钮才能贴到表格右缘（auto 布局下空表头列宽=内容宽） */
 #bkTable td{white-space:nowrap}   /* 其余列按最小内容宽分配，时间/大小防折行压字 */
 #bkTable td:last-child{text-align:right}
+/* 手机没有对齐表头的需求，三列 nowrap 会挤出屏：行改 flex 换行（时间+大小一行，按钮折到右下） */
+@media(max-width:640px){
+  #bkTable thead{display:none}
+  #bkTable tbody tr{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;border-bottom:1px solid var(--line)}
+  #bkTable tbody td{border-bottom:none;padding:5px 0}
+  #bkTable tbody td:last-child{margin-left:auto}
+}
 /* 备份勾选组（原内联样式改类，便于断点控制）：桌面不伸缩，手机独占一行 */
 .st-sec .row>.bk-toggle{flex:0 0 auto;display:flex;align-items:center;gap:6px}   /* 带父级选择器抬特异性，压过 .row>* 的 flex:1 */
 @media (max-width:640px){
@@ -441,20 +461,8 @@ th{color:var(--muted);font-weight:500;font-size:12px}
   .st-sec .row>button{flex:0 0 auto;margin-left:auto;margin-top:2px}
 }
 .st-sec input[type="number"]{flex:0 0 90px;width:90px}
-.mchip{display:inline-flex;align-items:center;gap:4px;background:var(--chip);border:1px solid var(--border);border-radius:8px;padding:2px 8px;margin:2px 4px 2px 0;font-size:13px;cursor:pointer}
-.mchip:hover{border-color:var(--primary-2)}
-.mchip b{color:var(--muted);font-weight:400;padding:0 2px}
-
-.cm-group{margin-top:14px}
-.cm-gtitle{font-weight:600;font-size:13px;color:var(--muted);margin-bottom:6px;display:flex;align-items:center}
-.cm-cat{border:1px solid var(--border);border-radius:8px;padding:8px 10px;margin-bottom:8px;
-  display:flex;align-items:center;gap:10px}
-.cm-cname{flex:0 0 auto;font-weight:600}
-.cm-cname.edit{cursor:pointer;color:var(--primary);text-decoration:underline dotted}
-.cm-chips{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:2px 4px;align-items:center;justify-content:flex-end}
-.mchip b:hover{color:var(--expense)}
-.st-sec .btn.danger{border:1px solid var(--expense);color:var(--expense);background:none;padding:4px 10px;font-size:12px}
-@media(max-width:768px){ .st-head h1{display:none} }
+/* 分类管理样式（cm-*/mchip）已并入 catmgr.js 内嵌样式（.catmgr-root 作用域，两页单源）；
+   .btn.danger 已收口到 base.css 全站单源（原 .st-sec 与 catmgr 各一份同值规则） */
 
 /* ===== 移动端触摸反馈（按钮涟漪） ===== */
 .btn{position:relative;overflow:hidden}
@@ -470,7 +478,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .sb-cell{padding:8px 12px;border-radius:var(--radius-sm);cursor:pointer;transition:background .15s}
 .sb-cell .k{font-size:11.5px;color:var(--muted);display:flex;align-items:center;justify-content:center;gap:5px;margin-bottom:3px}
 .sb-cell .k .ic{width:8px;height:8px;border-radius:3px;flex:none}
-.sb-cell .k .arr{opacity:0;font-size:10px;transition:opacity .15s}
+.sb-cell .k .arr{opacity:0;font-size:11px;transition:opacity .15s}
 .sb-cell:hover .k .arr{opacity:.9}
 .sb-cell .v{font-size:17.5px;font-weight:650;letter-spacing:-.2px;white-space:nowrap;text-align:center}
 .sb-v-in{color:var(--income)} .sb-v-net{color:var(--m-peach-fg)}
@@ -486,7 +494,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 
   .sb-cells{grid-template-columns:repeat(3,1fr);gap:5px;padding:0;margin-top:6px}
   .sb-cell{padding:5px 7px}
-  .sb-cell .k{font-size:10.5px;margin-bottom:1px}
+  .sb-cell .k{font-size:11px;margin-bottom:1px}
   .sb-cell .k .ic{width:6px;height:6px}
   .sb-cell .v{font-size:13px;letter-spacing:-.3px}
   .sb-cell.sb-bal .v{font-size:13.5px;color:var(--m-blue-fg)}
@@ -504,7 +512,7 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .dt-c.today{border-color:var(--m-mint-bd);color:var(--m-mint-fg)}
 .dt-c.sel{background:var(--primary);color:var(--on-primary);border-color:transparent}
 
-.ui-pop{position:fixed;z-index:95;display:none;background:var(--card);border:1px solid var(--border);
+.ui-pop{position:fixed;z-index:var(--z-modal-over);display:none;background:var(--card);border:1px solid var(--border);
   border-radius:14px;box-shadow:var(--shadow-lg);padding:14px;min-width:220px}
 #avPop{padding:8px;min-width:0}   /* 两只牛牛并排，无文字 */
 #ddPop{padding:8px;min-width:0}
@@ -524,11 +532,6 @@ th{color:var(--muted);font-weight:500;font-size:12px}
 .dd-c:hover{background:var(--hover)}
 .dd-c.sel{color:var(--primary-fg);background:var(--primary-bg);font-weight:600}
 
-/* ===== 桌面内容卡片适配：fixed 的筛选区/翻页条让出卡片边距（left:200px 沿用
-   各自的原有规则，此处只补 top/bottom/right）；AI hero 高度同口径扣除外框 */
-@media(min-width:769px){
-  #txPager{bottom:10px;right:10px;border:1px solid var(--border);border-radius:0 0 var(--radius-panel) var(--radius-panel);background:var(--panel)}
-  #tab-list .tx-filter{top:calc(var(--gbar-h,96px) + 2px);right:10px;background:var(--panel)}
-  .ai-hero{height:calc(100vh - var(--gbar-h,96px) - 22px)}
-  @supports (height:100dvh){.ai-hero{height:calc(100dvh - var(--gbar-h,96px) - 22px)}}
-}
+/* ===== 桌面内容卡片适配：筛选区/翻页条已改 sticky 常规流、AI hero 已改 flex 填充，
+   原为 fixed 元素让出卡片边距的整套补偿（bottom/right/left:200px 与两套高度 calc）随之删除；
+   桌面底色差异在各自规则内以媒体查询处理（--panel） */

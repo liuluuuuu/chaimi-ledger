@@ -1,14 +1,23 @@
 #!/bin/bash
 
 # 卸载向导选择消费：remove_logs=delete 时清除应用日志。
-# 配置（@appconf/chaimi.conf）与 PKGVAR 里的数据库/备份不受影响。
+# 配置（@appconf/chaimi.conf）与数据基目录里的数据库/备份不受影响。
+# run-as=package 非 root：数据基目录里的日志是自己写的删得掉；/var/log/apps 由系统
+# 写，无权限时 rm 静默失败——删不掉的如实报出来（框架捕获 stdout 进安装日志），
+# 不让向导承诺的「删除日志数据」悄悄落空
 
 if [ "$remove_logs" = "delete" ]; then
     rm -f /var/log/apps/chaimi-ledger.* 2>/dev/null
-    PKGVAR="${TRIM_PKGVAR:-}"
-    if [ -n "$PKGVAR" ]; then
-        rm -f "${PKGVAR}/info.log" 2>/dev/null
-    fi
+    _left="$(ls /var/log/apps/chaimi-ledger.* 2>/dev/null)"
+    [ -n "${_left}" ] && echo "uninstall_callback: 未能清除 ${_left}（系统日志目录无权限，请管理员手动删除）"
+    # 应用日志（info.log + 自身轮转 chaimi-ledger.log*）落在 main 选定的数据基目录：
+    # main 启动时把 TRIM_PKGVAR 覆写为 pick_var_base 的结果，可能回落 PKGHOME/PKGTMP//tmp。
+    # 候选全扫（与 main/pick_var_base、uninstall_init 同一候选列表）——此前只清框架原值，
+    # 回落安装下向导承诺的「删除日志数据」落空
+    for _C in "${TRIM_PKGVAR:-}" "${TRIM_PKGHOME:-}" "${TRIM_PKGTMP:-}" "/tmp/chaimi-ledger"; do
+        [ -n "${_C}" ] && [ -d "${_C}" ] || continue
+        rm -f "${_C}/info.log" "${_C}"/chaimi-ledger.log* 2>/dev/null
+    done
 fi
 
 exit 0

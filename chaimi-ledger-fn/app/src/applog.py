@@ -13,7 +13,15 @@ import sys
 
 import config
 
-_fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+class _SingleLineFormatter(logging.Formatter):
+    """日志单行化：用户可控文本（账本/账户/分类名等）可内嵌 \n，直接插值会让轮转日志
+    出现伪造日志行。 Formatter 单点覆盖 stdout + 轮转文件两条 handler。"""
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        return msg.replace("\r", "").replace("\n", "⏎")
+
+
+_fmt = _SingleLineFormatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
 
 def setup() -> logging.Logger:

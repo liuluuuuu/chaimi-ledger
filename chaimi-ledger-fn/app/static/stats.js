@@ -9,11 +9,13 @@ function attrDetailToggle(i){
 }
 async function fillYearSel(){
   const cur = new Date().getFullYear();
+  const sc = ledgerScope();   // 账本身份守卫（ledgerScope 单源）：旧账本年份数据的迟到响应不写年份选项
   let years = [cur];
   try{
-    const ys = await api(`/api/stats/yearly?ledger=${lid()}`);
+    const ys = await api(`/api/stats/yearly?ledger=${sc.id}`);
+    if(!sc.isCurrent()) return;
     years = [...new Set([...ys.map(x=>+x.year), cur])].sort((a,b)=>b-a);
-  }catch(_){}
+  }catch(e){ console.warn("年份数据加载失败，年份下拉只列今年", e); if(!sc.isCurrent()) return; }
   _yearOpts = years.map(y=>({v:String(y), t:y+"年"}));
   if(!_yearOpts.some(o=>o.v === dtGet($("#yearSel")))) dtSet($("#yearSel"), _yearOpts[0].v);
 }
@@ -127,6 +129,9 @@ function syncScopeChips(){   // 取值控件显隐（不触发重载）
   $("#monthSel").style.display = sc==="month" ? "" : "none";
   $("#yearSel").style.display = sc==="year" ? "" : "none";
   $("#sc_dates").style.display = sc==="custom" ? "flex" : "none";
+  // 横向可滚提示：滚动条已隐藏，右缘渐隐（.can-scroll）让用户知道还有内容
+  const bar = document.getElementById("scopeBar");
+  if(bar) bar.classList.toggle("can-scroll", bar.scrollWidth > bar.clientWidth + 2);
 }
 function setScope(v){
   $("#appScope").value = SC_LABEL[v] || v;
@@ -149,15 +154,15 @@ function onTimeChange(){
 }
 function curStatRange(){
   const sc = appScope();
-  // toExclusive：to 是否为排他上界（下一周期首日/远期末日）。仅自定义区间的 to 是
-  // 含当天的裸截止日——位在构造时落定，消费方（rangeDto/rangeExcl/loadTx/accScopeInfo）
-  // 只读该位，不再各自读全局 scope 猜语义
+  // toExclusive：to 是否已是排他上界（下一周期首日/远期末日）。仅自定义区间的 to 是
+  // 含当天的裸截止日——位在构造时落定，唯一消费方 rangeDto 据此决定原样传或转次日
+  //（服务端全部端点只认排他上界，无双编码）
   const xe = sc !== "custom";
   if(sc === "all") return {from:"2000-01-01", to:"2100-01-01", label:"全部", toExclusive:xe};
   if(sc === "custom") return {from:dtGet($("#sc_from"))||"2000-01-01", to:dtGet($("#sc_to"))||"2100-01-01", label:"自定义区间", toExclusive:xe};
   if(sc === "year"){
     const y = dtGet($("#yearSel")) || new Date().getFullYear();
-    return {from:`${y}-01-01`, to:`${+y+1}-01-01`, label:`${y}年`, toExclusive:xe};
+    return {from:`${y}-01-01`, to:`${+y+1}-01-01`, label:`${y}年`, year:y, toExclusive:xe};   // year 直带（fetchStatsBundle 取月趋势用，不再从文案反解）
   }
   const m = dtGet($("#monthSel")) || thisMonth();
   const y = m.slice(0,4);
@@ -172,27 +177,19 @@ const _fmtAmt = () => window.matchMedia("(max-width:640px)").matches ? fmtI : fm
 const _ymd = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
 /* 'YYYY-MM' → 下月首日（跨年 +1），月边界三处共用 */
 const nextMonthFirst = ym => { const y=+ym.slice(0,4), m=+ym.slice(5,7); return m===12 ? `${y+1}-01-01` : `${y}-${pad2(m+1)}-01`; };
-/* 统计请求的 to 参数（汇总条/统计页/归属三处共用）：位随区间对象（toExclusive）——
-   排他界原样传；仅自定义区间的裸截止日补 23:59:59（后端按 date< 排他） */
-const rangeDto = r => r.toExclusive ? r.to : r.to + " 23:59:59";
-/* 区间「to 是否排他上界」（汇总条/蝴蝶图/分类日历下钻共用）：位在 curStatRange 构造时
-   落定（loadSumbarAi / AI 附件 aiStatsRange 自建的区间同样带位）；settings 的账户口径走
-   nextDayStr（/api/accounts 无 to_exclusive 参数，等效含当天） */
-const rangeExcl = r => !!(r && r.toExclusive);
+/* 统计/流水/导出请求的 to 参数（全站唯一转换点）：排他界原样传；自定义区间的裸截止日
+   转次日作排他上界——服务端全部区间端点只认排他，补 23:59:59 的旧「含当天」编码已删 */
+const rangeDto = r => r.toExclusive ? r.to : nextDayStr(r.to);
 function _heatClass(r){ return r>0.66?"h4":r>0.4?"h3":r>0.18?"h2":r>0.02?"h1":""; }
 
 const _sbRanges = {};   // page → {from,to,label,toExclusive}，点击时取回渲染时的区间
-function sbLabel(r){
-  if(/^\d{4}-\d{2}$/.test(r.label)) return r.label.replace("-","年")+"月";
-  return r.label;
-}
+const sbLabel = r => ymLabel(r.label);   // 裸 YYYY-MM 润色为中文年月（ymLabel 单源）
 function renderSumbar(page, s, range){
-  const curPage = document.body.dataset.page || "ai";   // 初始未走 showPage 时默认 AI 页
+  const curPage = document.body.dataset.page;   // loadAll 已在取数前恢复停留页，此处恒有值
   if(curPage !== page || !s) return;   // 只渲染当前页（多页异步竞态时后到者不覆盖）
   const host = document.getElementById("gsum");
   if(!host) return;
-  const r = range || curStatRange();
-  _sbRanges[page] = r;
+  _sbRanges[page] = range;
   const bal = s.income - s.net_expense;
   host.innerHTML = `
     <div class="sb-cells">
@@ -206,207 +203,223 @@ function renderSumbar(page, s, range){
         <div class="k"><span class="ic" style="background:var(--m-blue)"></span>结余 <span class="arr">›</span></div>
         <div class="v${bal<0?" sb-v-neg":""}">${bal>=0?"+":"−"}${curSym()}${fmt(Math.abs(bal))}</div></div>
     </div>`;
-  gbarFit();
 }
-/* 顶栏高度实测写回 --gbar-h（.main 让位 / AI hero 高度 / 钉顶筛选区都用它） */
-function gbarFit(){
-  const g = document.getElementById("gbar");
-  if(g) document.body.style.setProperty("--gbar-h", (g.offsetHeight + 8) + "px");
-}
-/* 高度自愈：范围条显隐/汇总卡渲染/窄屏换行都会改 gbar 高度，gbarFit 只在汇总刷新时跑，
-   期间钉顶筛选区(calc(var(--gbar-h) - 8px))会按陈旧值定位出间隙——RO 实测即回写保持贴合 */
-const _gbarEl = document.getElementById("gbar");
-if(window.ResizeObserver && _gbarEl) new ResizeObserver(gbarFit).observe(_gbarEl);
+/* gbarFit/--gbar-h/ResizeObserver 测高链已随流水筛选区 sticky 退役（结构化钉顶后
+   顶栏与页面是同列 flex 行，高度关系由布局承担，无需实测回写） */
 
-let _sumbarSeq = 0;   // 请求代数：快速切范围/账本时丢弃迟到旧响应（renderSumbar 只挡页面错位，挡不住旧区间数据）
+const sumbarGen = makeSeq();   // 请求代数（makeSeq 单源）：快速切范围/账本时丢弃迟到旧响应（renderSumbar 只挡页面错位，挡不住旧区间数据）
 async function loadSumbarList(){
   if(!document.getElementById("gsum")) return;
-  const seq = ++_sumbarSeq;
+  const seq = sumbarGen.next();
   try{
     const range = curStatRange();
     const s = appScope() === "month"
       ? await api(`/api/stats/summary?ledger=${lid()}&month=${dtGet($("#monthSel")) || thisMonth()}`)
       : await api(`/api/stats/range?ledger=${lid()}&from=${range.from}&to=${encodeURIComponent(rangeDto(range))}`);
-    if(seq !== _sumbarSeq) return;
+    if(!sumbarGen.isCurrent(seq)) return;
     renderSumbar("list", s, range);
-  }catch(_){}
+  }catch(e){ console.warn("汇总条加载失败", e); }
 }
 /* AI 页汇总条：固定本月（Top3 分类行已取消） */
 async function loadSumbarAi(){
+  const sc = ledgerScope();   // 账本身份守卫（ledgerScope 单源）：旧账本汇总的迟到响应不渲染
   const m = thisMonth();
   const range = {from:`${m}-01`, to:nextMonthFirst(m), label:m, toExclusive:true};
   try{
-    const s = await api(`/api/stats/summary?ledger=${lid()}&month=${m}`);
+    const s = await api(`/api/stats/summary?ledger=${sc.id}&month=${m}`);
+    if(!sc.isCurrent()) return;
     renderSumbar("ai", s, range);
-  }catch(_){}
+  }catch(e){ console.warn("AI 页汇总条加载失败", e); }
 }
-/* 汇总条各格下钻：与原统计卡 statCardDetail 同口径（支出下钻支出明细，退款行一并展示） */
+/* 汇总条各格下钻：与统计卡下钻同口径（支出下钻支出明细，退款行一并展示） */
 function sumbarDetail(page, kind){
   const r = _sbRanges[page] || curStatRange();
-  const excl = rangeExcl(r);
   const name = {income:"收入", net:"支出", balance:"收支"}[kind] || "收支";
   const type = kind==="income" ? "income" : kind==="balance" ? "" : "expense";
   showTxDetail(`${sbLabel(r)} ${name}明细`,
-    {from:r.from, to:r.to, toExclusive:excl, ...(type?{type}:{}),
+    {from:r.from, to:rangeDto(r), ...(type?{type}:{}),
      ...(kind==="net" ? {with_refunds:true} : {})});   // 支出=净额(毛−退款)，明细带退款行对账
 }
-let _statsSeq = 0;   // 请求代数：快速切范围/账本时丢弃迟到旧响应，防旧数据重渲日历/蝴蝶图/饼图
-async function refreshStats(){
-  const seq = ++_statsSeq;
-  const sc = appScope();
-  const m = dtGet($("#monthSel")) || thisMonth();
-  statRange = curStatRange();
-  let s, cats, catsInc, trend, trendIsYearly = false;
+
+async function fetchStatsBundle(sc, m){
+  // 并发拉统计四件套（汇总/支出分类/收入分类/趋势）
   if(sc === "month"){
-    [s, cats, catsInc, trend] = await Promise.all([
+    const [s, cats, catsInc, trend] = await Promise.all([
       api(`/api/stats/summary?ledger=${lid()}&month=${m}`),
       api(`/api/stats/category?ledger=${lid()}&month=${m}`),
       api(`/api/stats/category?ledger=${lid()}&month=${m}&type=income`),
       api(`/api/stats/monthly?ledger=${lid()}&year=${m.slice(0,4)}`)]);
-  }else{
-    // 自定义区间末端含当天（与流水页同口径：补 23:59:59，后端按 date< 排他）
-    const q = `ledger=${lid()}&from=${statRange.from}&to=${encodeURIComponent(rangeDto(statRange))}`;
-    [s, cats, catsInc, trend] = await Promise.all([
-      api(`/api/stats/range?${q}`),
-      api(`/api/stats/category-range?${q}`),
-      api(`/api/stats/category-range?${q}&type=income`),
-      sc==="year"
-        ? api(`/api/stats/monthly?ledger=${lid()}&year=${statRange.label.replace("年","")}`)
-        : sc==="custom"
-          ? api(`/api/stats/trend?${q}`)
-          : api(`/api/stats/yearly?ledger=${lid()}`)]);
-    trendIsYearly = sc === "all";
+    return {s, cats, catsInc, trend, trendIsYearly: false};
   }
-  if(seq !== _statsSeq) return;   // 期间又发起了新 refreshStats：本响应已过期，丢弃
+  // 自定义区间末端含当天（rangeDto 转次日排他上界，后端按 date< 判定；与流水页同口径）
+  const q = `ledger=${lid()}&from=${statRange.from}&to=${encodeURIComponent(rangeDto(statRange))}`;
+  const [s, cats, catsInc, trend] = await Promise.all([
+    api(`/api/stats/range?${q}`),
+    api(`/api/stats/category-range?${q}`),
+    api(`/api/stats/category-range?${q}&type=income`),
+    sc==="year"
+      ? api(`/api/stats/monthly?ledger=${lid()}&year=${statRange.year}`)
+      : sc==="custom"
+        ? api(`/api/stats/trend?${q}`)
+        : api(`/api/stats/yearly?ledger=${lid()}`)]);
+  return {s, cats, catsInc, trend, trendIsYearly: sc === "all"};
+}
+
+async function renderMonthCalendar(m, isFresh){
+  // 月历网格：前后月补格 + 热度底色 + 当日标记（cal api 过期即不渲；isFresh 闭包由
+  // refreshStats 绑定本次代数传入——跨函数传递的是「是否仍是最新一次」谓词而非裸 token）
+  const cal = await api(`/api/stats/calendar?ledger=${lid()}&month=${m}`);
+  if(!isFresh()) return;
+  $("#calTitle").textContent = ymLabel(m);   // 回填移到守卫后：迟到方不再写标题
+  const [y,mo] = m.split("-").map(Number);
+  const first = new Date(y,mo-1,1), days = new Date(y,mo,0).getDate();
+  const byDay = {}; cal.forEach(c=>byDay[+c.day.slice(8)]=c);
+  const maxNet = Math.max(1, ...cal.map(c=>Math.max(0,c.net||0)));
+  const startWd = first.getDay() || 7;  // 1=Mon..7=Sun
+  let html = ["一","二","三","四","五","六","日"].map(d=>`<div class="cal-wd">${d}</div>`).join("");
+  const prevY = mo===1 ? y-1 : y, prevM = mo===1 ? 12 : mo-1;
+  const prevDays = new Date(y,mo-1,0).getDate();
+  for(let i=startWd-1;i>=1;i--){
+    const d = prevDays - i + 1;
+    html += `<div class="cal-d other" onclick="gotoMonth('${_ymd(prevY,prevM,d)}')"><span class="n">${d}</span></div>`;
+  }
+  const todayStr = today();
+  $("#calendar").classList.remove("trend");
+  const fa = _fmtAmt();
+  for(let d=1;d<=days;d++){
+    const c = byDay[d], dd = `${m}-${pad2(d)}`;
+    const heat = c && c.net>0 ? _heatClass(c.net/maxNet) : "";
+    html += `<div class="cal-d ${heat} ${dd===todayStr?'today':''}" onclick="showDay('${dd}')"><span class="n">${d}</span>
+      ${c&&c.net?`<div class="v e num">-${fa(c.net)}</div>`:""}
+      ${c&&c.income?`<div class="v i num">+${fa(c.income)}</div>`:""}</div>`;
+  }
+  // 尾部补齐：把最后一行填满到 7 的倍数
+  const totalSoFar = startWd - 1 + days;
+  const trailing = (7 - totalSoFar % 7) % 7;
+  const nextY = mo===12 ? y+1 : y, nextM = mo===12 ? 1 : mo+1;
+  for(let d=1;d<=trailing;d++){
+    html += `<div class="cal-d other" onclick="gotoMonth('${_ymd(nextY,nextM,d)}')"><span class="n">${d}</span></div>`;
+  }
+  $("#calendar").innerHTML = html;
+}
+
+function renderTrendCells(trend, trendIsYearly){
+  // 年/全局概览格：按月或按年的统计格（点击下钻明细）
+  $("#calTitle").textContent = statRange.label + " 概览";
+  const cells = trendIsYearly
+    ? trend.map(t=>({label:t.year+"年", net:t.net||0, income:t.income||0,
+        click:`showTxDetail('${t.year}年 流水', {from:'${t.year}-01-01', to:'${+t.year+1}-01-01'})`}))
+    : trend.map(t=>{ const ym=t.month, mo=+ym.slice(5,7);
+        const to = nextMonthFirst(ym);
+        return {label:mo+"月", net:t.net||0, income:t.income||0,
+          click:`showTxDetail('${ym} 流水', {from:'${ym}-01', to:'${to}'})`};});
+  const maxNet = Math.max(1, ...cells.map(c=>Math.max(0,c.net)));
+  const fa = _fmtAmt();
+  $("#calendar").classList.add("trend");
+  $("#calendar").innerHTML = cells.map(c=>{
+    const heat = c.net>0 ? _heatClass(c.net/maxNet) : "";
+    return `<div class="cal-d trend ${heat}" onclick="${c.click}">
+      <span class="n">${c.label}</span>
+      ${c.net?`<div class="v e num">${fa(c.net)}</div>`:""}
+      ${c.income?`<div class="v i num">+${fa(c.income)}</div>`:""}</div>`;
+  }).join("");
+}
+
+function renderAttribution(attrs){
+  // 归属蝴蝶图 + 可展开列表（中心人名，左=支出右=收入）
+  $("#attrCard").style.display = attrs.length ? "" : "none";
+  if(!attrs.length) return;
+  const maxAmt = Math.max(...attrs.map(a => Math.max(a.expense || 0, a.income || 0)), 1);
+  const barW = v => Math.max(2, (v / maxAmt) * 100);
+  const amtLabel = v => v > 0 ? `<span class="sub" style="font-size:11px;flex-shrink:0;margin:0 6px">${fmt(v)}</span>` : "<span style='width:8px'></span>";
+  // to 排他上界走 rangeDto 单源（与 sumbarDetail/showCategoryDetail 一致）
+  const barClick = (a, dir, type) => `showTxDetail('${qEsc(a.person)} ${dir}明细',{from:'${statRange.from}',to:'${rangeDto(statRange)}',type:'${type}',attribution:'${qEsc(a.person)}'})`;
+  $("#attrButterfly").innerHTML =
+    `<div class="attr-b-axis"><span class="l">← 支出</span><span class="c"></span><span class="r">收入 →</span></div>` +
+    attrs.map((a, i) => `
+      <div class="attr-b-row">
+        <div class="attr-b-half left">${amtLabel(a.expense)}<div class="attr-b-bar exp" style="width:${barW(a.expense)}%" onclick="${barClick(a, "支出", "expense")}"></div></div>
+        <div class="attr-b-center" onclick="attrDetailToggle(${i})">${esc(a.person)}</div>
+        <div class="attr-b-half"><div class="attr-b-bar inc" style="width:${barW(a.income)}%" onclick="${barClick(a, "收入", "income")}"></div>${amtLabel(a.income)}</div>
+      </div>`).join("");
+  // 下方保留可展开列表（分组/成员明细）
+  const sums=x=>`<div class="num"><span class="c-exp">−${fmt(x.expense)}</span>&nbsp;·&nbsp;<span class="c-inc">+${fmt(x.income)}</span></div>`;
+  $("#attrList").innerHTML = attrs.map((a,i)=>{
+    const sub=a.group?`${a.members.length} 个归属 · ${a.cnt} 笔 ▸`:`${a.cnt} 笔`;
+    const head=`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;${a.group?"cursor:pointer;":""}border-bottom:1px solid rgba(128,128,128,.15)"${a.group?` onclick="attrDetailToggle(${i})"`:""}>
+      <div><b>${esc(a.person)}</b>&nbsp;<span class="sub">${sub}</span></div>${sums(a)}</div>`;
+    if(!a.group)return head;
+    return head+`<div id="attrDetail${i}" style="display:none">${a.members.map(m=>
+      `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0 5px 14px;border-bottom:1px dashed rgba(128,128,128,.15)">
+        <div><span class="sub">${esc(m.person)}</span>&nbsp;<span class="sub">${m.cnt} 笔</span></div>${sums(m)}</div>`).join("")}</div>`;
+  }).join("");
+}
+
+async function renderStatCharts(cats, catsInc, trend, trendIsYearly, range, isFresh){
+  // 分类饼图 + 趋势柱（仅在统计页可见时绘制，避免隐藏容器中初始化导致尺寸错乱）。
+  // 每次 drawChart 前核对代数（isFresh 闭包，同 renderMonthCalendar）：drawChart 是顺序
+  // await，旧响应的后续图表若不拦，会 destroy 掉新响应刚画好的图再画上旧图
+  if(!$("#tab-stats").classList.contains("on")) return;
+  if(cats.length && isFresh()) await drawChart("catChart","doughnut", cats.map(c=>c.name), cats.map(c=>c.net/100), null,
+    (e, els)=>{ const i = els[0].index; showCategoryDetail(cats[i].name, range); }, "catChartLg");
+  if(catsInc.length && isFresh()) await drawChart("catIncChart","doughnut", catsInc.map(c=>c.name), catsInc.map(c=>c.net/100), null,
+    (e, els)=>{ const i = els[0].index; showCategoryDetail(catsInc[i].name, range, "income"); }, "catIncChartLg");
+  if(!trend.length || !isFresh()) return;
+  if(trendIsYearly){
+    await drawChart("trendChart","bar", trend.map(t=>t.year+"年"),
+      trend.map(t=>t.net/100), trend.map(t=>t.income/100),
+      (e, els)=>{ const el = els[0]; const yv = trend[el.index].year;
+        showTxDetail(`${yv}年 ${el.datasetIndex===1?"收入":"支出"}明细`,
+          {from:`${yv}-01-01`, to:`${+yv+1}-01-01`, type: el.datasetIndex===1?"income":"expense"}); });
+  }else{
+    // 月度趋势（按月/按年/自定义区间共用）：下钻用数据自身的月份，兼容自定义跨年区间
+    await drawChart("trendChart","bar", trend.map(t=>t.month.slice(5)+"月"),
+      trend.map(t=>t.net/100), trend.map(t=>t.income/100),
+      (e, els)=>{ const el = els[0];
+        showMonthDetail(trend[el.index].month,
+          el.datasetIndex===1 ? "income" : "expense"); });
+  }
+}
+
+const statsGen = makeSeq();   // 请求代数（makeSeq 单源）：快速切范围/账本时丢弃迟到旧响应，
+                              // 防旧数据重渲日历/蝴蝶图/饼图；guard 对象传给 renderMonthCalendar/
+                              // renderStatCharts（其内部 await 后各自核对）
+async function refreshStats(){
+  const gen = statsGen.next();
+  const isFresh = () => statsGen.isCurrent(gen);   // 本次代数的守卫谓词（传给子函数，见下）
+  const sc = appScope();
+  const m = dtGet($("#monthSel")) || thisMonth();
+  statRange = curStatRange();
+  const {s, cats, catsInc, trend, trendIsYearly} = await fetchStatsBundle(sc, m);
+  if(!isFresh()) return;   // 期间又发起了新 refreshStats：本响应已过期，丢弃
   // 图例与切片统一按金额(净额)从高到低排列
   cats.sort((a,b)=>b.net-a.net);
   catsInc.sort((a,b)=>b.net-a.net);
   renderSumbar("cal", s, statRange);
   renderSumbar("stats", s, statRange);
-  if(sc === "month"){
-    $("#calTitle").textContent = m.replace("-","年")+"月";
-    // 日历
-    const cal = await api(`/api/stats/calendar?ledger=${lid()}&month=${m}`);
-    if(seq !== _statsSeq) return;
-    const [y,mo] = m.split("-").map(Number);
-    const first = new Date(y,mo-1,1), days = new Date(y,mo,0).getDate();
-    const byDay = {}; cal.forEach(c=>byDay[+c.day.slice(8)]=c);
-    const maxNet = Math.max(1, ...cal.map(c=>Math.max(0,c.net||0)));
-    const startWd = first.getDay() || 7;  // 1=Mon..7=Sun
-    let html = ["一","二","三","四","五","六","日"].map(d=>`<div class="cal-wd">${d}</div>`).join("");
-    const prevY = mo===1 ? y-1 : y, prevM = mo===1 ? 12 : mo-1;
-    const prevDays = new Date(y,mo-1,0).getDate();
-    for(let i=startWd-1;i>=1;i--){
-      const d = prevDays - i + 1;
-      html += `<div class="cal-d other" onclick="gotoMonth('${_ymd(prevY,prevM,d)}')"><span class="n">${d}</span></div>`;
-    }
-    const todayStr = today();
-    $("#calendar").classList.remove("trend");
-    const fa = _fmtAmt();
-    for(let d=1;d<=days;d++){
-      const c = byDay[d], dd = `${m}-${pad2(d)}`;
-      const heat = c && c.net>0 ? _heatClass(c.net/maxNet) : "";
-      html += `<div class="cal-d ${heat} ${dd===todayStr?'today':''}" onclick="showDay('${dd}')"><span class="n">${d}</span>
-        ${c&&c.net?`<div class="v e num">-${fa(c.net)}</div>`:""}
-        ${c&&c.income?`<div class="v i num">+${fa(c.income)}</div>`:""}</div>`;
-    }
-    // 尾部补齐：把最后一行填满到 7 的倍数
-    const totalSoFar = startWd - 1 + days;
-    const trailing = (7 - totalSoFar % 7) % 7;
-    const nextY = mo===12 ? y+1 : y, nextM = mo===12 ? 1 : mo+1;
-    for(let d=1;d<=trailing;d++){
-      html += `<div class="cal-d other" onclick="gotoMonth('${_ymd(nextY,nextM,d)}')"><span class="n">${d}</span></div>`;
-    }
-    $("#calendar").innerHTML = html;
-  }else if($("#tab-cal").classList.contains("on")){
-    // 年/全局：按月/按年的统计格
-    $("#calTitle").textContent = statRange.label + " 概览";
-    const cells = trendIsYearly
-      ? trend.map(t=>({label:t.year+"年", net:t.net||0, income:t.income||0,
-          click:`showTxDetail('${t.year}年 流水', {from:'${t.year}-01-01', to:'${+t.year+1}-01-01', toExclusive:true})`}))
-      : trend.map(t=>{ const ym=t.month, mo=+ym.slice(5,7);
-          const to = nextMonthFirst(ym);
-          return {label:mo+"月", net:t.net||0, income:t.income||0,
-            click:`showTxDetail('${ym} 流水', {from:'${ym}-01', to:'${to}', toExclusive:true})`};});
-    const maxNet = Math.max(1, ...cells.map(c=>Math.max(0,c.net)));
-    const fa = _fmtAmt();
-    $("#calendar").classList.add("trend");
-    $("#calendar").innerHTML = cells.map(c=>{
-      const heat = c.net>0 ? _heatClass(c.net/maxNet) : "";
-      return `<div class="cal-d trend ${heat}" onclick="${c.click}">
-        <span class="n">${c.label}</span>
-        ${c.net?`<div class="v e num">${fa(c.net)}</div>`:""}
-        ${c.income?`<div class="v i num">+${fa(c.income)}</div>`:""}</div>`;
-    }).join("");
+  // 月历/趋势格都在 cal 页的 #calendar 里：仅 cal 页可见时渲染（切到 cal 页时
+  // showPage 会再触发整轮 refreshStats，提前渲隐藏 DOM 没有消费方——两分支同门控）
+  if($("#tab-cal").classList.contains("on")){
+    if(sc === "month") await renderMonthCalendar(m, isFresh);
+    else renderTrendCells(trend, trendIsYearly);
   }
-  // 口径与上面 range 系列相同（自定义区间末端补 23:59:59，to 排他）
+  // 口径与 range 系列相同（to 经 rangeDto 单源转排他上界）
   let attrs = [];
   try{
     attrs = await api(`/api/stats/attribution?ledger=${lid()}&from=${statRange.from}&to=${encodeURIComponent(rangeDto(statRange))}`);
-  }catch(_){}
-  if(seq !== _statsSeq) return;   // 归属请求也可能迟到：过期即不渲蝴蝶图/图例
-  $("#attrCard").style.display = attrs.length ? "" : "none";
-  if(attrs.length){
-    // 蝴蝶图：中心人名，左=支出右=收入；金额在条外（支出左侧/收入右侧）；条色走 CSS 语义色（views.css --expense/--income）
-    const maxAmt = Math.max(...attrs.map(a => Math.max(a.expense || 0, a.income || 0)), 1);
-    const barW = v => Math.max(2, (v / maxAmt) * 100);
-    const amtLabel = v => v > 0 ? `<span class="sub" style="font-size:10px;flex-shrink:0;margin:0 6px">${fmt(v)}</span>` : "<span style='width:8px'></span>";
-    // to 排他口径走 rangeExcl（与 sumbarDetail/showCategoryDetail 单源）
-    const bExcl = rangeExcl(statRange);
-    const barClick = (a, dir, type) => `showTxDetail('${qEsc(a.person)} ${dir}明细',{from:'${statRange.from}',to:'${statRange.to}',toExclusive:${bExcl},type:'${type}',attribution:'${qEsc(a.person)}'})`;
-    $("#attrButterfly").innerHTML =
-      `<div class="attr-b-axis"><span class="l">← 支出</span><span class="c"></span><span class="r">收入 →</span></div>` +
-      attrs.map((a, i) => `
-        <div class="attr-b-row">
-          <div class="attr-b-half left">${amtLabel(a.expense)}<div class="attr-b-bar exp" style="width:${barW(a.expense)}%" onclick="${barClick(a, "支出", "expense")}"></div></div>
-          <div class="attr-b-center" onclick="attrDetailToggle(${i})">${esc(a.person)}</div>
-          <div class="attr-b-half"><div class="attr-b-bar inc" style="width:${barW(a.income)}%" onclick="${barClick(a, "收入", "income")}"></div>${amtLabel(a.income)}</div>
-        </div>`).join("");
-
-    // 下方保留可展开列表（分组/成员明细）
-    const sums=x=>`<div class="num"><span class="c-exp">−${fmt(x.expense)}</span>&nbsp;·&nbsp;<span class="c-inc">+${fmt(x.income)}</span></div>`;
-    $("#attrList").innerHTML = attrs.map((a,i)=>{
-      const sub=a.group?`${a.members.length} 个归属 · ${a.cnt} 笔 ▸`:`${a.cnt} 笔`;
-      const head=`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;${a.group?"cursor:pointer;":""}border-bottom:1px solid rgba(128,128,128,.15)"${a.group?` onclick="attrDetailToggle(${i})"`:""}>
-        <div><b>${esc(a.person)}</b>&nbsp;<span class="sub">${sub}</span></div>${sums(a)}</div>`;
-      if(!a.group)return head;
-      return head+`<div id="attrDetail${i}" style="display:none">${a.members.map(m=>
-        `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0 5px 14px;border-bottom:1px dashed rgba(128,128,128,.15)">
-          <div><span class="sub">${esc(m.person)}</span>&nbsp;<span class="sub">${m.cnt} 笔</span></div>${sums(m)}</div>`).join("")}</div>`;
-    }).join("");
-  }
-  // 分类饼图 + 趋势（仅在统计页可见时绘制，避免隐藏容器中初始化导致尺寸错乱）
+  }catch(e){ console.warn("归属统计加载失败，蝴蝶图将缺省", e); }
+  if(!isFresh()) return;   // 归属请求也可能迟到：过期即不渲蝴蝶图/图例
+  renderAttribution(attrs);
+  // 空态与卡片可见性
   const noData = !cats.length && !trend.length && !attrs.length;
   $("#statsEmpty").textContent = `${sbLabel(statRange)} · 暂无数据`;   // 空态文案随范围（月/年/全部/自定义），不写死"本月"
   $("#statsEmpty").style.display = noData ? "block" : "none";
   $("#catCard").style.display = cats.length ? "" : "none";
   $("#catIncCard").style.display = catsInc.length ? "" : "none";
   $("#trendCard").style.display = trend.length ? "" : "none";
-  const range = statRange;
-  if($("#tab-stats").classList.contains("on")){
-    if(cats.length) await drawChart("catChart","doughnut", cats.map(c=>c.name), cats.map(c=>c.net/100), null,
-      (e, els)=>{ const i = els[0].index; showCategoryDetail(cats[i].name, range); }, "catLegend");
-    if(catsInc.length) await drawChart("catIncChart","doughnut", catsInc.map(c=>c.name), catsInc.map(c=>c.net/100), null,
-      (e, els)=>{ const i = els[0].index; showCategoryDetail(catsInc[i].name, range, "income"); }, "catIncLegend");
-    if(trend.length){
-      if(trendIsYearly){
-        await drawChart("trendChart","bar", trend.map(t=>t.year+"年"),
-          trend.map(t=>t.net/100), trend.map(t=>t.income/100),
-          (e, els)=>{ const el = els[0]; const yv = trend[el.index].year;
-            showTxDetail(`${yv}年 ${el.datasetIndex===1?"收入":"支出"}明细`,
-              {from:`${yv}-01-01`, to:`${+yv+1}-01-01`, toExclusive:true, type: el.datasetIndex===1?"income":"expense"}); });
-      }else{
-        // 月度趋势（按月/按年/自定义区间共用）：下钻用数据自身的月份，兼容自定义跨年区间
-        await drawChart("trendChart","bar", trend.map(t=>t.month.slice(5)+"月"),
-          trend.map(t=>t.net/100), trend.map(t=>t.income/100),
-          (e, els)=>{ const el = els[0];
-            showMonthDetail(trend[el.index].month,
-              el.datasetIndex===1 ? "income" : "expense"); });
-      }
-    }
-  }
+  await renderStatCharts(cats, catsInc, trend, trendIsYearly, statRange, isFresh);
 }
-function themeColors(){
+function chartColors(){
   const cs = getComputedStyle(document.body);
   const isDark = document.body.dataset.theme === "dark";
   /* 深色模式调色板（环形图）：亮度再降一档，目标 35-45% lightness，深色底上完全不刺眼 */
@@ -430,7 +443,7 @@ function lgDrill(id, i){ chartDrill[id] && chartDrill[id](i); }
 function renderLegend(legendId, chartId, labels, data){
   // HTML 图例：固定圆图尺寸后，上下两图的圆心与图例列起点严格对齐；点击图例=点击切片下钻
   const total = data.reduce((a,b)=>a+(+b||0),0);
-  const pal = themeColors().palette;
+  const pal = chartColors().palette;
   document.getElementById(legendId).innerHTML = labels.map((l,i)=>{
     const v = +data[i]||0, pct = total ? Math.round(v/total*100) : 0;
     return `<div class="lg-item" onclick="lgDrill('${chartId}',${i})">
@@ -444,41 +457,52 @@ async function drawChart(id, type, labels, data, data2, onClick, legendId, opts)
   /* opts.responsive=false：固定 canvas 像素尺寸（AI 聊天气泡内的 150px 环形图），
      不随容器缩放；缺省 true 与统计页行为一致 */
   const fixed = opts && opts.responsive === false;
-  try{ await loadChart(); }catch(_){ return; }   // Chart.js 按需加载；加载失败静默跳过（图例照常渲染）
+  try{ await loadChart(); }catch(e){ console.warn("Chart.js 加载失败，图表跳过", e); return; }
   if(charts[id]) charts[id].destroy();
-  const tc = themeColors();
-  const isDark = document.body.dataset.theme === "dark";
-  const total = data.reduce((a,b)=>a+(+b||0), 0);
-
-  const doughnutBorder = tc.card;
+  /* 颜色一律 scriptable（每次绘制时求值，Chart.js v4）：切主题经 dropCharts 的
+     update() 即换色，不再在创建时焙成 hex 定值（此前为此维护销毁-重放机制） */
   const doughnutBorderWidth = 2;
+  const palOf = () => chartColors().palette, cardC = () => chartColors().card;
   const ds = [{data, backgroundColor:type==="doughnut"
-    ? data.map((_,i)=>tc.palette[i%tc.palette.length])
-    :tc.bar.expense, borderColor: doughnutBorder, borderWidth: doughnutBorderWidth,
-    hoverBorderColor: doughnutBorder, label:(opts && opts.label) || "净支出", borderRadius:6}];
-  if(data2) ds.push({data:data2, backgroundColor:tc.bar.income, borderColor: doughnutBorder, borderWidth: doughnutBorderWidth,
-    hoverBorderColor: doughnutBorder, label:"收入", borderRadius:6});
+      ? ctx => palOf()[ctx.dataIndex % palOf().length]
+      : () => chartColors().bar.expense,
+    borderColor: cardC, borderWidth: doughnutBorderWidth,
+    hoverBorderColor: cardC, label:(opts && opts.label) || "净支出", borderRadius:6}];
+  if(data2) ds.push({data:data2, backgroundColor: () => chartColors().bar.income,
+    borderColor: cardC, borderWidth: doughnutBorderWidth,
+    hoverBorderColor: cardC, label:"收入", borderRadius:6});
+  const fgC = () => chartColors().fg, gridC = () => chartColors().grid;
   charts[id] = new Chart($("#"+id), {type, data:{labels, datasets:ds},
     /* 容器均固定高度：maintainAspectRatio 必须为 false，否则 canvas 按自身宽高比撑高溢出卡片 */
     options:{responsive:!fixed, maintainAspectRatio:false, onClick: onClick||undefined,
-      elements:{arc:{borderColor: doughnutBorder, borderWidth: doughnutBorderWidth, hoverOffset: type==="doughnut" ? 4 : 0, hoverBorderColor: doughnutBorder}},
-      plugins:{legend:{display:false, labels:{color:tc.fg}},
-        tooltip:{backgroundColor: isDark ? "rgba(20,28,45,.92)" : "rgba(255,255,255,.95)",
-                 titleColor: getComputedStyle(document.body).getPropertyValue("--fg").trim() || "#0F172A",
-                 bodyColor: tc.fg, borderColor: tc.grid, borderWidth:1, padding:8,
+      elements:{arc:{borderWidth: doughnutBorderWidth, hoverOffset: type==="doughnut" ? 4 : 0}},
+      plugins:{legend:{display:false, labels:{color: fgC}},
+        tooltip:{backgroundColor: () => document.body.dataset.theme === "dark"
+                   ? "rgba(20,28,45,.92)" : "rgba(255,255,255,.95)",
+                 titleColor: () => getComputedStyle(document.body).getPropertyValue("--fg").trim() || "#0F172A",
+                 bodyColor: fgC, borderColor: gridC, borderWidth:1, padding:8,
           callbacks:{label:(ctx)=>{
             const v = typeof ctx.parsed==="number" ? ctx.parsed : ctx.parsed.y;
             const prefix = ctx.dataset.label || ctx.label || "";
             return ` ${prefix} ${curSym()}${fmtYuan(v)}`;
           }}}},
-      scales:type==="doughnut"?undefined:{x:{ticks:{color:tc.fg},grid:{color:tc.grid}},y:{ticks:{color:tc.fg},grid:{color:tc.grid}}}}});
+      scales:type==="doughnut"?undefined:{x:{ticks:{color:fgC},grid:{color:gridC}},y:{ticks:{color:fgC},grid:{color:gridC}}}}});
   if(onClick) chartDrill[id] = (i)=>onClick(null,[{index:i}]);
   if(legendId) renderLegend(legendId, id, labels, data);
 }
 
 function dropCharts(){
-  Object.values(charts).forEach(c=>{ try{ c.destroy(); }catch(_){} });
-  charts = {};
-  const p = document.body.dataset.page;
-  if(p === "stats" || p === "cal") refreshStats();   // 当前页有图表：切主题立即换色
+  /* 切主题换图表配色：drawChart 的颜色是绘制时求值的 scriptable（见其注释），
+     update() 重画即得新配色——AI 聊天气泡图不必再销毁重建（其创建数据只在气泡
+     闭包里，此前为此维护「快照 labels/data/下钻闭包再原位重建」的重放机制）。
+     图例圆点是内联样式，按图表现存数据重渲一遍；图例 id 统一「canvas id + Lg」
+     （趋势图无图例，miss 跳过）。蝴蝶图/月历格颜色走 CSS 类，无需重渲。 */
+  for(const [id, c] of Object.entries(charts)){
+    try{
+      c.update();
+      const lg = document.getElementById(id + "Lg");
+      if(lg && c.data.labels && (c.data.datasets[0] || {}).data)
+        renderLegend(lg.id, id, c.data.labels, c.data.datasets[0].data);
+    }catch(_){ /* 气泡已删的残余实例：update 抛错跳过即可 */ }
+  }
 }

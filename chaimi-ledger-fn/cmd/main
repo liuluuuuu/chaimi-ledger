@@ -45,12 +45,19 @@ SITE="${VAR_BASE}/site-packages"
 log_msg() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"; }
 
 fail() {
-    echo "$1" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    echo "$1" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}"   # 追加：多次失败的诊断不互相覆盖（install_init 同口径）
     log_msg "$1"
     return 1
 }
 
-check_process() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+# 存活 + 身份双验：断电重启后残留 pid 文件的 PID 可能已被别的进程复用——只验存活会让
+# status 误报运行中、start 直接跳过（网关 502 直到手删 pid），stop 更会把 TERM/KILL 发给
+# 无关进程。身份 = cmdline 含本应用入口；无 procfs（非 Linux）时回落只验存活
+check_process() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 0
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qF "${APP_SRC}"
+}
 
 cleanup_socket() {
     if [ -e "${GATEWAY_SOCKET}" ]; then
@@ -133,35 +140,69 @@ ensure_site() {
 start_app() {
     status_app && return 0
     [ -x "${PY}" ] && [ -f "${APP_SRC}" ] || { fail "python3(${PY}) 或 ${APP_SRC} 缺失"; return 1; }
+    # 并发 start 互斥（框架重复触发时防止双进程同时 ensure_site 把 site-packages 装坏/
+    # 双 uvicorn 双轮询）：mkdir 原子锁；锁龄超 120s 视为上次异常残留强清
+    local LOCK="${VAR_BASE}/.start.lock"
+    if ! mkdir "${LOCK}" 2>/dev/null; then
+        local lock_age=$(( $(date +%s) - $(stat -c %Y "${LOCK}" 2>/dev/null || echo 0) ))
+        if [ ${lock_age} -gt 120 ]; then
+            rm -rf "${LOCK}"
+            mkdir "${LOCK}" 2>/dev/null || { fail "启动锁被占用且无法清理"; return 1; }
+        else
+            fail "另一个 start 正在进行（锁：${LOCK}）"
+            return 1
+        fi
+    fi
     adopt_legacy
-    ensure_site || return 1
+    ensure_site || { rmdir "${LOCK}" 2>/dev/null; return 1; }
     cleanup_socket
     log_msg "run user: $(id -un 2>/dev/null || echo '?') (TRIM_RUN_USERNAME=${TRIM_RUN_USERNAME:-<unset>}), 数据基目录: ${VAR_BASE}"
     log_msg "正在启动 chaimi-server ..."
-    # TRIM_PKGVAR 传基目录(覆盖框架原值):server 侧 receipts/日志定位与 DB 对齐;
+    # 进程名可读化：python 二进制按应用名建符号链接再 exec -a 同名——进程列表显示
+    # chaimi-ledger 而非 python3；server.py 路径仍在命令行（check_process/uninstall
+    # 清理按路径匹配）。链接每次启动按当前运行时重建；建不成回落原样，不拦启动
+    BIN_ALIAS="${VAR_BASE}/chaimi-ledger"
+    ln -sf "${PY}" "${BIN_ALIAS}" 2>/dev/null || BIN_ALIAS="${PY}"
+    # TRIM_PKGVAR传基目录(覆盖框架原值):server 侧 receipts/日志定位与 DB 对齐;
     # CHAIMI_DB 显式指定,不依赖 config.py 的 TRIM_PKGVAR 回退链
-    TRIM_APPDEST="${APP_DIR}" \
-    TRIM_PKGVAR="${VAR_BASE}" \
-    CHAIMI_DB="${VAR_BASE}/chaimi.db" \
-    TRIM_GATEWAY_SOCKET="app.sock" \
-    TRIM_GATEWAY_PREFIX="/app/chaimi-ledger" \
-    PYTHONPATH="${SITE}" \
-        "${PY}" "${APP_SRC}" --uds "${GATEWAY_SOCKET}" >> "${LOG_FILE}" 2>&1 &
+    ( export TRIM_APPDEST="${APP_DIR}" TRIM_PKGVAR="${VAR_BASE}" \
+             CHAIMI_DB="${VAR_BASE}/chaimi.db" TRIM_GATEWAY_SOCKET="app.sock" \
+             TRIM_GATEWAY_PREFIX="/app/chaimi-ledger" PYTHONPATH="${SITE}"
+      exec -a chaimi-ledger "${BIN_ALIAS}" "${APP_SRC}" --uds "${GATEWAY_SOCKET}" ) >> "${LOG_FILE}" 2>&1 &
     SRV_PID=$!
     printf "%s" "${SRV_PID}" > "${PID_FILE}"
     log_msg "chaimi-server pid=${SRV_PID}"
     local i=0
     while [ ${i} -lt 30 ]; do
         [ -S "${GATEWAY_SOCKET}" ] && break
+        # 进程中途死了就不必白等满 30 秒
+        check_process "${SRV_PID}" || break
         sleep 1; i=$((i + 1))
     done
     if [ -S "${GATEWAY_SOCKET}" ]; then
         chmod 666 "${GATEWAY_SOCKET}"
         log_msg "网关 socket 就绪: ${GATEWAY_SOCKET} (/app/chaimi-ledger)"
     else
+        # 超时兜底：终止慢启动进程并清 PID 文件——否则留下「假活」：下次 start 会被
+        # status 误判已在运行，而网关 socket 缺失、应用不可用。
+        # TERM 后必须等它退净（复用 stop_app 的 wait+KILL 模式）：uvicorn 优雅关闭会
+        # 删除 UDS 文件——若不等它退净就返回，框架快速重试 start 时旧进程的关闭流程
+        # 会删掉新进程刚建好的 socket（网关断流直到手动重启）
+        if check_process "${SRV_PID}"; then
+            kill -TERM "${SRV_PID}" 2>/dev/null
+            local count=0
+            while check_process "${SRV_PID}" && [ ${count} -lt 8 ]; do
+                sleep 1; count=$((count + 1))
+            done
+            check_process "${SRV_PID}" && kill -KILL "${SRV_PID}" 2>/dev/null
+            log_msg "未就绪超时：已终止慢启动进程 pid=${SRV_PID}"
+        fi
+        rm -f "${PID_FILE}" 2>/dev/null
+        rmdir "${LOCK}" 2>/dev/null
         fail "chaimi-server 未在 30 秒内就绪，详见 ${LOG_FILE}"
         return 1
     fi
+    rmdir "${LOCK}" 2>/dev/null
 }
 
 stop_app() {

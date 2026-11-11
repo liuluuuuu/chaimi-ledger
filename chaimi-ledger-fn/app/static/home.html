@@ -10,11 +10,16 @@
 <style>
 /* ===== 登录/用户选择页：≤768px 竖排、宽屏左品牌右操作。
    lg-* 样式只在本页使用（app.html 不携带）。 ===== */
-html,body{height:100%}
-body{display:flex;align-items:center;justify-content:center;background:var(--bg)}
-.lg-wrap{display:flex;width:100%;max-width:420px;min-height:100vh;flex-direction:column;background:var(--bg)}
+/* 手机：自然文档流 + 水平居中（margin auto）。旧版 body 定高弹性居中会把超高内容
+   垂直居中——顶部溢出不可滚动（用户列表一长首屏元素够不着） */
+body{background:var(--bg)}
+.lg-wrap{display:flex;width:100%;max-width:420px;min-height:100vh;flex-direction:column;margin:0 auto}
 .lg-brand{display:none}
-.lg-panel{flex:1;display:flex;flex-direction:column;justify-content:center;padding:40px 30px}
+.lg-panel{flex:1;display:flex;flex-direction:column;padding:40px 30px;overflow-y:auto}
+.lg-panel>*{flex-shrink:0}   /* 高度不够改滚动：按钮/输入框/用户卡是纵向 flex 子项，默认可被压扁 */
+.lg-panel::before,.lg-panel::after{content:"";flex:1 0 0}   /* 上下弹性占位：有余量时垂直居中，
+   超高时归零贴顶可从头滚（justify-content:center 会把首行顶出滚动区；auto 边距落在
+   桌面端隐藏的 .lg-mhead 上不生效——内容贴顶的根因） */
 .lg-mhead{display:flex;flex-direction:column;margin-bottom:26px}
 .lg-mhead img{width:72px;height:72px;border-radius:20px;box-shadow:var(--shadow)}
 .lg-h1{font-size:22px;font-weight:700;margin-bottom:8px;color:var(--fg)}
@@ -58,62 +63,84 @@ body{display:flex;align-items:center;justify-content:center;background:var(--bg)
   background:var(--fg);color:var(--bg);padding:10px 18px;border-radius:999px;font-size:13px;
   transition:all .25s;pointer-events:none;z-index:9}
 #lgToast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+#lgToast.err{background:var(--expense);color:#fff}   /* ok=false 报错样式（与 core.js msg 语义对齐） */
 @media(min-width:769px){
-  .lg-wrap{flex-direction:row;width:100%;max-width:none;height:100vh;min-height:0;background:var(--card);overflow:hidden}
-  .lg-brand{flex:0 0 41%;display:flex;flex-direction:column;justify-content:center;padding:0 5.5vw;position:relative;
-    overflow:hidden;background:linear-gradient(160deg,var(--m-blue-50) 0%,#F3EEFE 100%)}
-  .lg-blob{position:absolute;border-radius:50%;opacity:.5}
-  .lg-blob.b1{width:220px;height:220px;background:var(--m-blue-50);right:-70px;top:-60px}
-  .lg-blob.b2{width:150px;height:150px;background:#FBEBF0;right:40px;bottom:-50px}
-  .lg-blob.b3{width:90px;height:90px;background:var(--m-mint-50);left:-24px;bottom:70px}
+  /* 桌面布局与主应用同款（base.css .sidebar/.main）：左=窗口灰（app 侧栏底色），
+     右=灰底上的描边圆角内容卡片（上/右/下 10px 留白、左缘贴齐，如 app 的 .main） */
+  .lg-wrap{flex-direction:row;width:100%;max-width:none;height:100vh;min-height:0;background:var(--win);overflow:hidden}
+  .lg-brand{flex:0 0 41%;display:flex;flex-direction:column;justify-content:center;padding:0 5.5vw;
+    position:relative;overflow:hidden;background:var(--win)}
+  .lg-brand>*{flex-shrink:0}   /* 与 .lg-panel 同款：窗口过矮时图标/标题不压缩 */
   .lg-icon{width:88px;height:88px;border-radius:24px;box-shadow:var(--shadow-lg);position:relative}
   .lg-name{font-size:27px;font-weight:700;margin-top:24px;position:relative;color:var(--fg)}
-  .lg-tag{margin-top:12px;color:var(--muted);font-size:14px;line-height:1.9;position:relative;max-width:300px}
-  .lg-panel{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:48px 5vw}
+  .lg-tag{margin-top:12px;color:var(--muted);font-size:14px;line-height:1.9;position:relative}
+  .lg-tag span{white-space:nowrap}   /* 短语不可拆：宽度不够时只在「·」分隔处换行，不出现「记一/笔」这类拆词 */
+  .lg-panel{flex:1;display:flex;flex-direction:column;align-items:center;padding:48px 5vw;
+    margin:10px 10px 10px 0;border:1px solid var(--border);border-radius:var(--radius-panel);background:var(--panel)}
   .lg-panel>*{width:100%;max-width:420px}   /* 表单/列表一列居中，不贴左 */
   .lg-mhead{display:none}   /* 宽屏品牌区已有图标标题 */
 }
+/* ===== 分类编辑抽屉（内容复用 catmgr.js） ===== */
+.cat-drawer-mask{position:fixed;inset:0;background:var(--mask);z-index:var(--z-modal);display:none;align-items:center;justify-content:center;padding:16px}
+.cat-drawer-mask.on{display:flex}
+.cat-drawer{background:var(--card);border:1px solid var(--border);border-radius:22px;width:100%;max-width:560px;
+  max-height:84vh;display:flex;flex-direction:column;box-shadow:0 4px 16px rgba(31,36,51,.08),0 16px 48px rgba(31,36,51,.12);animation:catDrawerIn .22s ease}
+@keyframes catDrawerIn{from{transform:translateY(40px);opacity:0}}
+.cat-drawer-head{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
+.cat-drawer-btn{border:1px solid var(--border);background:none;color:var(--fg);border-radius:9px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+.cat-drawer-btn:hover{background:var(--hover)}
+.cat-drawer-body{padding:20px;overflow-y:auto}
+.cat-drawer-body .cm-group:first-child{margin-top:0}   /* 首组外距并入 20px 内距：抽屉上下留空对称 */
+.cat-drawer-body .cm-cat:last-child{margin-bottom:0}
 </style>
+<script>/* 首帧门控（规则在 base.css gate-hold，期间盖启动画面）：判定完成前不显示页面——
+   自动进入者全程只见启动画面（「正在加载…」不闪现），停留者一次性干净出现。
+   放行点=render()（boot 一切出口），4s 兜底亮出加载/失败态 */
+try{
+  document.documentElement.classList.add("gate-hold");
+  setTimeout(() => gateLift(), 4000);   // 须包箭头：此时 theme-boot.js 尚未加载，裸传 gateLift 求值即 ReferenceError（被 catch 吞掉、兜底从未注册），app.html 同款已注明此坑
+}catch(_){}</script>
 </head>
 <body data-theme="light">
-<script>
-/* 主题先行：与 app.html 同源逻辑——按偏好 + 上次解析明暗在首帧前落地，登录/选用户页
-   与主应用明暗一致；宿主/系统切换的实时联动由 theme.js 接管 */
-(function(){
-  var dark;
-  try{
-    var m = localStorage.getItem("chaimi_theme") || "auto";
-    dark = m === "dark" ? true : m === "light" ? false
-      : (localStorage.getItem("chaimi_theme_dark") || (matchMedia("(prefers-color-scheme: dark)").matches ? "1" : "0")) === "1";
-  }catch(_){ dark = matchMedia("(prefers-color-scheme: dark)").matches; }
-  document.body.dataset.theme = dark ? "dark" : "light";
-})();
-</script>
+<script src="static/theme-boot.js"></script>   <!-- 主题先行（防闪白/闪黑），与 app.html 共用 -->
   <div class="lg-wrap">
     <div class="lg-brand">
-      <div class="lg-blob b1"></div><div class="lg-blob b2"></div><div class="lg-blob b3"></div>
       <img class="lg-icon" src="images/icon-256.png" alt="柴米记账">
       <div class="lg-name">柴米记账</div>
-      <div class="lg-tag">家人共用的记账本 · 多账本 · 账单导入 · AI 记一笔<br>数据全在你的 NAS 上</div>
+      <div class="lg-tag"><span>家人共用的记账本</span> · <span>多账本</span> · <span>账单导入</span> · <span>AI 记一笔</span><br>数据全在你的 NAS 上</div>
     </div>
     <div class="lg-panel" id="lgPanel"><div class="lg-sub">正在加载…</div></div>
   </div>
   <div id="lgToast"></div>
+  <!-- 分类编辑抽屉：内容复用 catmgr.js（与设置页分类管理同源）；「分类来自」选中即应用，编辑直接改当前生效的分类 -->
+  <div class="cat-drawer-mask" id="catDrawer" onclick="if(event.target===this)closeCatDrawer()">
+    <div class="cat-drawer">
+      <div class="cat-drawer-head">
+        <b>编辑分类</b>
+        <span style="display:flex;align-items:center;gap:8px">
+          <button type="button" id="catEditBtn" class="cat-drawer-btn" onclick="toggleCatEdit()">编辑</button>
+          <button type="button" class="cat-drawer-btn" onclick="closeCatDrawer()" title="关闭">✕</button>
+        </span>
+      </div>
+      <div class="cat-drawer-body"><div id="catMgr" class="catmgr-root"></div></div>
+    </div>
+  </div>
+<script src="static/shared-lite.js"></script>   <!-- $/esc/qEsc/api/apiSend 最小工具集（与 core.js 同口径单源） -->
+<script src="static/catmgr.js"></script>
 <script>
-/* 独立登录页：服务端入口（GET / 发现无账本）或主应用检测到「无当前用户」（首次/缓存
-   失效）跳过来，选定/创建用户后写 chaimi_user_{账本id} 并回主应用。无 core.js 依赖，自带最小工具。 */
-const $ = s => document.querySelector(s);
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-async function api(path, opts){
-  const r = await fetch(path.replace(/^\//, ""), opts);   // 相对路径，经 <base> 兼容网关前缀/直连
-  if(!r.ok){ let e = "请求失败"; try{ e = (await r.json()).detail || e }catch(_){} throw new Error(e); }
-  return r.json();
-}
-const apiSend = (path, method, body) => api(path, {method, headers:{"Content-Type":"application/json"},
-  body: JSON.stringify(body)});
+/* 独立登录页：/ 入口看设备记忆（Cookie，读写见 shared-lite.js）——记着有效用户的设备
+   直接拿到主界面，不经过本页；没记忆或记忆失效才 302 到这里选人/建用户（老版本升级后
+   第一次打开也停在这里，点一次用户即写入 Cookie，不搬旧记录）。本页保留自动进入
+   （?pick=1 显式选人时跳过）给直达场景（书签直开本页等）。选定/创建后写
+   chaimi_user_{账本id} 并进 /app。无 core.js 依赖，基础工具由 shared-lite.js 提供，
+   此处只留本页专属的 toast。 */
 let _toastT = null;
-function msg(t){
-  const el = $("#lgToast"); el.textContent = t; el.classList.add("on");
+function msg(t, ok=true){
+  // 签名与 core.js msg(t, ok) 对齐：catmgr 共享模块按 (text, false) 报错，home 此前
+  // 单参实现让错误 toast 永远中性样式（API 口径漂移）；ok=false 红字示警
+  const el = $("#lgToast"); el.textContent = t;
+  el.classList.toggle("err", ok === false);
+  el.classList.add("on");
   clearTimeout(_toastT); _toastT = setTimeout(()=>el.classList.remove("on"), 2600);
 }
 
@@ -121,16 +148,23 @@ let LEDGER = 0, LNAME = "", USERS = [], SAVED = 0, LEDGERS = [];
 
 async function boot(){
   try{
+    const qp = new URLSearchParams(location.search);
+    let want = +qp.get("ledger") || 0;   // 目标账本：URL 指定优先
+    if(!want) want = +ckGet("chaimi_ledger") || 0;   // 其次上次使用（与 app loadAll 选账本同口径）
     const ls = await api("api/ledgers");
     if(!ls.length){ render(newLedgerHtml()); return; }   // 无账本（新飞牛用户/全新安装）：先建账本，不再跳回主应用（会成环）
     LEDGERS = ls;
-    const qp = +new URLSearchParams(location.search).get("ledger") || 0;
-    const cur = ls.find(l => l.id === qp) || ls[0];
+    const cur = ls.find(l => l.id === want) || ls[0];
     LEDGER = cur.id; LNAME = cur.name;
-    try{ SAVED = +localStorage.getItem("chaimi_user_" + LEDGER) || 0; }catch(_){}
+    SAVED = savedUser(LEDGER);
+    // 账本列表→用户列表串行取。常规冷启动已不经过本页（/ 入口服务端判定直出 app），
+    // 到这里的都是少数场景，不为省一个来回做请求预取（老方案的提速已随入口改版移除）
     USERS = await api(`api/attribution-groups?ledger=${LEDGER}`);
+    /* 本机已记录有效用户→自动直入 app（书签直开本页等直达场景走这条）；
+       ?pick=1 显式选人（app 顶栏「切换用户」入口）不自动进入，否则一进 home 又被弹回原用户 */
+    if(!qp.get("pick") && USERS.some(g => g.id === SAVED)){ enter(SAVED); return; }
     render(USERS.length ? selHtml() : setupHtml(false));
-  }catch(e){ $("#lgPanel").innerHTML = `<div class="lg-sub">加载失败：${esc(e.message)}</div>`; }
+  }catch(e){ render(`<div class="lg-sub">加载失败：${esc(e.message)}</div>`); }   // 经 render 放行（首帧门控）
 }
 /* 账本选择行：
    两态（选用户/建用户）共用，点击切换目标账本并重拉其用户（enter 写 chaimi_ledger/chaimi_user 都以 LEDGER 为准，闭环） */
@@ -141,14 +175,22 @@ function ledBar(){
 async function switchLedger(id){
   if(id === LEDGER) return;
   LEDGER = id; LNAME = LEDGERS.find(l=>l.id===id)?.name || "";
-  try{ SAVED = +localStorage.getItem("chaimi_user_" + LEDGER) || 0; }catch(_){}
+  SAVED = savedUser(id);
   render(`<div class="lg-sub">加载中…</div>`);
-  try{ USERS = await api(`api/attribution-groups?ledger=${LEDGER}`); }
-  catch(_){ USERS = []; }
+  // 账本守卫（ledgerScope 单源，身份源是本页模块变量 LEDGER）：快速连点两个账本时慢的
+  // 旧响应若直接写入 USERS，界面会显示 A 账本用户、LEDGER 却是 B，此后 enter(id) 会把
+  // A 的用户写进 B 的存储键。守卫放在 USERS 赋值之前，旧响应连全局都不污染
+  const sc = ledgerScope(() => LEDGER);
+  let us = [];
+  try{ us = await api(`api/attribution-groups?ledger=${sc.id}`); }catch(_){}
+  if(!sc.isCurrent()) return;
+  USERS = us;
   render(USERS.length ? selHtml() : setupHtml(false));
 }
+const savedUser = id => +ckGet("chaimi_user_" + id) || 0;   // 上次使用用户（没记过/禁 Cookie 为 0），boot/switchLedger 共用
 function render(html){
   $("#lgPanel").innerHTML = html;
+  gateLift();   // 首帧判定出口：渐隐揭掉启动画面（boot 成功/失败都经此；自动进入不经过=画面盖到跳转）
 }
 function head(){ return `<div class="lg-mhead"><img src="images/icon-256.png" alt=""></div>`; }
 /* 状态 C：一本账本都没有（新飞牛用户/全新安装）——先建账本再进建用户流程 */
@@ -165,13 +207,28 @@ async function createLedger(){
   try{
     const name = ($("#lg_ledger_name").value || "").trim() || "日常";
     const r = await apiSend("api/ledgers", "POST", {name, currency: "CNY"});
-    try{ localStorage.setItem("chaimi_ledger", String(r.id)); }catch(_){}
+    ckSet("chaimi_ledger", r.id);
     LEDGER = r.id; LNAME = name; LEDGERS = [{id: r.id, name, icon: ""}];
     render(setupHtml(false));   // 建完账本接着走「设置第一个用户」
   }catch(e){ msg(e.message); }
 }
 let lgAvatar = "f";
 let lgFromList = false;
+function catFromHtml(fromList){   // 「分类来自」：新账本首用户流程且有历史账本时才显示
+  // （全新安装无可复用；fromList=给已有账本补用户，非新建场景不换分类）
+  const others = fromList ? [] : LEDGERS.filter(l => l.id !== LEDGER);
+  if(!others.length) return "";
+  return `<div class="lg-label"><span>分类来自</span></div>
+    <div style="display:flex;gap:8px">
+      <!-- min-width:0：flex 子项默认最小宽=内容（select 即最长 option 文本），不放开则
+           窄屏压不扁本行、「编辑」按钮被挤出屏外不可点；select 自身会截断长文案 -->
+      <select id="lg_cat_from" class="lg-input" style="flex:1 1 auto;width:auto;min-width:0" data-applied="" onchange="applyCatFrom(this)">
+        <option value="">默认分类（已就绪）</option>
+        ${others.map(l => `<option value="${l.id}">复用「${esc(l.name)}」的分类与来源映射</option>`).join("")}
+      </select>
+      <button type="button" class="lg-input" style="flex:none;width:auto;padding:0 16px;cursor:pointer" onclick="openCatDrawer()">编辑</button>
+    </div>`;
+}
 function setupHtml(fromList){   // 状态 A：设置用户名（必填）+ 头像；fromList=从选择页「＋新建用户」进入
   lgAvatar = "f";
   lgFromList = !!fromList;
@@ -184,20 +241,18 @@ function setupHtml(fromList){   // 状态 A：设置用户名（必填）+ 头�
       : "先设置一个用户名——记账会默认记在当前用户名下，家人可稍后在「设置 → 用户设置」里添加。"}</div>
     <div class="lg-label"><span>头像</span></div>
     <div class="lg-avatars">
-      <button type="button" class="lg-avpick" data-av="m" onclick="pickAv(this)"><img src="images/avatar-cow-m.png" alt="男牛牛"></button>
-      <button type="button" class="lg-avpick on" data-av="f" onclick="pickAv(this)"><img src="images/avatar-cow-f.png" alt="女牛牛"></button>
+      <button type="button" class="lg-avpick" data-av="m" onclick="pickAv(this)"><img src="${avatarUrl("m")}" alt="男牛牛"></button>
+      <button type="button" class="lg-avpick on" data-av="f" onclick="pickAv(this)"><img src="${avatarUrl("f")}" alt="女牛牛"></button>
     </div>
     <div class="lg-label"><span>用户名</span>${fromList ? "" : '<span class="lg-req">必填</span>'}</div>
     <input id="lg_name" class="lg-input" placeholder="如：老公 / 老婆 / 我" oninput="this.classList.remove('lg-err')">
+    ${catFromHtml(fromList)}
     <button class="lg-go" onclick="create()">开始记账 →</button>
     <div class="lg-foot">头像可稍后在「设置 → 用户设置」里更换</div>`;
 }
 function pickAv(btn){
   lgAvatar = btn.dataset.av;
   document.querySelectorAll(".lg-avpick").forEach(b=>b.classList.toggle("on", b===btn));
-}
-function avCell(g){   // 用户卡头像：牛牛（历史空值兜底为女牛）
-  return `<img class="lg-avimg" src="images/avatar-cow-${g.avatar==="m"?"m":"f"}.png" alt="">`;
 }
 function selHtml(){   // 状态 B：选择用户（上次使用的排最前并标注）
   const gs = [...USERS].sort((a,b)=>(b.id===SAVED)-(a.id===SAVED));
@@ -207,8 +262,8 @@ function selHtml(){   // 状态 B：选择用户（上次使用的排最前并�
     <div class="lg-sub">选择记账人进入「${esc(LNAME)}」（每个账本的用户独立）。</div>
     <div class="lg-ulist">
       ${gs.map(g=>`
-      <button class="lg-uitem" onclick="pick(${g.id})">
-        ${avCell(g)}
+      <button class="lg-uitem" onclick="enter(${g.id})">
+        <img class="lg-avimg" src="${avatarUrl(g.avatar)}" alt="">
         <span class="lg-uinfo"><span class="lg-uname">${esc(g.name)}</span>
           <span class="lg-umeta">${g.id===SAVED ? "上次使用 · " : ""}${g.members ? esc(g.members) : "暂无账单归属"}</span></span>
         <span class="lg-uarrow">›</span>
@@ -221,14 +276,13 @@ const back = () => render(selHtml());
 const newUser = () => render(setupHtml(true));
 function enter(id){
   // 主应用 loadAll 首载读它恢复——修复「新账本建用户，进入后却回到旧账本」
-  try{
-    localStorage.setItem("chaimi_user_" + LEDGER, String(id));
-    localStorage.setItem("chaimi_ledger", String(LEDGER));
-    if(localStorage.getItem("chaimi_user_" + LEDGER) !== String(id)) throw 0;   // 写被拒（禁存储）
-  }catch(_){ msg("本浏览器禁止本地存储，无法记住用户，请更换浏览器或关闭隐私模式"); return; }
-  location.replace(".");
+  ckSet("chaimi_user_" + LEDGER, id);
+  ckSet("chaimi_ledger", LEDGER);
+  if(ckGet("chaimi_user_" + LEDGER) !== String(id)){   // 没写进去（浏览器禁了 Cookie）
+    msg("本浏览器禁用了 Cookie，无法记住用户，请更换浏览器或关闭隐私模式"); return;
+  }
+  location.replace("app");   // 进 /app：它不做入口判定，一定给主界面，并由服务端把刚写的记忆重发一遍续期
 }
-const pick = id => enter(id);
 async function create(){
   const name = $("#lg_name").value.trim();
   if(!name){
@@ -243,6 +297,45 @@ async function create(){
     enter(r.id);
   }catch(e){ msg(e.message); }
 }
+function openCatDrawer(){   /* 打开即拉当前账本分类（初始=默认分类或已应用来源） */
+  $("#catDrawer").classList.add("on");
+  loadCatMgr();
+}
+function closeCatDrawer(){
+  $("#catDrawer").classList.remove("on");
+  if(catEdit.on) toggleCatEdit();   /* 收起时退出编辑态，下次打开视图干净 */
+}
+async function applyCatFrom(sel){   /* 选中即应用（WYSIWYG）：编辑抽屉改的就是当前生效的分类；失败回滚选项 */
+  const v = +sel.value || null;
+  try{
+    await apiSend(`api/ledgers/${LEDGER}/category-source`, "PUT", {from: v});
+    sel.dataset.applied = sel.value;
+    msg(v ? "已应用所选账本的分类与映射" : "已恢复默认分类");
+    if($("#catDrawer").classList.contains("on")) loadCatMgr();   /* 抽屉开着：所见须为当前生效分类 */
+  }catch(e){ sel.value = sel.dataset.applied ?? ""; msg("应用失败：" + e.message); }
+}
+/* ===== 手机物理返回键：先关顶层浮层（新建分类 > 编辑抽屉），无浮层再退出 =====
+   core.js navTopModal/popstate 守卫的单屏简化版：浮层开启不 pushState，popstate
+   先关浮层并补位一帧——home 是 webview 首帧，不垫帧时第一个返回键就把页面弹出
+   去（「抽屉开着按返回直接退出应用」的根因）。浮层经 ✕/遮罩关闭不动历史，自然回落 */
+function homeTopLayer(){
+  const cn = catNewLayer();   // catmgr 单源：懒构建判空+关闭配对（app 侧 navTopModal 共用）
+  if(cn) return cn;
+  if($("#catDrawer").classList.contains("on")) return () => closeCatDrawer();
+  return null;
+}
+window.addEventListener("popstate", () => {
+  const m = homeTopLayer();
+  if(m){ m(); history.pushState({chaimiGuard:1}, ""); return; }   // 关顶层浮层+补位：下个返回键仍有帧可落
+  if(history.state?.chaimiGuard) return;   // 落在垫帧上（如刷新后再返回）：页面不动（core.js 同款）
+  msg("再按一次退出应用");   // 垫帧已弹尽：本次无动作，下次返回=退出（与 app 侧口径一致）
+});
+window.addEventListener("keydown", e => {   // 桌面 Esc 与物理返回键同层：先关顶层浮层（app 侧 Esc 栈同款语义）
+  if(e.key !== "Escape") return;
+  const m = homeTopLayer();
+  if(m) m();
+});
+history.pushState({chaimiGuard:1}, "");   // 首帧垫一层：返回键先落到 popstate 守卫
 boot();
 </script>
 </body>

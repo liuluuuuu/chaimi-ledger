@@ -18,7 +18,9 @@ function applyTheme(){
   const icon = (id, on) => { const el = document.getElementById(id); if(el) el.style.display = on ? "block" : "none"; };
   icon("ic-sun-ai", m === "light"); icon("ic-moon-ai", m === "dark"); icon("ic-auto-ai", m === "auto");
   try{ localStorage.setItem("chaimi_theme_dark", dark ? "1" : "0"); }catch(_){}
-  if(flip && typeof dropCharts === "function") dropCharts();   // stats.js 定义；本模块（defer）晚于它执行
+  // stats.js 定义 dropCharts。本模块（head 内 module）实际先于 body 尾的 defer 脚本执行
+  // （同按文档序），首跑 dropCharts 尚未定义——typeof 兜底挡住；此后每次切换都已就绪
+  if(flip && typeof dropCharts === "function") dropCharts();
 }
 window.toggleTheme = function(){   // 侧栏按钮 onclick 直调：浅色 → 深色 → 自动 循环（home.html 无按钮）
   const next = { light: "dark", dark: "auto", auto: "light" }[themeMode()] || "auto";

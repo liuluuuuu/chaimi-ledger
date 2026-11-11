@@ -19,9 +19,9 @@
   two_pass         导出回环：按 col.export_id/export_ref 批内直连退款对（负序号协议）
   pay_split        支付账户按分隔符拆出收款账户（导出 " & "）
   attribution_col  归属直取列（导出 流水归属）
-  skip_zero_reason 0 元行标 skip 并以此为由（支付宝）
+  skip_zero_reason 0 元行的 skip 理由（缺省「0 元行」；零额行入库会被拒收，一律 skip）
   note_strip       备注占位清理（美团 "/"）
-  amount_mode      lenient=to_cents 宽松（内置平台）；strict=先严格校验、失败标 skip、取绝对值
+  amount_mode      lenient=parse_cents 宽松取绝对值（内置平台）；strict=失败标 skip、取绝对值
                    （缺省 strict，向导/用户模板沿用旧 parse_generic 口径）
   note_fallback_last  备注列缺失借末列（hash 同步）
   owner / owner_re / skip_first_n / name_strip   v1 字段，语义不变
@@ -30,6 +30,8 @@ from __future__ import annotations
 
 # 「本应用导出」列名单源：server._export_table 表头与 export 模板的 headers/col/hash_fields/
 # attribution_col 全部引用同一份（导出文件须被自家模板命中，tests 有契约断言），改列名只动这里
+# pay_legacy / to_account 为旧代列：新导出不再写出（小票列恒空已删、收款账户列随删），
+# 仅保留在模板 col 里作别名——用户手里已下载的旧导出文件重导时照常取值（同 pay_legacy 待遇）
 EXPORT_COLUMNS = {
     "date": "交易时间", "name": "交易名称", "amount": "交易金额", "flow": "流水类型",
     "type": "支出类型/收入类型", "pay": "支付账户", "pay_legacy": "支付方式/收款方式",
@@ -43,13 +45,32 @@ WX_GENERIC_NAMES = frozenset({
     "微信转账", "转账", "微信红包-退款", "转账-退款",
 })
 
+# 平台元数据单源（此前散在 import_bill._WALLET_KEYWORDS/_PLATFORM_ACC 与
+# import_match._PLATFORM_DISPLAY/_PAYMENT_CHANNELS 四张表）：新增平台只改这里。
+#   account：平台钱包账户名（import_bill._match_account 按它取/建 e-wallet 账户）
+#   keywords：收/付款方式归平台钱包的关键词（含花呗/零钱通等信用与理财钱包）
+#   display：支付渠道账单中该平台商户的典型叫法（跨源配对正向按名匹配；仅列需要的平台）
+#   channel：是否支付渠道账单（跨源配对的反向预览侧）
+PLATFORMS = {
+    "wechat":  {"account": "微信支付", "keywords": ("零钱", "微信"),
+                "display": "微信", "channel": True},
+    "alipay":  {"account": "支付宝", "keywords": ("余额宝", "账户余额", "花呗", "支付宝"),
+                "display": "支付宝", "channel": True},
+    "jd":      {"account": "京东", "keywords": ("余额", "白条", "京东"),
+                "display": "京东", "channel": True},
+    "meituan": {"account": "美团支付", "keywords": ("余额", "美团支付", "美团"),
+                "display": "美团", "channel": False},
+}
+# 支付渠道账单来源（import_match 反向配对预览侧）
+PAYMENT_CHANNELS = tuple(k for k, v in PLATFORMS.items() if v["channel"])
+# 跨源正向按名匹配的平台白名单（仅 meituan：美团消费在渠道账单里商户名含「美团」可按名
+# 命中；wechat/alipay/jd 本身就是渠道，进正向分支会把渠道行互配——保持原 _PLATFORM_DISPLAY 语义）
+NAME_MATCH_PLATFORMS = {"meituan": PLATFORMS["meituan"]["display"]}
+
 # 微信 transfer 集合：账户间搬运不计收支（信用卡还款/理财申赎/充值等）。
-# 字面列表，须与 db.TRANSFER_SUBCLASS 派生集保持一致（单测断言同步，防 db.py 演进失同步；
-# 个人间转账/红包族与退款按方向计收支或单独处理，故排除）。
-WX_TRANSFER_TYPES = [
-    "小金库", "投资理财", "转入零钱通", "余额宝", "余额宝-自动转入",
-    "转入零钱通-来自零钱", "赎回", "信用卡还款", "信用借还", "余额互通", "充值",
-]
+# 单源于 db.WX_TRANSFER_TYPES（由 db.TRANSFER_SUBCLASS 排除个人间转账/红包族与退款派生），
+# 此处只引用——此前字面再维护一份靠单测断言同步，db 演进即两处手改。
+from db import WX_TRANSFER_TYPES
 
 PLATFORM_TEMPLATES = [
     {   # 京东（2026-10 新导出）：退款独立成行（「退款-」前缀 + 退款成功状态 + 不计收支），
@@ -62,11 +83,12 @@ PLATFORM_TEMPLATES = [
                 "amount": "金额", "flow": "收/支", "type": "交易分类",
                 "order": "交易订单号", "pay": "收/付款方式", "note": "备注"},
         "flow_map": {"支出": "expense"},          # 仅支出计收支，其余（含收入侧退款）transfer
+        # 退款状态一条 contains 规则收口：历次导出的 9 个精确状态值里 8 个本身含
+        # 「退款」，为 contains 所覆盖（先有精确名单、后加 contains 兜底时没回收名单）；
+        # 「退已成功」是唯一不含「退款」的历史变体，并入 values。处理中/退款中是
+        # 进行态不是退款行，仍由 contains_none 排除。
         "refund_rules": [
-            {"col": "交易状态", "op": "in", "values": [
-                "退款成功", "已退款", "退款完成", "全额退款", "部分退款",
-                "退款已到账", "退款到账", "成功退款", "退已成功"]},
-            {"col": "交易状态", "op": "contains", "values": ["退款"],
+            {"col": "交易状态", "op": "contains", "values": ["退款", "退已成功"],
              "contains_none": ["处理中", "退款中"]},
         ],
         "hash_fields": ["交易时间", "交易分类", "商户名称", "交易说明",
@@ -147,7 +169,7 @@ PLATFORM_TEMPLATES = [
                     "支付方式", "订单金额", "实付金额", "交易单号", "商家单号", "备注"],
         "col": {"date": "交易成功时间", "type": "交易类型", "name": "订单标题",
                 "flow": "收/支", "pay": "支付方式", "amount": "实付金额",
-                "order": "交易单号", "merchant": "", "note": "备注"},
+                "order": "交易单号", "note": "备注"},
         "flow_map": {"支出": "expense", "收入": "income"},
         "refund_type": "退款",
         "name_strip": ["订单详情"],

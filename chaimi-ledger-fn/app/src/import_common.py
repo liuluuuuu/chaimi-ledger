@@ -1,7 +1,61 @@
 """导入公共原语（各子模块共享的叶子工具，无内部依赖）。"""
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
+import re
+import unicodedata
+
 import platform_templates as pt
+
+_WAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*万\s*(\d)?(?![\d.])")
+
+def strip_amount_str(v: str) -> str:
+    """会话侧金额字符串清洗（AI 记一笔/对话改单共用，yuan_to_cents 的前置步骤）：
+    保留数字与小数点/负号，剥掉币符（¥30）、单位（5000元）、空白等一切杂字符。
+    「万」按倍数折算、孤数字尾按千（1.5万=15000、1万5=15000，与 fix_local 的
+    _local_amount 同口径）——此前一律剥字，"1.5万" 成 1.5 元，差一万倍且无任何提示。
+    只用于自由文本里的口说金额——导入账单单元格走 yuan_to_cents 自带的 NFKC+币符
+    清洗（账单列不会出现「万」写法，不混用）。"""
+    m = _WAN_RE.search(v)
+    if m:
+        return str(Decimal(m.group(1)) * 10000 + Decimal(m.group(2) or 0) * 1000)
+    return "".join(ch for ch in v if ch.isdigit() or ch in ".-")
+
+def yuan_to_cents(v) -> int | None:
+    """金额（元）→ 分的统一换算（全应用单点收口：导入解析 / AI 草稿 / 票据 OCR / 对话改单共用）。
+    NFKC 全角归一（１２．３４／－）+ 去币符/千分位后走 Decimal（十进制精确）；
+    失败或非有限值（""／"N/A"／"nan"／"1e999"→inf）返回 None，0 是合法零额
+    （None 与 0 语义分离，与 parse_cents 一致）。此前五处各自防御、口径不一：
+    漏 OverflowError 或漏 nan 都曾把脏值穿成 500 / 非法 JSON——统一到这里一次防全。
+    Decimal 而非 float 的取整：1.005*100 在二进制浮点是 100.4999…，裸 round 得 100 分
+    与前端 toCents（toPrecision(12)）的 101 分答案分叉——十进制 + HALF_UP 两端一致。"""
+    try:
+        if isinstance(v, bool):
+            return None   # bool 是 int 子类：True→100 分无意义，按解析不了处理
+        if isinstance(v, int):
+            return v * 100
+        s = amount_clean(v).strip().replace(" ", "")
+        d = Decimal(s) * 100
+        return int(d.quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if d.is_finite() else None
+    except (ValueError, TypeError, ArithmeticError):
+        # InvalidOperation/ArithmeticError=空串/非数字/nan/inf（Decimal 不做 float 溢出，无 OverflowError）
+        return None
+
+def cents_loose(v) -> int | None:
+    """口说金额（元）→ 分的会话侧入口：字符串先过 strip_amount_str（"¥30"/"5000元"/
+    "1.5万"），再走 yuan_to_cents 单点换算（None=空/解析不了/nan/inf）。AI 记账条目
+    与 bot 对话改单共用——此前两处各抄一份两行式，靠注释互相同步。"""
+    if isinstance(v, str):
+        v = strip_amount_str(v)
+    return yuan_to_cents(v)
+
+def amount_clean(s) -> str:
+    """金额字符串清洗（yuan_to_cents 与 import_bill._amount_str 共用一份）：
+    NFKC 全角归一（１２．３４／－／，）+ 去币符/千分位。"""
+    s = unicodedata.normalize("NFKC", str(s if s is not None else ""))
+    for ch in ("¥", "￥", ","):
+        s = s.replace(ch, "")
+    return s
 
 def normalize(field) -> str:
     """trim（含京东/美团单元格尾部 \\t）。"""

@@ -5,6 +5,9 @@
 # 数据基目录可能是回落位置(PKGHOME/PKGTMP//tmp),候选位置全部扫一遍。
 # chaimi.db/备份/配置一律不动;root 时代遗留的 apt 标记/内嵌清单顺带清掉。
 # site-packages 缺了 main 启动时会自动重装;如需保留数据,请先在设置页备份。
+# 残留 server 进程也在此清：停应用依赖 pid 文件，升级中断把 pid 文件弄丢后旧进程
+# 会漏停——旧代码继续轮询微信、按旧逻辑回复记账（新进程起来后一条消息两份回复、
+# 记两笔），只能清进程断根。升级也走卸载，所以每次换版本前都会清一遍。
 
 set -u
 
@@ -14,6 +17,36 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - uninstall_init: $1" >> "${TMPLOG}" 2>/dev/null
 }
 
+# 残留进程识别：cmdline 含 chaimi-ledger/src/server.py（本应用入口的路径尾巴，换卷
+# 重装等任何安装根都命中）；本脚本与 grep 子进程的 cmdline 都不含该串，不会误伤。
+# TERM 后 8 秒不退 KILL（与 main stop 同节奏）；应用恒以专用账户运行，残留同属该
+# 账户必清得掉；无 /proc 的环境天然 no-op。
+if [ -d /proc ]; then
+    _strays=""
+    for _p in /proc/[0-9]*/cmdline; do
+        _pid=${_p#/proc/}; _pid=${_pid%/cmdline}
+        tr '\0' ' ' < "${_p}" 2>/dev/null | grep -qF "chaimi-ledger/src/server.py" || continue
+        _strays="${_strays} ${_pid}"
+    done
+    if [ -n "${_strays}" ]; then
+        for _pid in ${_strays}; do
+            kill -TERM "${_pid}" 2>/dev/null
+            _count=0
+            while [ -e "/proc/${_pid}" ] && [ ${_count} -lt 8 ]; do
+                sleep 1; _count=$((_count + 1))
+            done
+            kill -KILL "${_pid}" 2>/dev/null
+        done
+        log "已清理残留 server 进程:${_strays}"
+    fi
+fi
+
+# 网关 socket：框架通常随应用目录一并清，个别没清到时在此兜底（空 APPDEST 不动根目录）
+if [ -n "${TRIM_APPDEST:-}" ] && [ -e "${TRIM_APPDEST}/app.sock" ]; then
+    rm -f "${TRIM_APPDEST}/app.sock" 2>/dev/null
+    log "已清除残留网关 socket ${TRIM_APPDEST}/app.sock"
+fi
+
 for _C in "${TRIM_PKGVAR:-}" "${TRIM_PKGHOME:-}" "${TRIM_PKGTMP:-}" "/tmp/chaimi-ledger"; do
     [ -n "${_C}" ] && [ -d "${_C}" ] || continue
     if [ -d "${_C}/site-packages" ]; then
@@ -21,5 +54,7 @@ for _C in "${TRIM_PKGVAR:-}" "${TRIM_PKGHOME:-}" "${TRIM_PKGTMP:-}" "/tmp/chaimi
         log "已清除 Python 依赖目录 ${_C}/site-packages"
     fi
     rm -f "${_C}/requirements.embedded.txt" 2>/dev/null
+    rm -f "${_C}/chaimi.pid" 2>/dev/null       # 残留 pid 文件：进程已清，留着只会误导下次安装判断
+    rm -rf "${_C}/.start.lock" 2>/dev/null     # 启动中断残留的锁目录：不清下次 start 要等 120s 锁龄强清
 done
 exit 0

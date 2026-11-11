@@ -42,7 +42,9 @@ def _locate(name: str):
 def create_backup(period: str = "") -> dict:
     """period: ""=手动(完整时间戳) "monthly"=YYYYMM "yearly"=YYYY。
     文件名统一 chaimi-ledger-<时间戳>.db/.conf.json，手动与自动仅时间戳粒度不同。
-    小票一并备份：打包为同名 .receipts.zip（目录为空则不生成）。"""
+    小票一并备份：打包为同名 .receipts.zip（目录为空则不生成）。
+    失败不留半成品：备份中途异常（锁冲突/磁盘满）时关闭两侧连接并删除残缺主文件
+    ——list_backups 曾照常列出半写的库，restore 侧只能靠 integrity_check 兜底拦。"""
     bdir = config.backup_dir()
     bdir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
@@ -53,12 +55,24 @@ def create_backup(period: str = "") -> dict:
     else:
         stamp = now.strftime("%Y%m%d_%H%M%S")
     dest = bdir / f"chaimi-ledger-{stamp}.db"
-    src = sqlite3.connect(config.db_path())
-    dst = sqlite3.connect(dest)
-    with dst:
-        src.backup(dst)
-    dst.close()
-    src.close()
+    src = dst = None
+    try:
+        src = sqlite3.connect(config.db_path())
+        dst = sqlite3.connect(dest)
+        with dst:
+            src.backup(dst)
+    except BaseException:
+        # 月备/年备复写同名文件：半成品删除后由下一轮自动重试重建，不会误留
+        if dest.exists():
+            try:
+                dest.unlink()
+            except OSError:
+                _log.warning(f"残缺备份删除失败：{dest}")
+        raise
+    finally:
+        for c in (src, dst):
+            if c is not None:
+                c.close()
     # 配置副本
     conf = config.conf_path()
     if conf.exists():
@@ -76,8 +90,9 @@ def list_backups() -> list[dict]:
     out = []
     if bdir.exists():
         for f in sorted(bdir.glob("chaimi-*.db"), reverse=True):
-            out.append({"file": f.name, "size": f.stat().st_size,
-                        "mtime": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")})
+            st = f.stat()
+            out.append({"file": f.name, "size": st.st_size,
+                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")})
     return out
 
 def restore_backup(name: str) -> None:
@@ -87,12 +102,17 @@ def restore_backup(name: str) -> None:
     chk = sqlite3.connect(src_file)
     try:
         ok = chk.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        # 空库/仅 SQLite 头的文件 integrity_check 也返回 ok（0 页）：磁盘满或拷贝中断的
+        # 残件一旦放行，backup(dst) 会把整库替换成空库再被 init_db 重新播种，原账无声消失
+        pages = chk.execute("PRAGMA page_count").fetchone()[0]
     except sqlite3.DatabaseError as e:
         raise ValueError(f"备份文件不是有效的 SQLite 数据库: {e}") from e
     finally:
         chk.close()
     if not ok:
         raise ValueError("备份文件完整性校验失败")
+    if not pages or src_file.stat().st_size == 0:
+        raise ValueError("备份文件是空数据库（0 页），疑似损坏的残件，已拒绝恢复")
     # 旧实现"临时文件替换 db"在 Linux 下各线程缓存的旧连接仍读旧 inode（恢复"看似没生效"的根因），
     # 在 Windows 下直接被旧句柄锁死无法替换；backup 写同一文件，所有连接立即可见
     target = config.db_path()
@@ -109,9 +129,9 @@ def restore_backup(name: str) -> None:
     conf_backup = src_file.with_suffix(".conf.json")
     if conf_backup.exists():
         try:
-            # 原子写（tmp+os.replace）：并发 load() 不会读到半截 JSON 而静默回退默认值；
-            # 配置缓存按文件签名自动失效，无需额外处理
-            config.write_raw(conf_backup.read_bytes())
+            # replace_raw（tmp+os.replace 且持 _edit_lock）：并发 edit() 的读改写不会用
+            # 旧快照覆盖刚恢复的凭证；配置缓存按文件签名自动失效，无需额外处理
+            config.replace_raw(conf_backup.read_bytes())
         except OSError as e:
             _log.warning(f"配置恢复失败(忽略): {conf_backup.name}: {e}")
     receipts_backup = config.backup_dir() / (src_file.stem + ".receipts.zip")
@@ -166,6 +186,8 @@ class AutoBackup:
     def __init__(self):
         self._last_date = ""
         self.last_result: dict = {"error": "尚未备份"}
+        self.paused = False   # restore 期间置位（server.do_restore）：恢复中的库文件不加锁保护，
+                              # 恰逢整点月备会产出拷贝新库+旧 conf 的组合备份或 error 记录
 
     def start(self) -> None:
         threading.Thread(target=self._loop, name="autobackup", daemon=True).start()
@@ -181,6 +203,8 @@ class AutoBackup:
         备份成功才置 _last_date：瞬时失败（如撞库锁）本轮记 error，下一分钟重试，
         不会整月丢月备；_last_date 在 create_backup 之后、_cleanup_old 之前置位，
         清理失败也不会同一天重复备份（周期文件名同戳，重复执行即整份重写）。"""
+        if self.paused:
+            return
         cfg = config.load().get("backup", {})
         try:
             today = now.strftime("%Y-%m-%d")

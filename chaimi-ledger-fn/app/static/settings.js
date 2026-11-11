@@ -11,11 +11,12 @@ function stAdminVis(){
     if(tab) tab.style.display = admin ? "" : "none";
     if(sec) sec.style.display = admin ? "" : "none";
   });
-  // 机器人：区块全员可见；模式/白名单是应用级配置，非管理员只读（服务端同口径 admin 门）
+  // 机器人：区块全员可见；模式/记账确认/白名单是应用级配置，非管理员只读（服务端同口径 admin 门）
   $("#bot_mode_box").style.display = admin ? "" : "none";
   $("#bot_save").style.display = admin ? "" : "none";
   $("#bot_mode_ro").style.display = admin ? "none" : "";
   $("#bot_users_row").style.display = admin ? "" : "none";
+  $("#bot_confirm_row").style.display = admin ? "" : "none";
   if(!admin){
     const on = document.querySelector("#stTabs button.on");
     if(on && on.style.display === "none") stTab("book");
@@ -52,19 +53,20 @@ function applyPreset(id){
 }
 async function loadCfg(){
   const c = await getCfg();
+  const llm = c.llm || {};   // 新装/恢复异常时可能缺键：与 loadBotCfg 的 c.bot||{} 同口径防空引用
   $("#llm_preset").innerHTML=LLM_PRESETS.map(p=>`<option value="${p.id}">${p.name}</option>`).join("")
     +`<option value="custom">自定义</option>`;
-  $("#llm_url").value=c.llm.base_url; $("#llm_model").value=c.llm.model;
-  $("#vl_model").value=c.llm.vl_model||""; $("#llm_key").value=c.llm.api_key;
-  $("#vl_url").value=c.llm.vl_base_url||""; $("#vl_key").value=c.llm.vl_api_key||"";
-  const hit=LLM_PRESETS.find(x=>x.base_url===c.llm.base_url);
+  $("#llm_url").value=llm.base_url||""; $("#llm_model").value=llm.model||"";
+  $("#vl_model").value=llm.vl_model||""; $("#llm_key").value=llm.api_key||"";
+  $("#vl_url").value=llm.vl_base_url||""; $("#vl_key").value=llm.vl_api_key||"";
+  const hit=LLM_PRESETS.find(x=>x.base_url===llm.base_url);
   $("#llm_preset").value=hit?hit.id:"custom";   // 按地址回显预设；手改过的显示为自定义
-  $("#vlApiRow").style.display = (hit && !c.llm.vl_base_url && !c.llm.vl_api_key) ? "none" : "";
+  $("#vlApiRow").style.display = (hit && !llm.vl_base_url && !llm.vl_api_key) ? "none" : "";
 }
 async function saveCfg(){
-  await apiSend("/api/config","PUT",{llm:{base_url:$("#llm_url").value,model:$("#llm_model").value,vl_model:$("#vl_model").value,api_key:$("#llm_key").value,
-      vl_base_url:$("#vl_url").value.trim(),vl_api_key:$("#vl_key").value.trim()}});
-  _cfgCache = null;   // 配置已变：缓存失效（loadCfg 重取）
+  // putConfig 单源（core.js）：写后缓存失效不再各写一遍
+  await putConfig("llm", {base_url:$("#llm_url").value,model:$("#llm_model").value,vl_model:$("#vl_model").value,api_key:$("#llm_key").value,
+      vl_base_url:$("#vl_url").value.trim(),vl_api_key:$("#vl_key").value.trim()});
   msg("已保存 ✅"); loadCfg();
 }
 document.addEventListener("DOMContentLoaded", () => {
@@ -72,14 +74,21 @@ document.addEventListener("DOMContentLoaded", () => {
   if (t) t.textContent = "chaimi-ledger v" + (window.CHAIMI_VER || "?");
 });
 
+const llmModelsGen = makeSeq();   // 模型列表请求代数（makeSeq 单源）：连点「模型列表」时旧响应
+                                  // 后到会覆盖新内容（settings 页其它加载器同款守卫，此处补齐）
 async function llmModelsOpen(){
   // 惯例同 catNew:内联 display:flex 覆盖 .modal-mask 的 CSS display:none
   // (曾误用 display="" 只清内联,回落 CSS 仍 none——弹窗 DOM 开着但视觉隐形)
+  const seq = llmModelsGen.next();
   $("#llmModelsMask").style.display = "flex";
   const b=$("#llmModelsBody");
   b.innerHTML='<div class="sub" style="padding:6px 0">获取中…</div>';
   let d; try{ d=await api("/api/llm/models"); }
-  catch(e){ b.innerHTML=`<div class="sub">获取失败: ${esc(e.message)}</div>`; return; }
+  catch(e){ if(!llmModelsGen.isCurrent(seq)) return; b.innerHTML=`<div class="sub">获取失败: ${esc(e.message)}</div>`; return; }
+  if(!llmModelsGen.isCurrent(seq)) return;   // 弹窗已关/重开：旧响应不回填
+  // 部分异常路径只回 {error} 不带 text/vision 字段：先归一成数组再判空/遍历，
+  // 否则 d.text.length 直接 TypeError（下方 grp 的 arr.map 同样会炸）
+  d.text=d.text||[]; d.vision=d.vision||[];
   if(d.error&&!d.text.length&&!d.vision.length){ b.innerHTML=`<div class="sub">${esc(d.error)}</div>`; return; }
   // 模型名来自外部 LLM 服务商的 /models 接口（不可信输入）：文本与 onclick 一律转义
   const grp=(t,arr,fill)=>`<label style="display:block;margin-top:10px">${t} <span class="sub" style="font-size:11px">点击选用</span></label>`+
@@ -122,12 +131,17 @@ async function shareOpen(id, name){
   await shareRefresh();
 }
 function shareClose(){ $("#shareMask").style.display = "none"; }
+const shareGen = makeSeq();   // 共享弹窗请求代数（makeSeq 单源）：shareOpen(A) 在途时 shareOpen(B)，
+                              // A 的成员表迟到响应不得渲进 B 的弹窗（与 botLuGen 同类，此前漏守卫）
 async function shareRefresh(){
+  const seq = shareGen.next();
+  const lg = _shareLid;
   try{
     const [ms, us] = await Promise.all([
-      api(`/api/ledgers/${_shareLid}/members`),
+      api(`/api/ledgers/${lg}/members`),
       api("/api/users")
     ]);
+    if(!shareGen.isCurrent(seq)) return;
     const ids = new Set(ms.map(m=>+m.uid));
     document.querySelector("#shareTable tbody").innerHTML = ms.map(m=>
       `<tr><td>${esc(m.username || ("uid " + m.uid))}</td>
@@ -137,7 +151,7 @@ async function shareRefresh(){
     $("#shareUserSel").innerHTML = cand.length
       ? cand.map(u=>`<option value="${u.uid}">${esc(u.username || ("uid "+u.uid))}${u.isadmin ? "（管理员）" : ""}</option>`).join("")
       : `<option value="">（没有其他用户——让对方先打开一次柴米记账）</option>`;
-  }catch(e){ msg(e.message, false); }
+  }catch(e){ if(shareGen.isCurrent(seq)) msg(e.message, false); }   // 过期失败的 toast 不晚到
 }
 async function shareAdd(){
   const v = +$("#shareUserSel").value || 0;
@@ -155,13 +169,15 @@ async function shareDel(uid){
 
 async function setLedgerCur(id, sel){
   const l = (await getLedgers()).find(x=>x.id===id);
+  if(!l) return msg("账本不存在或已失效，请刷新重试", false);   // 缓存陈旧（账本刚被 owner 删除）时 find 为 undefined
   try{
-    await apiSend(`/api/ledgers/${id}`,"PUT",{name:l.name, icon:l.icon||"", currency:sel.value});
+    // PUT 为部分更新语义：只发改动字段，name/icon 由服务端保持原值（不再读-改-写回显）
+    await apiSend(`/api/ledgers/${id}`,"PUT",{currency:sel.value});
     msg("币种已更新 ✅");
     await loadAll();
   }catch(e){ msg(e.message, false); loadLedgers(); }
 }
-async function addLedger(){
+async function addLedger(){   // 分类来源在建用户页（home）选：创建默认账本 → 跳 home 设用户时再复用
   if(!$("#lg_name").value)return msg("请输入账本名",false);
   const r=await apiSend("/api/ledgers","POST",{name:$("#lg_name").value, currency:$("#lg_cur").value});
   $("#lg_name").value="";$("#lg_cur").value="CNY";
@@ -171,118 +187,35 @@ async function delLedger(id){
   if(!await uiConfirm("删除账本将删除其全部流水，确定？", "删除"))return;
   const wasCur = id === lid();
   await api(`/api/ledgers/${id}`,{method:"DELETE"});
-  try{ localStorage.removeItem("chaimi_user_"+id); }catch(_){}   // 被删账本的用户缓存随账本清理
+  ckDel("chaimi_user_"+id);   // 被删账本的用户记忆随账本清理
   // 删的是当前账本 → 回用户选择页（home 拉账本列表自愈回落第一个；chaimi_ledger 失效由 loadAll/enter 写回纠正）
   if(wasCur){ location.replace("static/home.html"); return; }
   loadLedgers();loadAll();
 }
 
-const CAT_GROUP_CN = {expense:"支出", income:"收入", transfer:"退款和不计收支"};
-const catEdit = mkEditToggle("catEditBtn", () => loadCatMgr());
-function toggleCatEdit(){ catEdit.toggle(); }   // app.html onclick 入口
-async function loadCatMgr(){
-  const [cats, maps] = await Promise.all([
-    api(`/api/categories?ledger=${lid()}`),
-    api(`/api/mappings?ledger=${lid()}`)
-  ]);
-  categories = cats;   // 全局分类表同步（记一笔下拉/编辑弹窗同源）
-  const byCat = {};
-  for(const m of maps) (byCat[m.category_id] = byCat[m.category_id] || []).push(m);
-  $("#catMgr").innerHTML = ["expense","income","transfer"].map(g=>{
-    const tops = cats.filter(c=>!c.parent_id && c.type===g);
-    if(!tops.length) return "";
-    return `<div class="cm-group"><div class="cm-gtitle">${CAT_GROUP_CN[g]}
-        <button class="btn btn-ghost" style="padding:2px 10px;font-size:11px;margin-left:6px" onclick="catMgrNew('${g}')">＋新建分类</button></div>`
-      + tops.map(c=>{
-        const chips = (byCat[c.id]||[]).map(m=>
-          `<span class="mchip" title="账单来源名">${esc(m.source)}${catEdit.on?`<b onclick="event.stopPropagation();catMgrAliasDel(${m.id})">×</b>`:""}</span>`).join("");
-        return `<div class="cm-cat">
-          <div class="cm-cname${catEdit.on?" edit":""}"${catEdit.on?` onclick="catMgrRename(${c.id})" title="点此改名"`:""}>${esc(c.name)}</div>
-          <div class="cm-chips">${chips}
-            ${catEdit.on?`<button class="btn btn-ghost" style="padding:2px 8px;font-size:11px" onclick="catMgrAliasAdd(${c.id})">＋来源</button>`:""}
-          </div>
-          ${catEdit.on?`<button class="btn danger" style="padding:2px 10px;font-size:11px;flex:0 0 auto" onclick="catMgrDel(${c.id},'${qEsc(c.name)}')">删除</button>`:""}
-        </div>`;
-      }).join("") + `</div>`;
-  }).join("") || '<div class="sub">暂无分类</div>';
-}
-async function catMgrRename(id){
-  const c = categories.find(x=>x.id===id); if(!c) return;
-  const name = await uiPrompt("分类改名（流水、来源名自动同步）：", c.name);
-  if(!name || name===c.name) return;
-  try{
-    await apiSend(`/api/categories/${id}`, "PUT", {name:name.trim(), icon:c.icon||""});
-  }catch(e){ return msg(e.message, false); }
-  msg("已改名（流水自动同步） ✅"); await loadCatMgr();
-}
-async function catMgrAliasAdd(id){
-  const c = categories.find(x=>x.id===id); if(!c) return;
-  const source = await uiPrompt(`添加「${c.name}」包含的账单来源名（如：汽车用品）：`);
-  if(!source || !source.trim()) return;
-  // 同来源已挂其他分类时 INSERT OR REPLACE 自动改挂到这里（移动语义）；
-  try{
-    await apiSend(`/api/mappings?ledger=${lid()}`, "POST",
-      {flow_type: c.type==="transfer" ? "expense" : c.type, source: source.trim(), category_id: id});
-  }catch(e){ return msg(e.message, false); }
-  msg("来源已添加 ✅"); await loadCatMgr();
-}
-async function catMgrAliasDel(id){
-  if(!await uiConfirm("移除这个来源名？（该账单分类下次导入不再落到此分类）", "移除")) return;
-  await api(`/api/mappings/${id}`, {method:"DELETE"});
-  await loadCatMgr();
-}
-
-let catNewType = "expense";
-function catMgrNew(type){
-  catNewType = type;
-  $("#catNewTitle").textContent = `新建${CAT_GROUP_CN[type]||""}分类`;
-  $("#catNewName").value = ""; $("#catNewSources").value = "";
-  $("#catNewMask").style.display = "flex";
-  setTimeout(()=>$("#catNewName").focus(), 50);
-}
-function catNewClose(){ $("#catNewMask").style.display = "none"; }
-async function catNewSubmit(){
-  const name = $("#catNewName").value.trim();
-  if(!name) return msg("请填写分类名", false);
-  try{
-    const r = await apiSend(`/api/categories?ledger=${lid()}`, "POST", {name, type: catNewType});
-    // 来源名逐个挂到新分类（同来源已挂别处自动改挂）；不计收支组按支出侧落行，解析端不分侧命中
-    const srcs = [...new Set($("#catNewSources").value.split(/[，,、;；\s]+/).map(s=>s.trim()).filter(Boolean))];
-    for(const s of srcs){
-      await apiSend(`/api/mappings?ledger=${lid()}`, "POST",
-        {flow_type: catNewType==="transfer" ? "expense" : catNewType, source:s, category_id:r.id});
-    }
-  }catch(e){ return msg(e.message, false); }
-  catNewClose(); await loadCatMgr(); msg("分类已创建 ✅");
-}
-async function catMgrDel(id, name){
-  if(!await uiConfirm(`删除分类「${name}」：其历史流水将变为未分类并进待确认，包含的来源名一并移除。确定？`, "删除")) return;
-  await api(`/api/categories/${id}`, {method:"DELETE"});
-  await loadCatMgr();
-  loadTx(); loadPendingBadge();   // 受影响流水进待确认，列表与徽标同步刷新
-}
+/* 分类管理（loadCatMgr 与 catMgr/catNew 系列）已抽至 catmgr.js 共享模块，app 设置页与 home 抽屉复用 */
 function accScopeInfo(){
   const sc = appScope();
-  if(sc === "all") return {from: "", to: "", label: "全部", months: 0};
+  if(sc === "all") return {from: "", to: "", label: "全部"};
   const r = curStatRange();
-  const label = sc === "month" ? r.label.replace(/^(\d{4})-(\d{2})$/, "$1年$2月") : r.label;   // 裸 YYYY-MM 润色
-  // /api/accounts 后端按 date < to 排他：排他界的 to（月/年）原样；仅自定义区间的
-  // 裸截止日转次日作排他上界，否则截止日当天消费漏计（toExclusive 位随区间对象）
-  return {from: r.from, to: r.toExclusive ? r.to : nextDayStr(r.to), label, months: sc === "year" ? 12 : 1};
+  // /api/accounts 后端按 date < to 排他：to 的翻译走 stats.js rangeDto 单源（排他界原样；
+  // 仅自定义区间的裸截止日转次日），否则截止日当天消费漏计。
+  // 预算折算的月数（net_expense/months）由服务端随区间一并下发（db.range_months 单源），
+  // 前端不再各算一份
+  return {from: r.from, to: rangeDto(r), label: ymLabel(r.label)};
 }
 
-function mkEditToggle(btnId, rerender){
-  const st = {on: false};
-  st.toggle = () => { st.on = !st.on; $("#"+btnId).textContent = st.on ? "完成" : "编辑"; rerender(); };
-  return st;
-}
+/* mkEditToggle 定义在 shared-lite.js（settings 页与 catmgr 抽屉共用单源） */
 const accEdit = mkEditToggle("accEditBtn", () => stAccs());
 let accRows = [];   // stAccs 最近一次拉取的账户行（delAcc 弹确认框取名字/笔数用）
 let bdgDirty = false;   // 预算输入框被用户改过（input 置位）：他端改预算/切账本回填时不覆盖正在编辑的草稿
 $("#bdg_amt").oninput = () => { bdgDirty = true; };
 async function stAccs(){
+  const sc = ledgerScope();   // 账本身份守卫（ledgerScope 单源）：旧账本账户表的迟到响应不渲染
   const r = accScopeInfo();
-  const as = await api(`/api/accounts?ledger=${lid()}` + (r.from ? `&from=${r.from}&to=${r.to}` : ""));
+  const resp = await api(`/api/accounts?ledger=${sc.id}` + (r.from ? `&from=${r.from}&to=${r.to}` : ""));
+  if(!sc.isCurrent()) return;
+  const as = resp.items;
   accRows = as;
   // 消费金额 = 所选范围净支出（支出 − 退款回账；收入/转账不计）
   document.querySelector("#accTable tbody").innerHTML = as.map(a =>
@@ -291,15 +224,18 @@ async function stAccs(){
     '<tr><td colspan="3" class="sub">暂无账户</td></tr>';
   const spendSum = as.reduce((s, a) => s + (a.spend || 0), 0);
   $("#accTotal").textContent = `${r.label}消费合计 ${curSym()}${fmt(spendSum)}`;
-  // 避免与账户维度的 spend 合计因口径差异对不上；「全部」范围无该字段时回落账户合计
+  // 区间净支出与预算折算月数由服务端随区间下发（net_expense 含未选账户支出；「全部」
+  // 范围不带区间参数、无此二者，按账户 spend 合计展示——口径差异见端点注释）
   const cur = await curLedger();
+  if(!sc.isCurrent()) return;   // 账本行加载期间切了账本：旧账本的预算值不回填（下方全在写 DOM）
   const hasBudget = !!(cur && cur.budget);
   if(cur && !bdgDirty) $("#bdg_amt").value = cur.budget ? fmt(cur.budget) : "";   // 未编辑时跟随最新预算（含他端改动与清零），编辑中不覆盖
-  const spend = as[0] && as[0].net_expense !== undefined ? as[0].net_expense : spendSum;
-  if(hasBudget && r.months){
-    const budget = cur.budget * r.months;
+  const spend = resp.net_expense !== undefined ? resp.net_expense : spendSum;
+  const months = resp.months || 0;
+  if(hasBudget && months){
+    const budget = cur.budget * months;
     const pct = Math.round(spend / budget * 100);
-    const bLabel = r.months > 1 ? `预算(月预算×${r.months})` : "预算";   // 年范围折算值,标明口径防误读为未生效
+    const bLabel = months > 1 ? `预算(月预算×${months})` : "预算";   // 年范围折算值,标明口径防误读为未生效
     $("#bdg_stat").innerHTML = `${r.label}已消费 <b style="color:${pct > 100 ? "var(--expense)" : "var(--fg)"}">${curSym()}${fmt(spend)}</b> / ${bLabel} ${curSym()}${fmt(budget)}（${pct}%${pct > 100 ? " 超支" : ""}）`;
   }else{
     $("#bdg_stat").innerHTML = `${r.label}消费合计 <b>${curSym()}${fmt(spend)}</b>${hasBudget ? "（「全部」范围不按预算折算）" : ""}`;
@@ -317,15 +253,12 @@ const userEdit = mkEditToggle("userEditBtn", () => stAttrs());
 async function stAttrs(){   // 用户设置：拉取与状态解析走 loadAttrs 单源，此处只渲染两张表
   const [ats,gs]=await loadAttrs();
   const avHtml=g=>`<img src="${avatarUrl(g.avatar)}" style="width:30px;height:30px;border-radius:9px;vertical-align:middle">`;
-  document.querySelector("#attrGroupTable tbody").innerHTML=gs.map(g=>
-    `<tr>
-      <td style="vertical-align:middle;white-space:nowrap">${avHtml(g)}&nbsp;${esc(g.name)}</td>
-      <td class="sub" style="vertical-align:middle;word-break:break-all">${g.members?g.members.split("、").map(m=>`<span class="attr-m">${esc(m)}</span>`).join(""):"—"}</td>
-      ${userEdit.on?`<td style="white-space:nowrap;text-align:right;vertical-align:middle">
-        <button class="btn btn-ghost" onclick="event.stopPropagation();avatarDD(${g.id},this)">头像</button>
-        <button class="btn btn-ghost" onclick="renameAttrGroup(${g.id})">改名</button>
-        <button class="btn danger" onclick="delAttrGroup(${g.id})">删</button></td>`:""}
-    </tr>`).join("");
+  document.querySelector("#attrGroupTable tbody").innerHTML=gs.map(g=>{
+    const mems = g.members?g.members.split("、").map(m=>`<span class="attr-m">${esc(m)}</span>`).join(""):"—";
+    return userEdit.on
+      ? `<tr><td colspan="3"><div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px">${avHtml(g)}<span style="white-space:nowrap">${esc(g.name)}</span><span class="sub" style="flex:1 1 100px;min-width:0;word-break:break-all">${mems}</span><span style="display:inline-flex;gap:6px;margin-left:auto"><button class="btn btn-ghost" onclick="event.stopPropagation();avatarDD(${g.id},this)">头像</button><button class="btn btn-ghost" onclick="renameAttrGroup(${g.id})">改名</button><button class="btn danger" onclick="delAttrGroup(${g.id})">删除</button></span></div></td></tr>`
+      : `<tr><td style="vertical-align:middle;white-space:nowrap">${avHtml(g)}&nbsp;${esc(g.name)}</td><td class="sub" style="vertical-align:middle;word-break:break-all">${mems}</td></tr>`;
+  }).join("");
   const sel=v=>`<option value=""${v?"":" selected"}>未分组</option>`
     +gs.map(g=>`<option value="${g.id}"${v===g.id?" selected":""}>${esc(g.name)}</option>`).join("");
   document.querySelector("#attrMngTable tbody").innerHTML=ats.map(a=>
@@ -345,12 +278,12 @@ function avatarDD(id, el){
   const cur=g.avatar==="m"?"m":"f";
   pop.innerHTML=["m","f"].map(v=>
     `<button type="button" class="av-pick${v===cur?" on":""}" data-v="${v}" title="${v==="m"?"男牛牛":"女牛牛"}">
-       <img src="images/avatar-cow-${v}.png" alt="${v==="m"?"男牛牛":"女牛牛"}">
+       <img src="${avatarUrl(v)}" alt="${v==="m"?"男牛牛":"女牛牛"}">
      </button>`).join("");
   _popPlace(pop, el);
   pop.querySelectorAll(".av-pick").forEach(b=>b.onclick=async()=>{
     _popHide();
-    try{ await apiSend(`/api/attribution-groups/${id}`,"PUT",{name:g.name,avatar:b.dataset.v}); }
+    try{ await apiSend(`/api/attribution-groups/${id}`,"PUT",{avatar:b.dataset.v}); }   // 部分更新：只发改动字段
     catch(e){ return msg(e.message,false); }
     stAttrs();
   });
@@ -372,7 +305,7 @@ async function renameAttrGroup(id){
   const g=attrGroups.find(x=>x.id===id);if(!g)return;
   const name=await uiPrompt(`用户「${g.name}」改名：`,g.name);
   if(!name||name===g.name)return;
-  try{ await apiSend(`/api/attribution-groups/${id}`,"PUT",{name, avatar:g.avatar==="m"?"m":"f"}); }   // avatar 随带，避免被重置
+  try{ await apiSend(`/api/attribution-groups/${id}`,"PUT",{name}); }   // 部分更新：avatar 不随带，服务端保持原值
   catch(e){return msg(e.message,false);}
   msg("用户已改名 ✅（相关流水同步更新）");stAttrs();
 }
@@ -381,10 +314,20 @@ async function delAttrGroup(id){
   const wasCur=!!g&&g.id===curUserId;
   const warn=wasCur?"该用户是当前用户，删除后自动切换到第一个用户；":"";
   if(!await uiConfirm(`删除用户：${warn}成员回到未分组，导入流水归属回落原始归属、手动选择的清空`,"删除"))return;
+  // 删的是当前用户：补救**前置**到删除发出之前——DELETE 的 await 窗口内长轮询唤醒
+  // loadAttrs→restoreCurUser 读到已删 id 就会排队跳登录页（setCurUser 持久化新 id，
+  // 此后任何 loadAttrs 都看到合法用户，不触发跳转）
+  if(wasCur){
+    const nxt = attrGroups.find(x=>x.id!==id);
+    if(nxt) setCurUser(nxt.id);
+  }
   try{ await api(`/api/attribution-groups/${id}`,{method:"DELETE"}); }
-  catch(e){return msg(e.message,false);}
-  await stAttrs();   // 刷新列表与解析状态
-  if(wasCur && attrGroups.length) setCurUser(attrGroups[0].id);   // 删的是当前用户：直接切第一个，不弹登录页
+  catch(e){
+    // 删除失败：把误切的当前用户回滚（前置补救已持久化新 id，不回滚后续记账归属记错人）
+    if(wasCur && g) setCurUser(g.id);
+    return msg(e.message, false);
+  }
+  await stAttrs();   // 刷新列表与解析状态（当前 id 已由上方预置补救持久化，无需再兜底切人）
 }
 async function setAttrGroup(id,gid){
   try{ await apiSend(`/api/attributions/${id}`,"PUT",{group_id:gid?+gid:null}); }
@@ -408,25 +351,27 @@ async function delAcc(id){
 }
 async function loadBks(){
   const bs=await api("/api/backups");
+  // 三个真 td 对齐表头（时间/大小/操作），不再 colspan+flex 挤一格——表头与列内容曾因此错位
   document.querySelector("#bkTable tbody").innerHTML=bs.map(b=>
     `<tr><td>${esc(b.mtime)}</td><td class="num">${(b.size/1024).toFixed(0)} KB</td>
-     <td><button class="btn btn-ghost" style="padding:4px 10px;font-size:12px" onclick="location.href='api/backups/download?file=${encodeURIComponent(b.file)}'">下载</button>
+     <td><span style="display:inline-flex;gap:6px">
+     <button class="btn btn-ghost" style="padding:4px 10px;font-size:12px" onclick="location.href='api/backups/download?file=${qEsc(encodeURIComponent(b.file))}'">下载</button>
      <button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="restore('${qEsc(b.file)}')">恢复</button>
-     <button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="delBk('${qEsc(b.file)}')">删除</button></td></tr>`).join("")||'<tr><td colspan="3" class="sub">暂无备份</td></tr>';
+     <button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="delBk('${qEsc(b.file)}')">删除</button></span></td></tr>`).join("")||'<tr><td colspan="3" class="sub">暂无备份</td></tr>';
 }
 function dlLogs(){location.href="api/logs/download";}
 async function loadBkCfg(){
   const c = await getCfg();
-  $("#bk_enabled").checked=!!c.backup.enabled;
-  $("#bk_hour").value=c.backup.hour;
-  $("#bk_months").value=c.backup.keep_months;
-  $("#bk_years").value=c.backup.keep_years;
+  const bk = c.backup || {};   // 缺键时表单回落默认值，与 loadCfg 的 llm||{} 同口径
+  $("#bk_enabled").checked=!!bk.enabled;
+  $("#bk_hour").value=bk.hour;
+  $("#bk_months").value=bk.keep_months;
+  $("#bk_years").value=bk.keep_years;
 }
 async function saveBkCfg(){
-  await apiSend("/api/config","PUT",{backup:{
+  await putConfig("backup", {
     enabled:$("#bk_enabled").checked, hour:$("#bk_hour").value===""?3:+$("#bk_hour").value,
-    keep_months:$("#bk_months").value===""?0:+$("#bk_months").value, keep_years:$("#bk_years").value===""?0:+$("#bk_years").value}});
-  _cfgCache = null;
+    keep_months:$("#bk_months").value===""?0:+$("#bk_months").value, keep_years:$("#bk_years").value===""?0:+$("#bk_years").value});
   msg("自动备份已保存 ✅");
 }
 async function delBk(f){
@@ -439,7 +384,17 @@ async function restore(f){
   if(!await uiConfirm("恢复将覆盖当前全部数据，确定？", "恢复"))return;
   await apiSend("/api/restore","POST",{file:f});
   _cfgCache = null;   // 恢复会替换 chaimi.conf：配置缓存必须失效
-  $("#ai_msgs").innerHTML = ""; txCache = {};   // 库被整体替换：聊天流水卡与缓存全部作废
+  // 库被整体替换：在途 AI 流与查账缓存一并作废——此前不停流，恢复前发起的对话把旧统计卡/
+  // 文字续写进已清空的聊天区，aiLastStats 还能下钻到已不存在的数据
+  aiSseStop();
+  aiLastStats = null; aiLastStatsLid = null;
+  // 聊天流水卡与缓存全部作废。只清业务气泡、重新亮出 #chat_empty 开场
+  // （aiClearIntro 是 display 隐藏而非 remove——节点恒在，见其注释契约，无需重建分支）
+  document.querySelectorAll("#ai_msgs .bubble").forEach(b=>b.remove());
+  const intro = document.querySelector("#ai_msgs #chat_empty");
+  if(intro) intro.style.display = "";
+  txCache = {};
+  if(txSelMode) txSelExit();   // 整库替换后批量选择集里的 id 已不存在：退出选择态防残留计数
   msg("已恢复 ✅");loadAll();loadCfg();loadBkCfg();loadBotCfg();
 }
 
@@ -447,13 +402,16 @@ let _ilinkTimer = null, _qrTimer = null;
 const ILINK_STATE_CN = {off:"未启动", pending_scan:"等待扫码", scaned:"已扫码待确认",
   logged_in:"已连接 ✓", expired:"凭证过期", error:"连接异常"};
 
+const BOT_CONFIRM_CN = {reply:"回复确认入库", auto:"识别直接入库"};
 async function loadBotCfg(){
   const c = await getCfg();
   const b = c.bot || {};
+  const cm = BOT_CONFIRM_CN[b.confirm_mode] ? b.confirm_mode : "reply";   // 与服务端读侧归一同口径
   $("#bot_mode").value = ["off","direct"].includes(b.mode) ? b.mode : "off";
+  $("#bot_confirm").value = cm;
   $("#bot_mode_ro").textContent = b.mode === "direct"
-    ? "模式：微信扫码（管理员已开启）" : "模式：未开启（需管理员开启微信扫码）";
-  $("#bot_users").value = (b.allowed_users || []).join(", ");
+    ? `模式：微信扫码（管理员已开启）· 记账：${BOT_CONFIRM_CN[cm]}` : "模式：未开启（需管理员开启微信扫码）";
+  $("#bot_users").value = (b.allowed_users || []).join("\n");
   botGwVis();
   await botLedgers();
   await botMembers();
@@ -463,10 +421,9 @@ function botGwVis(){
 }
 async function saveBotCfg(){
   const users = $("#bot_users").value.split(/[,，\n]/).map(x=>x.trim()).filter(Boolean);
-  const m = $("#bot_mode").value;
-  await apiSend("/api/config","PUT",{bot:{mode:m, allowed_users:users}});
-  _cfgCache = null;
-  msg(m === "direct" ? "已开启微信扫码 ✅ 轮询将启动" : "机器人已关闭 ✅");
+  const m = $("#bot_mode").value, cm = $("#bot_confirm").value;
+  await putConfig("bot", {mode:m, confirm_mode:cm, allowed_users:users});
+  msg(m === "direct" ? `已开启微信扫码 ✅ 记账：${BOT_CONFIRM_CN[cm]}` : "机器人已关闭 ✅");
   loadBotCfg();
 }
 async function botLedgers(){
@@ -476,16 +433,19 @@ async function botLedgers(){
   if(cur) $("#bot_lg_sel").value = cur;
   await botLedgerUsers();
 }
+const botLuGen = makeSeq();   // 账本下拉切换请求代数（makeSeq 单源）：旧账本用户列表的迟到响应不回填（防串选错人）
 async function botLedgerUsers(){
   // 当前账本的用户=归属分组(用户与预算页维护);绑定谁,记的账就带谁的归属
   const lg = $("#bot_lg_sel").value;
   if(!lg) return;
+  const seq = botLuGen.next();
   try{
     const gs = await api(`/api/attribution-groups?ledger=${lg}`);
+    if(!botLuGen.isCurrent(seq)) return;
     $("#bot_user_sel").innerHTML = (gs||[]).length
       ? gs.map(g=>`<option value="${esc(g.name)}">${esc(g.name)}</option>`).join("")
       : `<option value="">（先到 用户与预算 添加用户）</option>`;
-  }catch(_){ $("#bot_user_sel").innerHTML = `<option value="">（用户列表加载失败）</option>`; }
+  }catch(_){ if(botLuGen.isCurrent(seq)) $("#bot_user_sel").innerHTML = `<option value="">（用户列表加载失败）</option>`; }
 }
 const _lgName = id => { const o = $("#bot_lg_sel"); const v = o ? [...o.options].find(x=>x.value==id) : null; return v ? v.text : ("账本"+id); };
 async function botMembers(){
@@ -500,78 +460,101 @@ async function botMembers(){
         ? `<button class="btn btn-ghost" onclick="botBind(${x.ledger},'${qEsc(x.label||"")}')">重新扫码</button>` : "";
       return `<tr><td>${esc(_lgName(x.ledger))}</td><td>${esc(x.label || x.user || "未备注")}</td>
         <td class="sub">${st}</td>
-        <td>${rescan}<button class="btn danger" onclick="botUnbind('${qEsc(x.account_id)}')">解绑</button></td></tr>`;
+        <td style="text-align:right">${rescan}<button class="btn danger" onclick="botUnbind('${qEsc(x.account_id)}')">解绑</button></td></tr>`;
     }).join("") || `<tr><td colspan="4" class="sub">尚无绑定——选账本和用户生成二维码,谁扫谁绑定</td></tr>`;
-  }catch(_){ $("#bot_sum").textContent = ""; }
+  }catch(e){
+    console.warn("botMembers 加载失败", e);   // 静默清空在线数会掩盖接口故障，留痕控制台
+    $("#bot_sum").textContent = "";
+  }
 }
 async function botBind(ledger, label){
-  const lg = ledger || parseInt($("#bot_lg_sel").value) || 1;
-  const lb = label != null && label !== false ? label : $("#bot_user_sel").value;
+  const lg = ledger || parseInt($("#bot_lg_sel").value) || 0;
+  if(!lg) return msg("请先选择要绑定的账本", false);   // 不再兜底账本1：多用户同库下会静默绑到别人账本
+  const lb = label != null ? label : $("#bot_user_sel").value;
   try{
     await apiSend("/api/bot/ilink/qrcode","POST",{ledger:lg, label:lb});
     msg(`二维码已生成（${_lgName(lg)}${lb?" · "+lb:""}），请用微信扫码`);
     botQrShow();
   }catch(e){ msg(e.message, false); }
 }
+const botQrGen = makeSeq();   // 扫码流程代数（makeSeq 单源）：botQrShow 每次生成 +1。
+                              // 旧流程在途的 botPoll 响应（如「off=已转正」）不得关掉
+                              // 新流程的二维码框/杀掉新倒计时（与 botLuGen/shareGen 同款）
 async function botQrShow(){
+  const flow = botQrGen.next();
   const box = $("#bot_qrbox"), img = $("#ilink_qr");
   box.style.display = "";
-  let left = 180;
+  let left = 180;   // 与服务端 QR_WAIT_TIMEOUT（bot_ilink.py，秒）同值：倒计时归零即收尾
   try{
     const r = await fetch("api/bot/ilink/qrimg?t=" + Date.now());
     if(!r.ok){
       let d = ""; try{ d = (await r.json()).detail || ""; }catch(_){}
       box.style.display = "none"; return msg("二维码失败：" + (d || r.status), false);
     }
+    if(img._url) URL.revokeObjectURL(img._url);   // 上一张的 objectURL 释放：重复生成不再累积滞留
+    img._url = URL.createObjectURL(await r.blob());
     img.onerror = ()=> msg("二维码图片解码失败", false);
-    img.src = URL.createObjectURL(await r.blob());
+    img.src = img._url;
   }catch(e){ box.style.display = "none"; return msg(e.message, false); }
   clearInterval(_qrTimer);
   const tick = ()=>{
     $("#ilink_cd").textContent = `剩余 ${Math.floor(left/60)}:${String(left%60).padStart(2,"0")}`;
-    if(left-- <= 0){ clearInterval(_qrTimer); }
+    if(left-- <= 0){
+      // 归零收尾（与 expired finish 同款）：此前只停倒计时，二维码挂着「剩余 0:00」、
+      // botPoll 的 2s 轮询也继续空转（弱网 catch 退避分支尤其如此）
+      clearInterval(_qrTimer);
+      if(_ilinkTimer){ clearTimeout(_ilinkTimer); _ilinkTimer = null; }
+      if($("#bot_qrbox").style.display !== "none"){
+        $("#bot_qrbox").style.display = "none";
+        msg("二维码已超时，请重新生成", true);
+      }
+    }
   };
   tick(); _qrTimer = setInterval(tick, 1000);
-  botPoll(true);
+  botPoll(true, flow);
 }
-async function botPoll(loop){
-  // loop=true:扫码期间 2s 自轮询。确认转正后 pending 归 off——活跃扫码中遇到 off 即流程结束
+async function botPoll(loop, flow){
+  // loop=true:扫码期间 2s 自轮询。确认转正后 pending 归 off——活跃扫码中遇到 off 即流程结束。
+  // flow=发起时的扫码流程代数（botQrGen，唯一入口 botQrShow 都会带上）：快速「重新扫码」时，
+  // 旧流程在途的响应（尤其 off）不得关掉新流程的二维码框/杀掉新倒计时
+  const isCurFlow = () => botQrGen.isCurrent(flow);
   const finish = async (m, warn)=>{
+    if(!isCurFlow()) return;   // 旧流程的收尾不得触碰新流程
     clearInterval(_qrTimer);
     $("#bot_qrbox").style.display = "none";
     if(m) msg(m, !warn);
     _cfgCache = null;   // 扫码确认由服务端回调写入白名单/凭证：前端配置缓存必须失效
-    await loadBotCfg(); // 白名单即时回显（内含 botMembers 成员表刷新；旧版只刷成员表，须关开面板才见新白名单）
+    await loadBotCfg(); // 白名单即时回显（内含成员表刷新）
   };
+  // 排程前核对页面身份：在途响应回来时已切离设置页（qrbox 内联 display 不随切页变，
+  // 只看它会自续空转轮询——showPage 清掉的定时器被这里重新排上）。try/catch 两分支共用
+  const qrActive = () => document.body.dataset.page === "settings"
+                    && $("#bot_qrbox").style.display !== "none";
   try{
     const s = await api("/api/bot/ilink/status");
+    if(!isCurFlow()) return;
     const p = s.pending || {};
-    const active = $("#bot_qrbox").style.display !== "none";
     $("#ilink_wait").textContent = ILINK_STATE_CN[p.state] || p.state || "—";
     if(p.state === "logged_in"){ await finish("绑定成功 ✅"); return; }
-    if(p.state === "off" && active){ await finish(); return; }   // 已转正入成员表
+    if(p.state === "off" && qrActive()){ await finish(); return; }   // 已转正入成员表
     if(p.state === "expired"){ await finish("二维码已过期，请重新生成", true); return; }
     if(p.state === "error"){ await finish("扫码出错：" + (p.detail || ""), true); return; }
     await botMembers();          // 扫码期间顺带刷新成员在线状态
     if(_ilinkTimer) clearTimeout(_ilinkTimer);
-    if(loop && active && ["pending_scan","scaned"].includes(p.state)){
-      _ilinkTimer = setTimeout(()=>botPoll(true), 2000);
+    if(loop && qrActive() && ["pending_scan","scaned"].includes(p.state)){
+      _ilinkTimer = setTimeout(()=>botPoll(true, flow), 2000);
     }
-  }catch(_){ if(_ilinkTimer){ clearTimeout(_ilinkTimer); _ilinkTimer = null; } }
+  }catch(_){
+    if(!isCurFlow()) return;
+    // 弹窗仍开着（二维码还在倒计时）时一次网络抖动不能永久停轮：退避 3s 重试；
+    // finish 路径已关掉 qrbox，active=false 自然不再排程；切离设置页同停
+    if(_ilinkTimer) clearTimeout(_ilinkTimer);
+    _ilinkTimer = qrActive() ? setTimeout(()=>botPoll(true, flow), 3000) : null;
+  }
 }
 async function botUnbind(aid){
   if(!await uiConfirm("解绑后该成员的微信机器人将停止记账，确定？", "解绑"))return;
   await apiSend("/api/bot/ilink/unbind","POST",{account_id:aid});
   _cfgCache = null;   // 解绑改写 chaimi.conf(ilink 凭证)：配置缓存随之失效
   msg("已解绑"); await botMembers();
-}
-async function botTest(){
-  const t = $("#bot_test_in").value.trim();
-  if(!t) return msg("请输入测试内容", false);
-  const out = $("#bot_test_out");
-  out.style.display = ""; out.textContent = "…";
-  try{
-    const r = await apiSend("/api/bot/test","POST",{text:t});
-    out.textContent = r.reply || "（空回复）";
-  }catch(e){ out.textContent = "❌ " + e.message; }
 }

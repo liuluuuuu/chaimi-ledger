@@ -1,18 +1,29 @@
 :root{
   /* ===== 全局中性 ===== */
   --bg:#F7F8FB;          /* 整页底色——比纯白更柔和 */
-  --bg-2:#EDEFF5;        /* 二级底色 */
   --card:#FFFFFF;        /* 卡片底色 */
   --fg:#1F2433;          /* 主文字——深蓝灰，4.7:1 对比度 */
   --muted:#6E7686;
   --border:#E8EBF3;      /* 通用边框 */
+  --line:#E8EBF3;        /* 行间分隔线（表行/流水行内分隔；深色下比 --border 亮一档保持可见） */
   --win:#F3F3F3;         /* 窗口灰（官方应用同款）：侧栏底色，桌面端兼作窗口底色 */
   --panel:var(--card);   /* 内容面板底：浅色=白（官方一致），卡片/顶栏/筛选/翻页条共用 */
   --chip:#F1F3F8;        /* 标签/小元素底 */
   --hover:#F4F6FB;       /* hover 高亮 */
   --mask:rgba(31,36,51,.45);   /* 弹窗遮罩（modal-mask 与退款下拉共用） */
-  --sb-thumb:rgba(31,36,51,.25);        /* 滚动条滑块（悬浮式，仅 hover 提亮） */
-  --sb-thumb-hover:rgba(31,36,51,.45);
+  --sb-thumb:rgba(31,36,51,.15);        /* 滚动条滑块（刻意低调，仅 hover 提亮到可辨识） */
+  --sb-thumb-hover:rgba(31,36,51,.35);
+
+  /* ===== 分层阶梯（弹窗叠放与 DOM 顺序解耦：确认/输入框永远最上，
+     同级之间才按 DOM 顺序——新弹窗插错位置不再被挡） ===== */
+  --z-nav:40;           /* 顶栏 */
+  --z-drawer-mask:59;   /* 抽屉遮罩 */
+  --z-drawer:60;        /* 抽屉侧栏 */
+  --z-modal:90;         /* 通用弹窗 */
+  --z-modal-over:95;    /* 叠加弹窗（小票/裁剪/浮层/退款全屏选择） */
+  --z-confirm:100;      /* 确认框/输入框（永远最上） */
+  --z-banner:110;       /* 常驻横幅 */
+  --z-toast:120;        /* Toast */
   color-scheme:light;
 
   /* ===== 三级阴影 ===== */
@@ -24,7 +35,7 @@
   --radius:18px;          /* 卡片 */
   --radius-lg:22px;        /* 容器/弹窗 */
   --radius-sm:12px;        /* 按钮/输入框 */
-  --radius-panel:16px;     /* 桌面内容面板外框（卡片/顶栏/翻页条共用） */
+  --radius-panel:20px;     /* 桌面内容面板外框——外层 ≥ 内层卡片 18px，嵌套不倒挂 */
   --radius-pill:999px;     /* chip/avatar 全圆 */
 
   /* ===== 马卡龙 8 色系（每个功能模块一个独立色相）=====
@@ -37,7 +48,7 @@
   --m-peach-50:#FDF0E5;   --m-peach-100:#FADCC2;   --m-peach-bd:#F4B98A;   --m-peach:#E8956B;   --m-peach-fg:#B5663E;
   --m-pink-50:#FBEBF0;    --m-pink-100:#F5C9D6;    --m-pink-bd:#EDA0B5;    --m-pink:#E8869F;    --m-pink-fg:#B84766;
   --m-teal-50:#E5F4F2;    --m-teal-100:#C0E4DF;    --m-teal-bd:#88CABE;    --m-teal:#5BBFAA;    --m-teal-fg:#2E8675;
-  --m-gray-50:#EEEEF1;    --m-gray-100:#DCDfe8;    --m-gray-bd:#B8BDC9;    --m-gray:#787A88;    --m-gray-fg:#494B58;
+  --m-gray-50:#EEEEF1;    --m-gray-100:#DCDFE8;    --m-gray-bd:#B8BDC9;    --m-gray:#787A88;    --m-gray-fg:#494B58;
   --m-butter-50:#FBF5E0;  --m-butter-100:#F4E5B0;  --m-butter-bd:#E5CC74;  --m-butter:#D9B85A;  --m-butter-fg:#9C7E2E;
 
   /* ===== 默认主色（保持向后兼容，指向流水蓝色系）===== */
@@ -53,6 +64,8 @@
   --pending:#E8B845;       /* 待确认——暖黄 */
   --pending-bg:#FDF6E0;
   --transfer:#787A88;      /* 转账——莫兰迪灰 */
+  --warn:#A16207;          /* 警示文字——深琥珀（浅琥珀在白底对比度不足） */
+  --warn-strong:#5C4713;   /* 暖黄底上的深字（待确认 chip：奶黄底 --m-butter 上的可读深棕） */
 
   /* ===== 日历热力（薄荷蓝绿 4 档，与 cal 图标 #5DBF8A 同源，4 档 lightness 阶梯） ===== */
   --cal-heat-1:#E6F4EE;        /* 极淡薄荷（最低支出，与 cal 图标同源） */
@@ -65,13 +78,13 @@
   --cal-amt-e3:#7A1F2B; --cal-amt-i3:#0B3D27;
 }
 [data-theme="dark"]{
-  --bg:#0F172A; --bg-2:#1E293B; --card:#26272B; --fg:#E8ECF4; --muted:#8A93A8;
-  --border:rgba(255,255,255,.04); --hover:rgba(255,255,255,.05);
+  --bg:#0F172A; --card:#26272B; --fg:#E8ECF4; --muted:#8A93A8;
+  --border:rgba(255,255,255,.04); --line:rgba(255,255,255,.09); --hover:rgba(255,255,255,.05);
   --win:#0C0C0D;         /* 窗口/菜单底：官方深色实测近黑（与浅色 #F3F3F3 同位——窗口层最暗） */
   --panel:#1F2021;       /* 内容面板底：官方深色实测值，亮窗口一档（明暗方向与浅色一致） */
   --chip:#252C40; --pending-bg:rgba(217,162,80,.16);
   /* 滚动条：深底上用低透明度白，弱化存在感，hover 才提亮 */
-  --sb-thumb:rgba(255,255,255,.16); --sb-thumb-hover:rgba(255,255,255,.32);
+  --sb-thumb:rgba(255,255,255,.10); --sb-thumb-hover:rgba(255,255,255,.28);
   color-scheme:dark;
   /* 深色模式马卡龙色系：
      50 = 极淡色相底（用于 box-shadow 光晕/虚线区底）
@@ -91,6 +104,7 @@
   /* 语义色：深色模式适度调暗避免刺眼，但仍需可辨识 */
   --expense:#E87585;
   --income:#7ACFA0;
+  --warn:#E8B845;          /* 深底警示文字换亮琥珀（浅色档的深琥珀 #A16207 在深底上偏暗） */
   /* 日历热力：深色模式薄荷蓝绿 4 档（与 cal 图标同源） */
   --cal-heat-1:#1E3A2E;        /* 极深薄荷（最低支出） */
   --cal-heat-2:#2E5042;        /* 深薄荷（低支出） */
@@ -107,25 +121,41 @@
 }
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;font-size:14px;transition:background .2s,color .2s;font-variant-numeric:tabular-nums}
-/* 焦点框全局不显示（输入框另有 :focus 描边，见下） */
+/* 鼠标点击不显示焦点框（输入框另有 :focus 描边，见下）；键盘 Tab 用 :focus-visible 恢复指示 */
 *:focus{outline:none}
+:focus-visible{outline:2px solid var(--primary-2);outline-offset:2px}
 
 *{-webkit-tap-highlight-color:transparent}
 
-/* ===== 全局滚动条：细窄悬浮式，透明轨道 + 半透明滑块 =====
-   深色模式默认滚动条是浅灰实心条，与深底对比过强；这里统一改为
-   10px 轨道 + 3px 透明描边（实际可见滑块仅 4px），hover 才提亮。
-   Firefox 走 scrollbar-width/color；modal/schips 的隐藏规则优先级更高，不受影响。 */
+/* ===== 全局滚动条：透明轨道 + 胶囊滑块 =====
+   8px 轨道，滑块满宽胶囊形（border-radius:999px 钳制成半圆端）；轨道两端各留 8px
+   margin——滚动容器（.main/.lg-panel/.modal）都是圆角卡片，原生滚动条不受容器圆角
+   裁切，滑块滚到顶/底若贴满轨道会探出圆角弧线，margin 让它止步于曲率区之外。
+   旧版用透明边框同时做「收窄 + 两端内缩」，边框会吃掉圆角，4px 细条端头看着是矩形。
+   引擎分工：Chromium ≥121 只要设了标准 scrollbar-width/color 就会整体接管、
+   忽略全部 webkit 定制——@supports 内还原成 auto 交还 webkit 伪元素；Firefox
+   不支持 webkit 伪元素，走标准 scrollbar-width/color（受圆角裁切，无此问题）。
+   modal/schips 的隐藏规则优先级更高，不受影响。 */
 *{scrollbar-width:thin;scrollbar-color:var(--sb-thumb) transparent}
-::-webkit-scrollbar{width:10px;height:10px}
+@supports selector(::-webkit-scrollbar){
+  *{scrollbar-width:auto;scrollbar-color:auto}
+}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-button{display:none}   /* 自定义滚动条会画出两端箭头钮，显式关掉 */
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--sb-thumb);border-radius:8px;border:3px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-track:vertical{margin:8px 0}      /* 滑块行程两端内缩：不探出容器圆角 */
+::-webkit-scrollbar-track:horizontal{margin:0 8px}
+::-webkit-scrollbar-thumb{background:var(--sb-thumb);border-radius:999px;
+  border:2px solid transparent;background-clip:padding-box}   /* 侧向透明边收细：可见 4px 胶囊；端部内缩只走轨道 margin——透明边框放在端部会压平圆头（上版看着是矩形的根因） */
 ::-webkit-scrollbar-thumb:hover{background-color:var(--sb-thumb-hover)}
 ::-webkit-scrollbar-corner{background:transparent}
 .num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
 svg{display:block;flex-shrink:0}
 button{cursor:pointer;font-family:inherit}
 select,input,textarea{font:inherit;color:var(--fg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;background:var(--card);transition:border-color .15s}
+/* 占位提示文字：UA 默认灰色不随主题翻转（深色卡片上 ≈1.5:1 不可见），统一走 --muted
+   并锁定 opacity——深色 #8A93A8 / 浅色 #6E7686，与 label 同档对比度 */
+::placeholder{color:var(--muted);opacity:1}
 input:focus,select:focus{outline:2px solid var(--primary-2);outline-offset:1px;border-color:var(--primary-2)}
 label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
 /* ===== 布局 ===== */
@@ -164,18 +194,22 @@ body{overflow:hidden}
 /* io 奶黄 */
 .nav-item.on[data-p="io"]{background:var(--m-butter-100);color:var(--m-butter-fg)}
 .nav-item.on[data-p="io"]::before{background:var(--m-butter)}
-.nav-item.on{background:var(--primary-bg);color:var(--primary-fg)}
-.nav-item.on::before{content:"";position:absolute;left:-8px;top:10px;bottom:10px;width:3px;border-radius:2px;background:var(--primary)}
+.nav-item.on::before{content:"";position:absolute;left:-8px;top:10px;bottom:10px;width:3px;border-radius:2px}   /* 形状在此单源；颜色由上方七个 data-p 分支给（侧栏按钮全部带 data-p） */
 .nav-item .bdg{display:inline-block;font-size:11px;background:var(--pending);color:#fff;border-radius:999px;padding:0 7px;line-height:17px}
-.main{flex:1;min-width:0;height:100vh;overflow-y:auto;overflow-x:hidden}
+/* 主区 = 纵向 flex 列：gbar（sticky 钉顶）在流内占掉顶栏高，AI 页 flex:1 填满剩余。
+   scrollbar-gutter:stable 常驻滚动条槽位：切页时滚动条出现/消失不再让内容列左右跳动 */
+.main{flex:1;min-width:0;height:100vh;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;scrollbar-gutter:stable}
 @supports (height:100dvh){.main{height:100dvh}}
 /* ===== 顶栏 ===== */
 .ledger-box{padding:10px 10px 12px;border-bottom:1px solid var(--border);margin-bottom:10px}
 
-.gbar{position:fixed;top:0;left:200px;right:0;z-index:40;display:flex;align-items:flex-start;gap:8px;padding:10px 16px 12px;background:var(--bg);border-bottom:1px solid var(--border)}
-.gbar-inner{flex:1;min-width:0}
-
-@media(min-width:1400px){.gbar-inner{max-width:1400px;margin:0 auto;padding:0 clamp(16px,4vw,64px)}}
+/* 顶栏：.main 滚动容器内常规流 + sticky 钉顶（非 fixed）。抽屉推挤随 .main 位移天然正确 */
+.gbar{position:sticky;top:0;z-index:var(--z-nav);display:flex;align-items:flex-start;gap:8px;padding:10px 0 12px;background:var(--bg);border-bottom:1px solid var(--border)}
+/* gbar-inner 与 .page 同版心（≤1400 全宽、>1400 限宽居中、clamp 内距）：
+   任何视口宽下顶栏的范围条/汇总卡都与页面内容列严格对齐（原实现只在 ≥1400
+   限宽，窄视口下顶栏内容比页面内容宽 4vw-16px）；gbar 自身横向内距归零交由
+   gbar-inner 承担，避免双重内距错位 */
+.gbar-inner{flex:1;min-width:0;max-width:1400px;margin:0 auto;padding:0 clamp(16px,4vw,64px)}
 .gbar-row{display:flex;align-items:center;gap:8px;min-height:34px}
 .gbar .scope-slot{margin-left:auto;display:flex;justify-content:flex-end;align-items:center;gap:6px;min-width:0}
 
@@ -186,11 +220,13 @@ body{overflow:hidden}
 .gb-user b{font-weight:600;line-height:1}
 .gb-user .gw{color:var(--muted);font-size:13.5px;line-height:1}
 .gb-user img{width:26px;height:26px;border-radius:9px;flex:none}
-@media(max-width:680px){.gb-user .gw{display:none}.gb-user{padding:6px 10px 6px 6px}}
+@media(max-width:640px){.gb-user .gw{display:none}.gb-user{padding:6px 10px 6px 6px}}
 
 /* 胶囊范围选择器：横向排布，窄屏可滑动 */
 .schips{display:flex;gap:6px;align-items:center;min-width:0;overflow-x:auto;scrollbar-width:none;padding:2px}
 .schips::-webkit-scrollbar{display:none}
+/* 横向可滚时右缘渐隐提示（滚动条已隐藏，不提示会以为右侧没内容；syncScopeChips 实测切换） */
+.schips.can-scroll{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 22px),transparent 100%);mask-image:linear-gradient(to right,#000 calc(100% - 22px),transparent 100%)}
 /* 取值控件（月/年）与胶囊同尺寸同圆角，选中时同款蓝底——消除基线参差与双选中态歧义 */
 .schips input,.schips select{flex:none;height:30px;padding:0 12px;font-size:13px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--fg);font-family:inherit}
 
@@ -205,18 +241,13 @@ body{overflow:hidden}
   #monthSel{width:12ch}#yearSel{width:10ch}#sc_from,#sc_to{width:15ch}
 }
 .schips input:hover,.schips select:hover{background:var(--hover)}
-.schips input[type="date"]{height:30px}
 
 .gbar .gbar-menu{display:none}
-/* 主区让位：高度跟随顶栏实际内容（JS 写回 --gbar-h；缺省 96px 兜底） */
-.main{padding-top:var(--gbar-h,96px)}
 
-body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="settings"] .gbar{display:none}
-body[data-page="renqing"] .main, body[data-page="io"] .main, body[data-page="settings"] .main{padding-top:0}
-body[data-page="renqing"] .gbar .gbar-inner, body[data-page="io"] .gbar .gbar-inner,
-body[data-page="settings"] .gbar .gbar-inner{display:none}
-/* 手机菜单条不带底部分界线，与页面融为一体 */
-body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="settings"] .gbar{border-bottom:none}
+/* 人情/导入/设置三页无汇总数据：桌面隐藏整条 gbar（子元素随之不渲染，无需逐个补写），
+   只留页面自身工具行；底界线一并去掉与页面融为一体（手机端恢复显示见下方媒体查询）。
+   三页名单用 :is() 单点——此前三元选择器列表抄 5 处，新增无汇总页要改 5 处 */
+body:is([data-page="renqing"], [data-page="io"], [data-page="settings"]) .gbar{display:none;border-bottom:none}
 .icon-btn{width:34px;height:34px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--card);color:var(--muted);display:flex;align-items:center;justify-content:center;transition:background .18s,color .18s,border-color .18s;position:relative}
 .icon-btn:hover{background:var(--hover);color:var(--fg);border-color:var(--primary-2)}
 .spacer{flex:1}
@@ -224,8 +255,16 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 .c-inc{color:var(--income)}
 /* ===== 通用 ===== */
 
-.page{display:none;padding:20px clamp(16px,4vw,64px);max-width:1400px;margin:0 auto}
-.page.on{display:block}
+/* flex:0 0 auto：主区改 flex 列后页面不收缩（内容多高就多高，容器滚动）；
+   AI 页在 views.css 里单独 flex:1 填满剩余 */
+/* width:100% 必需：纵向 flex 里交叉轴 auto 边距会关闭拉伸、宽度退化为 fit-content（各页参差）；
+   定宽后 max-width 封顶 + auto 边距居中，与块布局同效 */
+.page{display:none;flex:0 0 auto;width:100%;padding:20px clamp(16px,4vw,64px);max-width:1400px;margin:0 auto}
+/* 应用外壳化：页面占满 .main 剩余高、自身内部滚动（与 #tab-list/#tab-ai 同范式）——
+   顶栏常驻不再依赖 .main 滚动+sticky；汇总条恒在滚动容器外，「上滑收起汇总」
+   （ledger.js）因此在所有页面都无反馈环。#tab-list.on/#tab-ai.on 各自的 flex 规则
+   按 id 特异性覆盖 display，内部滚动容器不变 */
+.page.on{display:block;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
 .sub{font-size:12px;color:var(--muted)}
 .btn{border-radius:var(--radius-sm);padding:9px 16px;font-size:14px;font-weight:500;border:none;transition:opacity .18s,background .18s,transform .12s;white-space:nowrap}
@@ -234,30 +273,27 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 /* 深色模式：btn-pri hover 改用 bd（更深的中等亮度），避免淡蓝底白字对比度不足 */
 [data-theme="dark"] .btn-pri:hover{background:var(--primary-2)}
 .btn-ghost{background:none;border:1px solid var(--border);color:var(--fg)}
+/* 危险操作按钮（删除/解绑/移除/恢复备份）：全站单源——此前 views.css(.st-sec) 与
+   catmgr.js(.catmgr-root) 各写一份同值规则，新作用域（bot 成员表等）会漏样式 */
+.btn.danger{border:1px solid var(--expense);color:var(--expense);background:none;padding:4px 10px;font-size:12px}
 .btn:hover{opacity:.85}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-@media(max-width:680px){.grid3{grid-template-columns:1fr 1fr}}
+@media(max-width:640px){.grid3{grid-template-columns:1fr 1fr}}
 /* ===== Toast 系统（顶部下滑动画 + 3 秒自动消失） ===== */
-.msg{position:fixed;top:-60px;left:50%;transform:translateX(-50%);z-index:99;padding:12px 22px;border-radius:var(--radius-lg);display:block;font-size:14px;font-weight:500;box-shadow:var(--shadow-lg);transition:top .35s cubic-bezier(.34,1.56,.64,1);min-width:180px;text-align:center;opacity:0;pointer-events:none}
+.msg{position:fixed;top:-60px;left:50%;transform:translateX(-50%);z-index:var(--z-toast);padding:12px 22px;border-radius:var(--radius-lg);display:block;font-size:14px;font-weight:500;box-shadow:var(--shadow-lg);transition:top .35s cubic-bezier(.34,1.56,.64,1);min-width:180px;text-align:center;opacity:0;pointer-events:none}
 .msg.on{top:20px;opacity:1;pointer-events:auto}
-.modal-mask{position:fixed;inset:0;background:var(--mask);backdrop-filter:blur(2px);z-index:90;display:none;align-items:center;justify-content:center;padding:16px}
+.modal-mask{position:fixed;inset:0;background:var(--mask);backdrop-filter:blur(2px);z-index:var(--z-modal);display:none;align-items:center;justify-content:center;padding:16px}
 .modal-mask.on{display:flex}
-
-#rcpMask{z-index:95}
+/* 确认框/输入框永居最上（z 阶梯保证，不依赖 DOM 顺序） */
+#cfmMask,#prmMask{z-index:var(--z-confirm)}
+/* 小票查看与手动裁剪同层：cropMask 在 DOM 中靠后，同层按序自然叠于其上 */
+#rcpMask,#cropMask{z-index:var(--z-modal-over)}
 /* 带内嵌 SVG 的幽灵按钮：图标与文字垂直居中对齐 */
 .btn-ghost svg{vertical-align:-2px}
 #e_rcp_row .btn-ghost{display:inline-flex;align-items:center;gap:5px}
 .modal{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);max-width:600px;width:100%;max-height:90vh;overflow:auto;padding:0;box-shadow:var(--shadow-lg)}
 
-/* 所有弹窗恢复细滚动条——长列表需要视觉反馈 */
-.modal{scrollbar-width:thin;scrollbar-color:var(--sb-thumb) transparent}
-.modal::-webkit-scrollbar{display:block;width:6px}
-.modal::-webkit-scrollbar-thumb{background:var(--sb-thumb);border-radius:8px}
-.modal::-webkit-scrollbar-track{background:transparent}
-.modal .modal-body{scrollbar-width:thin;scrollbar-color:var(--sb-thumb) transparent}
-.modal .modal-body::-webkit-scrollbar{display:block;width:6px}
-.modal .modal-body::-webkit-scrollbar-thumb{background:var(--sb-thumb);border-radius:8px}
 .modal label{font-size:12px;color:var(--muted)}
 .modal input,.modal select{width:100%}
 .modal .grid3{gap:12px}
@@ -273,9 +309,9 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 .modal-head::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--m-purple),var(--m-blue),var(--m-mint),var(--m-peach));border-radius:var(--radius-lg) var(--radius-lg) 0 0}
 .modal-body{padding:14px 20px;overflow:auto;flex:1;min-height:0}
 .modal-foot{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid var(--border)}
-/* 导入框：图标 + 文字 + 文件名一行；hover 显示可点击 */
+/* 导入框：图标 + 文字 + 文件名一行；hover 显示可点击
+   （变量随 [data-theme=dark] 自动换值，无需深色覆盖规则） */
 .imp-btn{display:flex;align-items:center;gap:10px;padding:12px 14px;margin-top:10px;border:1px dashed var(--m-butter-bd);border-radius:var(--radius-sm);cursor:pointer;background:var(--m-butter-50);transition:border-color .15s,background .15s,transform .12s}
-[data-theme="dark"] .imp-btn{background:var(--m-butter-50);border-color:var(--m-butter-bd)}
 .imp-btn:hover{border-color:var(--m-butter);border-style:solid;background:var(--card);transform:translateY(-1px)}
 [data-theme="dark"] .imp-btn:hover{background:var(--m-butter-100)}
 [data-theme="dark"] .imp-btn.has-file{background:var(--m-butter-50)}
@@ -296,7 +332,7 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 .exp-presets{display:flex;gap:6px}
 .exp-presets .btn.on{background:var(--primary-bg);color:var(--primary-fg);border-color:var(--primary-2)}
 
-.exp-btns{margin-left:auto;display:flex;gap:8px;flex:0 0 auto;flex-wrap:nowrap}
+.exp-btns{margin-left:auto;display:flex;gap:8px;flex:0 0 auto;flex-wrap:wrap}   /* 允许换行：手机 6 个按钮 nowrap+按钮不收缩会溢出被 .main 裁掉 */
 /* 手机版导出行固定两行：日期组独占第一行，预设+下载第二行；桌面 display:contents 让包装 div 透明 */
 .exp-dates{display:contents}
 @media(max-width:768px){
@@ -309,26 +345,17 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
   .exp-row .btn-pri{padding:5px 12px;font-size:12px}
 }
 
-.pv-list .tx-card{
-  border:none;
-  border-bottom:1px solid var(--border);
-  border-radius:0;
-  background:transparent;
-  cursor:default;
-}
+/* 预览行不可点；行式样式由 .tx-card 基类统一承担 */
+.pv-list .tx-card{cursor:default}
 .pv-list .tx-card:hover{background:transparent}
-.pv-list .tx-card:last-child{border-bottom:none}
 .pv-list .tx-row{padding:10px 4px}
-/* 预览行间不画渐隐横线（视觉已有 border-bottom） */
-.pv-list .tx-row+.tx-row::before{display:none}
 /* 真根因：select/tags 都没有宽度约束，原生 min-content 把 tx-body 挤瘪 */
 .pv-list .tx-row .tx-sub select{max-width:110px;min-width:80px;overflow:hidden;text-overflow:ellipsis}
 .pv-list .tx-row .tx-sub span.sub{font-size:11px}
-.pv-list .tx-row>.tx-right>.tx-tags{flex-shrink:0;max-width:130px;overflow:hidden;align-self:flex-end}
+.pv-list .tx-row>.tx-right>.tx-tags{flex-shrink:0;max-width:130px;overflow:hidden}
 .pv-list .tx-row>.tx-right>.tx-tags .tag{display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pv-list .tx-row>.tx-right>.tx-amt-row{flex-shrink:0;min-width:55px}
-.pv-list .tx-row>.tx-right>.tx-amt-row>.tx-src{font-size:10.5px;padding:1px 6px;line-height:1.2}
-.pv-list .tx-row>.tx-right>.tx-amt-row>.tx-src-stack{display:flex;flex-direction:column;align-items:flex-start;gap:3px}
+.pv-list .tx-row>.tx-right>.tx-amt-row>.tx-src{font-size:11px;padding:1px 6px;line-height:1.2}
 /* 导入批次：手机端表格转卡片布局 */
 @media(max-width:768px){
   #batchTable{border:0}
@@ -345,8 +372,12 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 }
 
 #txList{padding:6px;border:none;background:transparent}
-#txList .tx-card{margin-bottom:8px}
-#txList .tx-card:last-child{margin-bottom:0}
+/* 日分组：日期头行 + 一张分组卡（唯一的「框」）；卡内流水行全出血，
+   overflow:hidden 裁掉行 hover 底色在分组卡圆角处的方角 */
+.tx-day{padding:0 6px;margin-bottom:12px}
+.tx-day:last-child{margin-bottom:0}
+.tx-day>.card{overflow:hidden;padding:0}   /* 行自带内距，卡不再叠内距 */
+.tx-day .day-head{padding:0 12px 6px}   /* 左右 12 与流水卡对称 */
 .msg.ok{background:var(--income);color:#fff}
 .msg.err{background:var(--expense);color:#fff}
 .msg.info{background:var(--m-blue);color:#fff}
@@ -355,36 +386,31 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
 /* ===== 移动端 ===== */
 @media(max-width:768px){
   body{--drawer-w:170px}
-  .sidebar{display:flex;position:fixed;left:0;top:0;bottom:0;height:100vh;width:var(--drawer-w);z-index:60;
+  .sidebar{display:flex;position:fixed;left:0;top:0;bottom:0;height:100vh;width:var(--drawer-w);z-index:var(--z-drawer);
     transform:translateX(-100%);transition:transform .22s ease;box-shadow:0 0 40px rgba(0,0,0,.18)}
   .sidebar.open{transform:translateX(0)}
-  .sidebar-mask{position:fixed;inset:0;background:transparent;z-index:59;display:none}
+  .sidebar-mask{position:fixed;inset:0;background:transparent;z-index:var(--z-drawer-mask);display:none}
   .sidebar-mask.on{display:block}
   .page{padding:14px}
 
-
-  /* 手机：顶栏改 fixed 钉死视口——sticky 受父容器 .main 高度限制,部分 WebView 会整页带走;
-     fixed 不依赖父级,配合 .main 顶部让位;抽屉推挤时 .main 的 transform 会让 fixed 跟随位移,视觉正确 */
-  .gbar{display:flex;position:fixed;top:0;left:0;right:0}
-  /* 三个人情/导入/设置页：手机保留菜单条（☰）并让位 */
-  body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="settings"] .gbar{display:flex;padding:6px 10px}
-  body[data-page="renqing"] .main, body[data-page="io"] .main, body[data-page="settings"] .main{padding-top:48px}
+  /* 手机：顶栏沿用 .main 内 sticky（在滚动容器内 sticky 是标准行为；
+     抽屉推挤随 .main 位移、顶栏让位补偿全免） */
+  /* 三个人情/导入/设置页：手机保留菜单条（☰），收窄内距（三页名单单点见上方 :is() 规则） */
+  body:is([data-page="renqing"], [data-page="io"], [data-page="settings"]) .gbar{display:flex;padding:6px 0 8px}   /* 横向内距由 gbar-inner 的 clamp 版心承担 */
 
   .gbar .gbar-menu{display:flex;flex:none;width:36px;height:36px;border:none;background:transparent;color:var(--fg);border-radius:50%}
   .gbar .gbar-menu:hover{background:var(--hover);border-color:transparent}
 
-  /* 人情/导入/设置页：桌面隐藏整个 gbar-inner，手机端菜单按钮已移入其中——恢复显示首行、
+  /* 人情/导入/设置页：桌面隐藏整个 gbar，手机端菜单按钮已移入其中——恢复显示首行、
      仍隐藏汇总行（这三页无汇总数据） */
-  body[data-page="renqing"] .gbar .gbar-inner, body[data-page="io"] .gbar .gbar-inner,
-  body[data-page="settings"] .gbar .gbar-inner{display:block}
-  body[data-page="renqing"] .gbar .gsum, body[data-page="io"] .gbar .gsum,
-  body[data-page="settings"] .gbar .gsum{display:none}
+  body:is([data-page="renqing"], [data-page="io"], [data-page="settings"]) .gbar .gbar-inner{display:block}
+  body:is([data-page="renqing"], [data-page="io"], [data-page="settings"]) .gbar .gsum{display:none}
   .tx-filter .filters{flex-wrap:wrap}
   .tx-filter .filters .fchip{flex:0 1 auto;white-space:nowrap}
   /* 手机版流水页：收紧左右留空（page 14→8、容器 6→4、行 12→10）让卡片更贴近视口 */
   #tab-list{padding:8px}
   #tab-list #txList{padding:4px}
-  #tab-list .tx-card .tx-row{padding:10px 10px}
+  #tab-list .tx-card .tx-row{padding:10px 0}   /* 左右 0：留空全部由卡内距 12 承担，与桌面同缘 */
 
   /* 推挤式抽屉：主区域整体右移让位；收起后移除 transform，恢复 sticky 顶栏 */
   .main{transition:transform .22s ease}
@@ -392,17 +418,40 @@ body[data-page="renqing"] .gbar, body[data-page="io"] .gbar, body[data-page="set
   .nav-item{font-size:13px;height:40px;gap:8px;padding:0 8px}
   .ledger-box{padding:8px 8px 10px}
 }
-@media (prefers-reduced-motion: reduce){*{transition:none!important}}
+@media (prefers-reduced-motion: reduce){
+  *{transition:none!important;animation:none!important}
+  .btn::after{display:none}            /* 涟漪靠 transition 收场，停动画后 :active 会白闪一下 */
+  .ai-chip-stack .rot-b{display:none}  /* 双卡轮播的可见性全由 keyframes 控制，停动画须固定显示 rot-a（否则两卡叠字） */
+}
 
 /* ===== 内容区卡片（桌面）：官方应用布局——菜单贴边不吃圆角，主内容区收进
-   描边圆角卡片（上/右/下 10px、左缘贴菜单）；fixed 元素让位与补偿见 views.css 同名块。
-   手机端全屏不套卡片。 */
+   描边圆角卡片（上/右/下 10px、左缘贴菜单）。顶栏已改面板内常规流 sticky：
+   圆角由 .main 的 overflow 裁切，无需自备描边/圆角复刻。手机端全屏不套卡片。 */
 @media(min-width:769px){
   body{background:var(--win)}
   .sidebar{border-right:none}   /* 分隔线交给卡片左边线 */
   .main{height:calc(100vh - 20px);margin:10px 10px 10px 0;
     border:1px solid var(--border);border-radius:var(--radius-panel);background:var(--panel)}
   @supports (height:100dvh){.main{height:calc(100dvh - 20px)}}
-  /* 顶栏是 fixed、不受卡片圆角裁切：自带重合描边+上圆角，否则方角背景盖住卡片圆角 */
-  .gbar{top:10px;right:10px;border:1px solid var(--border);border-radius:var(--radius-panel) var(--radius-panel) 0 0;background:var(--panel)}
+  .gbar{background:var(--panel)}   /* 与面板同底（列表从其下穿过时完全遮挡） */
 }
+
+/* ===== 触屏（粗指针）：表格/微型按钮的最小触控目标 =====
+   原表格操作按钮 padding:2px 10px 实高仅 ~24px，指尖易误触邻行 */
+@media(pointer:coarse){
+  table .btn{min-height:34px}
+  #q_clear,.txf-rm{width:32px;height:32px}
+}
+
+/* 机器人凭证过期常驻横幅（core.js 动态创建）：叠于一切之上、Toast 之下 */
+.bot-banner{position:fixed;top:0;left:0;right:0;z-index:var(--z-banner);background:#f59e0b;color:#fff;text-align:center;font-size:13px;padding:6px;cursor:pointer}
+
+/* 首帧门控（app/home 两页共用：head 内联脚本加 gate-hold，判定完成后经 gateLift 揭层，
+   定义在 theme-boot.js）。判定期间盖一层启动画面（主题色底 + 静止图标）；揭层时加
+   gate-fade 让底和图标一起渐隐，页面从下面透出，260ms 后移除两个类 */
+html.gate-hold body::before{content:"";position:fixed;inset:0;background:var(--bg);z-index:9999;transition:opacity .25s ease}
+html.gate-hold body::after{content:"";position:fixed;left:50%;top:38%;width:72px;height:72px;margin:-36px 0 0 -36px;
+  background:url("../images/icon-256.png") center/cover no-repeat;border-radius:18px;z-index:10000;transition:opacity .25s ease}
+html.gate-fade.gate-hold body::before,
+html.gate-fade.gate-hold body::after{opacity:0}
+@media(prefers-reduced-motion:reduce){html.gate-hold body::before,html.gate-hold body::after{transition:none}}
